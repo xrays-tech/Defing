@@ -30,10 +30,10 @@ next: {title: 04 草稿与发布, url: /04-draft/}
 | `bool` | 布尔 | `verbose: true` |
 | `json` | JSON 文本 | `healthcheck: {"path": "/healthz"}` |
 | `array` | 字符串数组（逗号分隔） | `tags: a, b, c` |
-| `secret` | 敏感项（加密存储，数据面恒脱敏 `***`） | 需要主密钥 |
+| `secret` | 敏感项（加密存储；SDK 快照恒脱敏 `***`，渲染端点按令牌/会话授权解密） | 需要主密钥 |
 
 - **required**：发布前该配置项必须有值，否则发布被拦截（校验策略可改为 `warn` 仅警告）
-- **secret**：值加密存储；数据面 / 渲染输出恒为 `***`，仅管理面 `reveal=true` 且审计后才解密
+- **secret**：值加密存储（AES-256-GCM 信封加密）；SDK 快照（`/snapshot`、gRPC）恒脱敏为 `***`；渲染端点 `/config` 对**携带项目访问令牌**的请求默认解密返回真值（构建脚本取用，记录 `config_reveal` 审计），管理面预览勾选「明文显示」同样解密并审计
 
 ## 3.3 共享引用
 

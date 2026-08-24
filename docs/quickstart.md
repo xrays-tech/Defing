@@ -24,7 +24,7 @@ defing --dev-single --admin-password admin123 --allow-no-master-key --http-addr 
 
 ![登录页]({{ site.baseurl }}/assets/images/01-login.png)
 
-输入管理员密码（`--admin-password` 指定的值）点击「登 录」。
+输入管理员密码（`--admin-password` 指定的值）点击「登 录」。**全局管理员：用户名留空**；项目管理员登录需填写自己的用户名（见 [09 管理员与审计]({{ site.baseurl }}/09-admin/)）。
 
 > 未显式指定 `--admin-password` 时，服务启动会随机生成并打印。
 

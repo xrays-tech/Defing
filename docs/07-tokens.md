@@ -68,7 +68,7 @@ snap = c.get('my-app', 'dev')
 | 端点池 failover | 多端点，连接失败指数退避切换 |
 | gRPC 优先 / HTTP 降级 | 端点含 `grpc` 地址走 gRPC（:8383），否则 HTTP/SSE |
 | watch 断线续传 | 重连携带 `after_version`，不丢事件 |
-| secret 脱敏 | 数据面恒返回 `***`（服务端不解密） |
+| secret 脱敏 | SDK 快照 / gRPC 恒返回 `***`；渲染端点（构建脚本）按项目令牌解密真值并审计，见 [08 §8.4]({{ site.baseurl }}/08-curl/) |
 | 灰度身份 | 传 `instance` / `labels` 参与灰度解析（见 [05 灰度发布]({{ site.baseurl }}/05-gray/)） |
 
 ## 下一步

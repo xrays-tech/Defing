@@ -37,17 +37,25 @@ curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=env" \
   -H "Authorization: Bearer <项目访问令牌>" > .env
 ```
 
-输出示例（`format=env`）：
+输出示例（`format=env`，测试实例 `horizon-compile/dev` 实测）：
 
 ```text
-CC=gcc
+CC=wefwefwefewe
+CXX=g++
+JOBS=8
+OPTIMIZE=2
+VERBOSE=true
+HEALTHCHECK={"interval":30,"path":"/healthz"}
+REGISTRY=registry.cn-north-1.example.com
+REPLICAS=1
+TAG=dev-2025.08
 HOST=10.0.0.1
+LOG_LEVEL=info
 PORT=6379
 TIMEOUT=60
-TAG=dev-gray-2025.08
 ```
 
-> ENV 约定：`KEY=VALUE`，键转大写、**无分组前缀**（组仅组织语义，不进入 .env 输出）；含空格 / 特殊字符自动加引号转义；secret 恒为 `***`。
+> ENV 约定：`KEY=VALUE`，键转大写、**无分组前缀**（组仅组织语义，不进入 .env 输出）；含空格 / 特殊字符自动加引号转义；secret 对项目令牌请求**解密返回真值**（构建脚本取用，记录 `config_reveal` 审计），见 §8.4。
 
 ## 8.3 在 Admin UI 中获取命令
 

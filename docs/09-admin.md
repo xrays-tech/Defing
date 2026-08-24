@@ -24,7 +24,9 @@ prev: {title: 08 构建脚本取值（curl）, url: /08-curl/}
 ### 项目管理员（PA）
 
 - 一个账号绑定一个项目；一个项目可有多个账号
-- PA 可登录 Admin UI 管理**自己项目**的草稿 / 结构 / 发布 / 灰度 / 版本；可**只读**共享库（草稿页「引用共享」下拉可看到共享项及物化值，secret 值恒掩码），但**不能**创建 / 修改 / 发布 / 删除共享项，也不能触碰集群、其他项目、账号管理
+- PA 可登录 Admin UI 管理**自己项目**的草稿 / 结构 / 发布 / 灰度 / 版本；导航仅显示「配置管理 / 审计日志 / 集群节点」（共享库、访问令牌、管理员入口对 PA 隐藏）
+- 共享项**只读**：草稿页「引用共享」下拉可看到共享项及物化值（secret 值恒掩码），但不能创建 / 修改 / 发布 / 删除共享项
+- 集群节点**只读**查看（用于配置 SDK 端点池）；不能管理集群、其他项目、账号管理
 - 全局管理员可对 PA 账号「改密 / 删除」（删除后其会话立即失效）；PA 忘记密码时由全局管理员重置
 
 ## 9.2 审计日志
@@ -33,25 +35,30 @@ prev: {title: 08 构建脚本取值（curl）, url: /08-curl/}
 
 ![审计日志]({{ site.baseurl }}/assets/images/10-audit.png)
 
-记录全部管理面操作：
+记录全部管理面操作（最近 200 条），列：seq / 时间 / action / 项目·分支 / 版本 / 操作人 / request_id / 明细：
 
 | 字段 | 说明 |
 |---|---|
+| seq | 审计流水号（单调递增） |
 | 时间 | 操作时间 |
-| 操作人 | `admin`（全局）/ `pa:alice`（项目管理员） |
-| 动作 | login / project_create / structure_publish / publish / gray_publish / token_create / config_reveal 等 |
+| action | login / project_create / structure_publish / publish / gray_publish / token_create / config_reveal 等 |
 | 项目 / 分支 | 操作对象 |
-| 详情 | 请求 ID 等 |
+| 版本 | 操作产生的版本号（发布 / 灰度等） |
+| 操作人 | `admin`（全局）/ `pa:alice`（项目管理员）/ `data-plane:{令牌名}`（数据面解密） |
+| request_id | 请求 ID |
+| 明细 | 结构化详情（JSON） |
 
 支持按动作类型过滤（如只看 `gray_publish`）。**reveal 明文查看配置**会记录 `config_reveal` 审计 —— 谁解密看过什么都有据可查。
 
 ## 9.3 集群节点
 
-「集群节点」视图展示 Raft 集群成员（node id、gRPC/HTTP 地址、leader / voter 状态、提交日志序号）：
+「集群节点」视图展示 Raft 集群状态与成员：
 
-- `--dev-single` 单节点模式无集群成员
+- 顶部状态卡：本节点 node id、集群状态、当前 Leader
+- 成员表：node_id / HTTP 地址 / gRPC 地址 / 角色（`voter`、`leader`、`learner`），voter 可移除、learner 可「提升为 voter」
+- `--dev-single` 单节点模式无集群成员（显示「无集群成员」提示）
 - 集群模式（[01 §1.3]({{ site.baseurl }}/01-install/)）下可查看成员，供 SDK 配置端点池
-- 项目管理员可只读查看节点端点（用于配置 SDK 连接）；join / promote / remove 等管理操作仍仅限全局管理员
+- 项目管理员可**只读**查看节点端点（表格行尾显示「只读」，用于配置 SDK 连接）；join / promote / remove 等管理操作仍仅限全局管理员
 
 ## 结语
 

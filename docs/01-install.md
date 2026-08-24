@@ -48,20 +48,26 @@ defing --node-id 3 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8388 --raft-a
 | `--bootstrap-peers` | 三段式成员表 `node_id@raft_addr@http_addr`，全员 voter |
 | `--join-token` / `--raft-token` | 集群模式**强制**，全集群相同（join 端点鉴权 / raft RPC 鉴权） |
 | `--node-id` | 节点唯一 ID |
+| `--join` | 追加节点加入既有集群：指定任一实例 HTTP 端点（如 `--join http://127.0.0.1:8384`） |
 | `--data-dir` | 集群模式必需（Raft 日志 + 状态机） |
 
 ## 1.4 常用参数速查
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--http-addr` | `0.0.0.0:8384` | 管理面 + 数据面 HTTP |
-| `--grpc-addr` | `0.0.0.0:8383` | 数据面 gRPC |
+| `--http-addr` | `127.0.0.1:8384` | 管理面 + 数据面 HTTP |
+| `--grpc-addr` | `127.0.0.1:8383` | 数据面 gRPC |
+| `--raft-addr` | `127.0.0.1:8385` | Raft 内部 RPC（集群模式） |
 | `--admin-password` | 首启随机生成 | 管理员密码（登录 Admin UI / API） |
 | `--master-key-file` / `DSH_MASTER_KEY` | — | 主密钥（secret 必需；生产必配） |
 | `--session-ttl` | `86400` | 管理会话有效期（秒） |
 | `--publish-policy` | `block` | 发布校验失败策略：`block` / `warn` |
 | `--shared-cascade` | `auto` | 共享发布级联：`auto` 自动级联 / `manual` |
 | `--read-mode` | `stale` | 读取模式：`stale` 本地直读 / `linear` ReadIndex 门控 |
+
+> **运维子命令**：`defing admin <cmd>`（客户端模式，不启动服务）——`gen-master-key` / `rotate-master-key` / `force-logout` / `set-password` / `promote` / `remove-node` / `snapshot` / `retention-status`。客户端模式经 `--admin-endpoint`（默认 `http://127.0.0.1:8384`）+ `--admin-token`（或 `--admin-password` 登录）调用管理面。
+>
+> **构建版本标记**：`/healthz`、`/readyz` 返回 `build` 信息（git 短哈希 + 构建时间），Admin UI 页脚同步显示 `Defing · build <commit> · <时间>`，便于确认部署产物是否为最新构建。
 
 ## 1.5 数据面鉴权（项目访问令牌）
 

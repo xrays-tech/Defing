@@ -45,7 +45,7 @@ next: {title: 07 访问令牌与 SDK, url: /07-tokens/}
 ## 6.4 共享项类型与 secret
 
 - 支持与配置项相同的类型（string / int / float / bool / json / array / secret）
-- **secret 共享项**需要主密钥；数据面恒脱敏（`***`）
+- **secret 共享项**需要主密钥；SDK 快照恒脱敏（`***`），渲染端点 `/config` 对项目令牌请求解密返回（与配置项 secret 一致，见 [08 §8.4]({{ site.baseurl }}/08-curl/)）
 - 描述字段（≤200 字节）仅作助记，不进入渲染输出
 
 ## 下一步
