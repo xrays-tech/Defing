@@ -459,6 +459,16 @@ paths:
       responses:
         '201': { $ref: '#/components/responses/Created' }
   /api/v1/shared-draft:
+    get:
+      summary: 共享草稿列表（secret 值掩码）
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SharedItem' }
     put:
       summary: 更新共享草稿
       requestBody:

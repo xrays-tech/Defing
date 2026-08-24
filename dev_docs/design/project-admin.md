@@ -108,7 +108,8 @@ PaSessionHeartbeat { username, expires_at: Option<i64> }   // 语义照抄现有
 | promote | `POST /projects/P/promote` | ✅ 允许 |
 | 读项目列表 | `GET /projects` | ✅ 过滤为仅 P |
 | 审计 | `GET /audit` | ✅ handler 层强制过滤 `project=P`（principal 来自 extensions，无 query 绕过面；`get_audit` 需扩展 project 参数） |
-| 共享配置 | `POST /shared`、`PUT /shared-draft`、`POST /shared/publish`、**`GET /shared`、`GET /shared-draft`** | ❌ 拒绝 403 |
+| 共享配置-读 | `GET /shared`、`GET /shared-draft` | ✅ 允许（只读；secret 值已掩码；`GET /shared` 的 refs 过滤为仅自己项目，N11） |
+| 共享配置-写 | `POST /shared`、`PUT /shared-draft`、`POST /shared/publish`、`DELETE /shared/{key}`、`DELETE /shared-draft/{key}` | ❌ 拒绝 403 |
 | 共享引用-写 | `POST/DELETE /shared/refs` | ❌ 拒绝（绑定共享 secret → 物化进项目可读，构成权限升级） |
 | 共享引用-读 | `GET /shared/refs` | ✅ 允许（只读）；handler 强制覆写 `project=P`（RefsQuery.project 来自 query，N11，防跨项目元数据读取） |
 | 管理语义 reveal | `/v1/projects/P/branches/{b}/config?reveal=true`（不在 /api/v1 下！） | ✅ 允许且仅限 P——**该端点现有手动会话校验（lib.rs:1346-1377）改为按 Principal 校验归属，否则 PA 可解密任意项目 secret（B2 权限提升漏洞）**；审计已有。与中间件共用 `resolve_principal` helper，禁止手抄第三份 token 解析（N15） |
@@ -165,7 +166,7 @@ PUT    /api/v1/projects/{p}/admins/{username} {"password"}               改密�
 - operator 字段 serde 兼容：无 operator 字段的 JSON 反序列化成功
 
 **dsh-api/tests/http_project_admin.rs（新建 HTTP 集成测试，M2，参照 grpc_data_plane.rs start_server 模式）**
-- 全局管理员创建 PA → PA 登录 → **授权矩阵逐行断言**（含：logout/heartbeat 可用且续期；共享端点全组 403 含 GET /shared、GET /shared-draft；`GET /cluster/members`、`GET /admin/retention-status` 403；跨项目 403；账号管理 403；集群端点 403）
+- 全局管理员创建 PA → PA 登录 → **授权矩阵逐行断言**（含：logout/heartbeat 可用且续期；共享库只读放行（`GET /shared`、`GET /shared-draft` → 200，secret 值掩码、refs 仅自己项目）而写全组 403；`GET /cluster/members`、`GET /admin/retention-status` 403；跨项目 403；账号管理 403；集群端点 403）
 - **路径绕过组**：`%70`(编码p)、大写、尾斜杠、`%2F` → 全部 403
 - **token 路由负形测试（N14）**：伪造前缀（PA secret 拼 `adm.`、空 username、`pa.admin.x`）、截断 token → 全部 401
 - **`/v1/.../config?reveal=true`**：PA 只能 reveal 自己项目（B2 回归用例）；PA reveal 其他项目 403
@@ -194,7 +195,7 @@ PUT    /api/v1/projects/{p}/admins/{username} {"password"}               改密�
 ## 10. 风险与权衡
 
 1. **auth_middleware 是唯一强制点**——默认拒绝表 + 集成测试逐端点断言（含路径绕过组）。
-2. **共享 secret 升级路径封死**：PA 无 shared 写权 + 无 refs 写权；reveal 修复后仅限本项目。
+2. **共享 secret 升级路径封死**：PA 无 shared 写权（只读放行、secret 值恒掩码）+ 无 refs 写权；reveal 修复后仅限本项目。
 3. **SHA-256 快哈希**与现状同水位（PA 加盐优于现状 admin 无盐）；argon2 另立需求。
 4. **会话定位 O(1)**：token 前缀路由，无缓存、无扫描。
 5. **Raft wire 兼容**：既有变体不动 + 新字段全 serde default；旧日志/旧命令重放安全。

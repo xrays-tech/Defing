@@ -17,6 +17,10 @@ struct TestServer {
 }
 
 async fn start() -> TestServer {
+    start_with_cipher(None).await
+}
+
+async fn start_with_cipher(cipher: Option<std::sync::Arc<dsh_crypto::Cipher>>) -> TestServer {
     let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(
         InMemoryStore::new(),
     ))));
@@ -51,7 +55,7 @@ async fn start() -> TestServer {
         WatchHub::new(),
         None,
         None,
-        None,
+        cipher,
         std::time::Duration::from_secs(86400),
         "admin-pw".into(),
         None,
@@ -260,13 +264,16 @@ async fn pa_authorization_matrix() {
         assert_eq!(c, 403, "{m} {p}: {b}");
     }
 
-    // ❌ 共享面全组（含 GET）
+    // ✅ 共享库只读（草稿页「引用共享」下拉数据源；secret 值掩码）
+    for (m, p) in [("GET", "/api/v1/shared"), ("GET", "/api/v1/shared-draft")] {
+        let (c, b) = req(&s.base, m, p, Some(&pa), None).await;
+        assert_eq!(c, 200, "{m} {p}: {b}");
+    }
+    // ❌ 共享库写（仅全局管理员）
     for (m, p) in [
         ("POST", "/api/v1/shared"),
         ("PUT", "/api/v1/shared-draft"),
         ("POST", "/api/v1/shared/publish"),
-        ("GET", "/api/v1/shared"),
-        ("GET", "/api/v1/shared-draft"),
         ("DELETE", "/api/v1/shared/any-key"),
         ("DELETE", "/api/v1/shared-draft/any-key"),
     ] {
@@ -297,6 +304,151 @@ async fn pa_authorization_matrix() {
     // ✅ 集群成员端点只读放行（PA 配置 SDK 连接用）：dev-single 无 raft 路由 → 404 而非 403
     let (c, _) = req(&s.base, "GET", "/api/v1/cluster/members", Some(&pa), None).await;
     assert_ne!(c, 403, "PA 应可读集群成员端点列表（集群模式 200 / dev-single 404）");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pa_shared_read_masked_and_refs_filtered() {
+    let s = start_with_cipher(Some(std::sync::Arc::new(dsh_crypto::Cipher::new(
+        [9u8; 32],
+    ))))
+    .await;
+    let admin = admin_login(&s.base).await;
+
+    // admin 建共享项：int timeout + secret api-key，并发布
+    for (key, ty, secret, val) in [
+        (
+            "timeout",
+            "int",
+            false,
+            serde_json::json!({"type": "int", "int_value": 30}),
+        ),
+        (
+            "api-key",
+            "secret",
+            true,
+            serde_json::json!({"type": "string", "str_value": "topsecret"}),
+        ),
+    ] {
+        let (c, b) = req(
+            &s.base,
+            "POST",
+            "/api/v1/shared",
+            Some(&admin),
+            Some(serde_json::json!({
+                "key": key, "type": ty, "secret": secret, "value": val
+            })),
+        )
+        .await;
+        assert_eq!(c, 200, "create shared {key}: {b}");
+    }
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/shared/publish",
+        Some(&admin),
+        Some(serde_json::json!({"comment": "v1"})),
+    )
+    .await;
+    assert_eq!(c, 200, "shared publish: {b}");
+    // admin 再存一个未发布草稿（PA 只读列表应可见，值掩码）
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/shared",
+        Some(&admin),
+        Some(serde_json::json!({
+            "key": "draft-item", "type": "string", "secret": false,
+            "value": {"type": "string", "str_value": "draftv"}
+        })),
+    )
+    .await;
+    assert_eq!(c, 200, "create shared draft: {b}");
+
+    // p1 绑 timeout（int）、p2 绑 api-key（secret）→ 验证 PA 视角 refs 只含自己项目
+    for (pid, ty, secret, bind) in [
+        ("p1", "int", false, "timeout"),
+        ("p2", "secret", true, "api-key"),
+    ] {
+        let (c, b) = req(
+            &s.base,
+            "PUT",
+            &format!("/api/v1/projects/{pid}/structure-draft"),
+            Some(&admin),
+            Some(serde_json::json!({
+                "base_version": 1,
+                "groups": [{"name": "g", "items": [
+                    {"key": "k", "type": "string", "required": true},
+                    {"key": "sk", "type": ty, "secret": secret, "shared": true}
+                ]}]
+            })),
+        )
+        .await;
+        assert_eq!(c, 200, "{pid} structure-draft: {b}");
+        let (c, b) = req(
+            &s.base,
+            "POST",
+            &format!("/api/v1/projects/{pid}/structure-draft/publish"),
+            Some(&admin),
+            Some(serde_json::json!({"comment": "c"})),
+        )
+        .await;
+        assert_eq!(c, 200, "{pid} structure publish: {b}");
+        let (c, b) = req(
+            &s.base,
+            "PUT",
+            &format!("/api/v1/projects/{pid}/branches/dev/draft"),
+            Some(&admin),
+            Some(serde_json::json!({
+                "updates": [{"group": "g", "key": "k", "value": {"type": "string", "str_value": "v"}}],
+                "deletes": [],
+                "shared_bindings": [{"group": "g", "key": "sk", "shared_key": bind}]
+            })),
+        )
+        .await;
+        assert_eq!(c, 200, "{pid} bind {bind}: {b}");
+    }
+
+    let (_, body) = pa_login(&s.base, "alice", "alicepw").await;
+    let pa = body["token"].as_str().unwrap().to_string();
+
+    // PA GET /shared：200，secret 掩码，refs 仅自己项目
+    let (c, b) = req(&s.base, "GET", "/api/v1/shared", Some(&pa), None).await;
+    assert_eq!(c, 200, "PA shared list: {b}");
+    let arr = b.as_array().unwrap();
+    assert!(!arr.is_empty(), "PA 应看到共享列表: {b}");
+    let text = serde_json::to_string(&b).unwrap();
+    assert!(!text.contains("topsecret"), "secret 明文不得出现在共享列表: {b}");
+    let api_key = arr
+        .iter()
+        .find(|x| x["key"] == "api-key")
+        .expect("api-key 应在列表中");
+    assert_eq!(api_key["value"]["masked"], true, "secret 共享项应掩码: {api_key}");
+    let timeout = arr
+        .iter()
+        .find(|x| x["key"] == "timeout")
+        .expect("timeout 应在列表中");
+    let refs = timeout["refs"].as_array().unwrap();
+    assert!(!refs.is_empty(), "timeout 被 p1 绑定，refs 应非空: {b}");
+    assert!(
+        refs.iter().all(|r| r["project"] == "p1"),
+        "refs 应只含自己项目 p1: {b}"
+    );
+    let api_refs = api_key["refs"].as_array().unwrap();
+    assert!(
+        api_refs.is_empty(),
+        "api-key 被 p2 绑定，PA 不可见（refs 应过滤为空）: {b}"
+    );
+
+    // PA GET /shared-draft：200，含未发布草稿
+    let (c, b) = req(&s.base, "GET", "/api/v1/shared-draft", Some(&pa), None).await;
+    assert_eq!(c, 200, "PA shared-draft list: {b}");
+    assert!(
+        b.as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["key"] == "draft-item"),
+        "PA 应看到共享草稿列表: {b}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

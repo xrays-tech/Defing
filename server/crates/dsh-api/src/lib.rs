@@ -626,6 +626,10 @@ fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool
     if method == "GET" && path == "/api/v1/cluster/members" {
         return true;
     }
+    // 共享库只读（草稿页「引用共享」下拉数据源；secret 值已掩码；写仍仅全局管理员）
+    if method == "GET" && (path == "/api/v1/shared" || path == "/api/v1/shared-draft") {
+        return true;
+    }
 
     // 项目本地端点：/api/v1/projects/{p}/... 且 p == 自己项目
     if let Some(p) = project_segment(path) {
@@ -1792,7 +1796,10 @@ async fn update_shared_draft(
         .map(Json)
 }
 
-async fn list_shared(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
+async fn list_shared(
+    State(app): State<ApiState>,
+    principal: axum::Extension<dsh_core::Principal>,
+) -> ApiResult<serde_json::Value> {
     let sm = app.sm.read().map_err(lock_err)?;
     let items = sm
         .list_shared_published()
@@ -1800,7 +1807,18 @@ async fn list_shared(State(app): State<ApiState>) -> ApiResult<serde_json::Value
     let out = items
         .iter()
         .map(|item| {
-            let refs = sm.shared_usage(&item.key).ok();
+            // N11：PA 只读共享列表时 refs 过滤为仅自己项目（防跨项目元数据读取）
+            let refs = match &*principal {
+                dsh_core::Principal::ProjectAdmin { project, .. } => sm
+                    .shared_usage(&item.key)
+                    .ok()
+                    .map(|all| {
+                        all.into_iter()
+                            .filter(|(p, _, _, _)| p.as_str() == project.0)
+                            .collect::<Vec<_>>()
+                    }),
+                _ => sm.shared_usage(&item.key).ok(),
+            };
             shared_item_json(item, refs.as_deref())
         })
         .collect::<Vec<_>>();
@@ -4440,13 +4458,17 @@ mod pa_matrix_tests {
     }
 
     #[test]
-    fn pa_denied_shared_and_admin_surface() {
+    fn pa_shared_read_allowed_writes_denied() {
         let p = pa("order-service");
-        // 共享库全拒（含 GET）
-        assert!(!pa_allowed(&p, "GET", "/api/v1/shared"));
-        assert!(!pa_allowed(&p, "GET", "/api/v1/shared-draft"));
+        // 共享库只读放行（草稿页「引用共享」下拉数据源；secret 值已掩码）
+        assert!(pa_allowed(&p, "GET", "/api/v1/shared"));
+        assert!(pa_allowed(&p, "GET", "/api/v1/shared-draft"));
+        // 写仍仅全局管理员
         assert!(!pa_allowed(&p, "POST", "/api/v1/shared"));
+        assert!(!pa_allowed(&p, "PUT", "/api/v1/shared-draft"));
         assert!(!pa_allowed(&p, "POST", "/api/v1/shared/publish"));
+        assert!(!pa_allowed(&p, "DELETE", "/api/v1/shared/timeout"));
+        assert!(!pa_allowed(&p, "DELETE", "/api/v1/shared-draft/timeout"));
         // 全局管理员面
         assert!(!pa_allowed(&p, "POST", "/api/v1/admin/set-password"));
         assert!(!pa_allowed(&p, "GET", "/api/v1/admin/snapshot"));
