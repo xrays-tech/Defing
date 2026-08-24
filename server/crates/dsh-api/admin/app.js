@@ -1918,18 +1918,35 @@ actions.setAdminPw = function (el) {
   });
 };
 
-actions.setGlobalPassword = async function (el) {
-  const p = $('g-password').value;
-  const p2 = $('g-password2').value;
-  if (!p || p.length < 6) { showErr('g-err', '新密码至少 6 位'); return; }
-  if (p !== p2) { showErr('g-err', '两次输入不一致'); return; }
-  hideErr('g-err');
+/* ---------- 自助修改密码（全局管理员 / 项目管理员通用；校验当前密码） ---------- */
+actions.openChangePw = function () {
+  hideErr('pw-err');
+  $('pw-current').value = ''; $('pw-new').value = ''; $('pw-new2').value = '';
+  $('pw-overlay').classList.remove('hidden');
+  $('pw-current').focus();
+};
+actions.closePwModal = function () {
+  $('pw-overlay').classList.add('hidden');
+};
+actions.submitChangePw = async function (el) {
+  const cur = $('pw-current').value;
+  const n1 = $('pw-new').value;
+  const n2 = $('pw-new2').value;
+  if (!cur) { showErr('pw-err', '请输入当前密码'); return; }
+  if (!n1 || n1.length < 6) { showErr('pw-err', '新密码至少 6 位'); return; }
+  if (n1 !== n2) { showErr('pw-err', '两次输入不一致'); return; }
+  hideErr('pw-err');
   await withBusy(el, async () => {
     try {
-      await j('POST', '/api/v1/admin/set-password', { password: p });
-      toast('全局管理员密码已修改，请重新登录');
-      $('g-password').value = ''; $('g-password2').value = '';
-    } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+      await j('POST', '/api/v1/me/password', { current_password: cur, new_password: n1 });
+      $('pw-overlay').classList.add('hidden');
+      // 服务端已收回全部旧会话（含当前）：清除本地会话并回登录页（不触发「会话已过期」提示）
+      S.token = '';
+      localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ);
+      $('app').classList.add('hidden');
+      $('login-view').classList.remove('hidden');
+      toast('密码已修改，请重新登录');
+    } catch (e) { if (!e.expired) showErr('pw-err', e.message); }
   });
 };
 /* ============================================================
@@ -2000,6 +2017,14 @@ function bindEvents() {
   });
   $('cfg-overlay').addEventListener('mousedown', (e) => { if (e.target === $('cfg-overlay')) actions.closeCfg(); });
   $('token-overlay').addEventListener('mousedown', (e) => { if (e.target === $('token-overlay')) actions.closeTokenModal(); });
+  $('pw-overlay').addEventListener('mousedown', (e) => { if (e.target === $('pw-overlay')) actions.closePwModal(); });
+
+  // 修改密码弹窗：Enter 提交（任一输入框）
+  for (const id of ['pw-current', 'pw-new', 'pw-new2']) {
+    $(id).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); $('pw-overlay').querySelector('[data-act="submitChangePw"]').click(); }
+    });
+  }
 
   // Esc 关闭弹窗
   document.addEventListener('keydown', (e) => {
@@ -2007,6 +2032,7 @@ function bindEvents() {
     if (!$('modal-overlay').classList.contains('hidden')) closeModal(false);
     else if (!$('cfg-overlay').classList.contains('hidden')) actions.closeCfg();
     else if (!$('token-overlay').classList.contains('hidden')) actions.closeTokenModal();
+    else if (!$('pw-overlay').classList.contains('hidden')) actions.closePwModal();
   });
 
   // 审计过滤（Enter）

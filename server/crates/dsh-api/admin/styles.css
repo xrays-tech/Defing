@@ -476,8 +476,8 @@ textarea.code { min-height: 140px; }
 .session-info { min-width: 0; line-height: 1.3; }
 .session-name { font-size: 13px; font-weight: 500; }
 .session-sub { font-size: 11.5px; color: var(--fg-faint); }
-.sidebar-foot .btn { justify-content: flex-start; }
-.foot-row { display: flex; gap: 6px; }
+.sidebar-foot .btn { justify-content: flex-start; padding: 0 8px; }
+.foot-row { display: flex; gap: 4px; flex-wrap: wrap; }
 
 .main {
   flex: 1;

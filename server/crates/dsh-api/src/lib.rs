@@ -614,6 +614,10 @@ fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool
     if method == "POST" && (path == "/api/v1/logout" || path == "/api/v1/heartbeat") {
         return true;
     }
+    // 自助改密（B1：校验当前密码；只能改自己，主体取自会话扩展不可伪造）
+    if method == "POST" && path == "/api/v1/me/password" {
+        return true;
+    }
     // 读项目列表（handler 内过滤为自己项目）
     if method == "GET" && path == "/api/v1/projects" {
         return true;
@@ -3715,6 +3719,109 @@ struct SetPasswordReq {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct ChangeMyPasswordReq {
+    /// 当前密码（验证本人；防无验证会话改密）。
+    current_password: String,
+    /// 新密码（≥6 位）。
+    new_password: String,
+}
+
+/// 当前密码错误统一响应（401 + ERR_BAD_CREDENTIALS，与登录同码位，防枚举）。
+fn bad_current_password() -> (StatusCode, Json<ApiErrorBody>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ApiErrorBody {
+            code: "ERR_BAD_CREDENTIALS".into(),
+            message: "当前密码错误".into(),
+            detail: None,
+        }),
+    )
+}
+
+/// 自助修改密码（全局管理员 + 项目管理员通用，侧边栏「修改密码」入口；B1：校验当前密码）。
+/// - admin：校验全局管理员密码（状态机哈希优先，回退节点配置 --admin-password，同 login）
+///   → AdminSetPassword + 踢全部管理员会话（改密即重登）；
+/// - PA：校验账号加盐哈希 → ProjectAdminSetPassword（apply 级联收回该账号全部会话）。
+/// 只能改自己的密码：主体取自会话扩展（中间件注入），不可由请求体伪造。
+async fn change_my_password(
+    State(app): State<ApiState>,
+    principal: axum::Extension<dsh_core::Principal>,
+    Json(req): Json<ChangeMyPasswordReq>,
+) -> ApiResult<serde_json::Value> {
+    if req.new_password.len() < 6 {
+        return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
+    }
+    let now = now_ms();
+    let operator = principal_op(&principal.0);
+    match &principal.0 {
+        dsh_core::Principal::Admin => {
+            let sm_pw_ok = {
+                let sm = app.sm.read().map_err(lock_err)?;
+                match sm.get_admin_password_hash().ok().flatten() {
+                    Some(hash) => verify_password(&req.current_password, &hash, ""),
+                    None => req.current_password == app.admin_password.as_ref(),
+                }
+            };
+            if !sm_pw_ok {
+                return Err(bad_current_password());
+            }
+            let hash = hash_password(&req.new_password).map_err(ApiError::from)?;
+            app.write(&Command::AdminSetPassword { password_hash: hash }, now)
+                .await?;
+            // 改密后强制下线全部管理员会话（旧+新格式全清），与 admin_set_password 一致
+            app.write(&Command::MultiSessionLogoutAll, now).await?;
+            app.audit
+                .append(
+                    "set_password_self",
+                    None,
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({}),
+                    &operator,
+                )
+                .await;
+        }
+        dsh_core::Principal::ProjectAdmin { username, .. } => {
+            let account = {
+                let sm = app.sm.read().map_err(lock_err)?;
+                sm.get_project_admin(username).ok().flatten()
+            };
+            let ok = account
+                .as_ref()
+                .map(|acct| verify_password(&req.current_password, &acct.password_hash, &acct.salt))
+                .unwrap_or(false);
+            if !ok {
+                return Err(bad_current_password());
+            }
+            let (salt, hash) = salted_password_hash(&req.new_password).map_err(ApiError::from)?;
+            app.write(
+                &Command::ProjectAdminSetPassword {
+                    username: username.clone(),
+                    salt,
+                    password_hash: hash,
+                },
+                now,
+            )
+            .await?;
+            // apply 已级联收回该账号全部会话（改密即重登）
+            app.audit
+                .append(
+                    "set_password_self",
+                    None,
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({ "username": username }),
+                    &operator,
+                )
+                .await;
+        }
+    }
+    Ok(Json(serde_json::json!({ "changed": true })))
+}
+
 /// 修改管理员密码（哈希落状态机，集群一致；旧会话失效需重新登录）。
 async fn admin_set_password(
     State(app): State<ApiState>,
@@ -4236,6 +4343,7 @@ pub fn build_router(app: ApiState) -> Router {
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/heartbeat", post(heartbeat))
+        .route("/api/v1/me/password", post(change_my_password))
         .route("/api/v1/audit", get(audit_list))
         .route("/api/v1/admin/rotate-master-key", post(rotate_master_key))
         .route("/api/v1/admin/force-logout", post(admin_force_logout))
@@ -4483,6 +4591,18 @@ mod pa_matrix_tests {
         assert!(pa_allowed(&p, "PUT", "/api/v1/projects/order-service/branches/dev/draft"));
         assert!(!pa_allowed(&p, "GET", "/api/v1/projects/other-svc/branches"));
         assert!(!pa_allowed(&p, "DELETE", "/api/v1/projects/order-service"));
+    }
+
+    #[test]
+    fn pa_self_service_password_change_allowed_only_post() {
+        let p = pa("order-service");
+        // 自助改密放行（主体取自会话扩展，只能改自己）
+        assert!(pa_allowed(&p, "POST", "/api/v1/me/password"));
+        // 其他方法/其他面不放行
+        assert!(!pa_allowed(&p, "GET", "/api/v1/me/password"));
+        assert!(!pa_allowed(&p, "PUT", "/api/v1/me/password"));
+        // 账号管理面仍拒绝（改别人密码仍仅全局管理员）
+        assert!(!pa_allowed(&p, "PUT", "/api/v1/projects/order-service/admins/u"));
     }
 }
 // ---------------- 安全加固单元测试（S6 节流 / argon2 密码哈希） ----------------

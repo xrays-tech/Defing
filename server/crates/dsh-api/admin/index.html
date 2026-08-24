@@ -63,7 +63,7 @@
       <div id="login-err" class="field-err hidden"></div>
       <button type="submit" class="btn primary block" id="login-submit">登 录</button>
     </form>
-    <p class="login-foot">项目管理员请填写用户名；令牌仅保存在本地浏览器</p>
+    <p class="login-foot">项目管理员请填写用户名；令牌仅保存在本地浏览器。登录后可在左下角「修改密码」修改自己的密码。</p>
   </div>
 </div>
 
@@ -90,6 +90,9 @@
         </div>
       </div>
       <div class="foot-row">
+        <button type="button" class="btn ghost" id="btn-changepw" data-act="openChangePw" title="修改密码" aria-label="修改密码">
+          <svg class="ic"><use href="#i-lock"/></svg><span>修改密码</span>
+        </button>
         <button type="button" class="btn ghost" id="btn-theme" data-act="toggleTheme" title="切换主题" aria-label="切换主题">
           <svg class="ic" id="btn-theme-sun"><use href="#i-sun"/></svg>
           <svg class="ic hidden" id="btn-theme-moon"><use href="#i-moon"/></svg>
@@ -430,24 +433,10 @@
       <section id="view-admins" class="view hidden">
         <header class="view-head">
           <h1>管理员</h1>
-          <p class="view-sub">全局管理员密码与项目管理员账号管理（仅全局管理员）</p>
+          <p class="view-sub">项目管理员账号管理（仅全局管理员）；修改自己的密码请使用左下角「修改密码」入口（需验证当前密码）</p>
         </header>
         <div class="stack">
           <div class="grid-2">
-            <div class="card">
-              <div class="card-head"><h3>全局管理员密码</h3></div>
-              <div class="field">
-                <label for="g-password">新密码（至少 6 位）</label>
-                <input class="in" id="g-password" type="password" autocomplete="new-password">
-              </div>
-              <div class="field">
-                <label for="g-password2">确认新密码</label>
-                <input class="in" id="g-password2" type="password" autocomplete="new-password">
-              </div>
-              <div id="g-err" class="field-err hidden"></div>
-              <button type="button" class="btn" data-act="setGlobalPassword">修改密码</button>
-              <p class="hint" style="margin:10px 0 0">修改后全部管理员会话将失效，需重新登录。</p>
-            </div>
             <div class="card">
               <div class="card-head"><h3>项目管理员</h3></div>
               <div class="row" style="gap:10px">
@@ -472,6 +461,10 @@
                   <tbody id="adm-body"></tbody>
                 </table>
               </div>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>说明</h3></div>
+              <p class="hint" style="margin:0">项目管理员可自行在左下角「修改密码」修改自己的密码（需验证当前密码，改后其全部会话失效重新登录）；全局管理员改密同样走该入口，改后全部管理员会话失效。</p>
             </div>
           </div>
         </div>
@@ -517,6 +510,34 @@
       <button type="button" class="icon-btn" data-act="copyCfg" title="复制" aria-label="复制"><svg class="ic"><use href="#i-copy"/></svg></button>
     </div>
     <pre id="cfg-out" class="codeblock"></pre>
+  </div>
+</div>
+
+<!-- ========== 修改密码（自助：全局管理员 / 项目管理员，需验证当前密码） ========== -->
+<div id="pw-overlay" class="overlay hidden">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pw-title">
+    <div class="modal-head-row">
+      <h3 id="pw-title">修改密码</h3>
+      <button type="button" class="icon-btn" data-act="closePwModal" title="关闭" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="field">
+      <label for="pw-current">当前密码</label>
+      <input class="in" id="pw-current" type="password" autocomplete="current-password">
+    </div>
+    <div class="field">
+      <label for="pw-new">新密码（至少 6 位）</label>
+      <input class="in" id="pw-new" type="password" autocomplete="new-password">
+    </div>
+    <div class="field">
+      <label for="pw-new2">确认新密码</label>
+      <input class="in" id="pw-new2" type="password" autocomplete="new-password">
+    </div>
+    <div id="pw-err" class="field-err hidden"></div>
+    <p class="hint">修改成功后全部旧会话将失效，需重新登录。</p>
+    <div class="modal-foot">
+      <button type="button" class="btn" data-act="closePwModal">取消</button>
+      <button type="button" class="btn primary" data-act="submitChangePw">确定</button>
+    </div>
   </div>
 </div>
 

@@ -810,6 +810,105 @@ async fn expired_session_auto_relogin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_service_password_change_pa_and_admin() {
+    let s = start().await;
+    let admin = admin_login(&s.base).await;
+    let (_, body) = pa_login(&s.base, "alice", "alicepw").await;
+    let pa = body["token"].as_str().unwrap().to_string();
+
+    // 未认证 → 401
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        None,
+        Some(serde_json::json!({"current_password": "alicepw", "new_password": "new-pw"})),
+    )
+    .await;
+    assert_eq!(c, 401, "未认证应 401");
+
+    // PA：当前密码错误 → 401 ERR_BAD_CREDENTIALS（与登录同码位），会话不受影响
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        Some(&pa),
+        Some(serde_json::json!({"current_password": "wrong", "new_password": "new-pw"})),
+    )
+    .await;
+    assert_eq!(c, 401, "{b}");
+    assert_eq!(b["code"], "ERR_BAD_CREDENTIALS");
+    let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1", Some(&pa), None).await;
+    assert_eq!(c, 200, "改密失败会话应保持有效");
+
+    // PA：新密码过短 → 422
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        Some(&pa),
+        Some(serde_json::json!({"current_password": "alicepw", "new_password": "123"})),
+    )
+    .await;
+    assert_eq!(c, 422, "{b}");
+
+    // PA 多会话并存：改密后该账号全部会话失效（旧+新格式全清）
+    let (_, b2) = pa_login(&s.base, "alice", "alicepw").await;
+    let pa2 = b2["token"].as_str().unwrap().to_string();
+    assert_ne!(pa, pa2);
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        Some(&pa),
+        Some(serde_json::json!({"current_password": "alicepw", "new_password": "new-pw"})),
+    )
+    .await;
+    assert_eq!(c, 200, "{b}");
+    for t in [&pa, &pa2] {
+        let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1", Some(t), None).await;
+        assert_eq!(c, 401, "改密后旧会话应全部失效");
+    }
+    // 新密码可登，旧密码不可
+    let (c, _) = pa_login(&s.base, "alice", "new-pw").await;
+    assert_eq!(c, 200);
+    let (c, _) = pa_login(&s.base, "alice", "alicepw").await;
+    assert_eq!(c, 401);
+
+    // 全局管理员：自助改密（校验当前密码）→ 全部管理员会话失效
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        Some(&admin),
+        Some(serde_json::json!({"current_password": "admin-pw", "new_password": "admin-pw2"})),
+    )
+    .await;
+    assert_eq!(c, 200, "{b}");
+    let (c, _) = req(&s.base, "GET", "/api/v1/projects", Some(&admin), None).await;
+    assert_eq!(c, 401, "管理员改密后旧会话应失效");
+    // 新密码可登，旧密码不可
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/login",
+        None,
+        Some(serde_json::json!({"password": "admin-pw2"})),
+    )
+    .await;
+    assert_eq!(c, 200);
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/login",
+        None,
+        Some(serde_json::json!({"password": "admin-pw"})),
+    )
+    .await;
+    assert_eq!(c, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn structure_endpoint_returns_published_structure() {
     let s = start().await;
     let admin = admin_login(&s.base).await;

@@ -49,6 +49,26 @@ paths:
                 properties:
                   expires_at: { type: string, format: date-time }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/me/password:
+    post:
+      summary: 自助修改自己的密码（全局管理员 / 项目管理员通用；校验当前密码，改后全部旧会话失效需重新登录）
+      security:
+        - AdminSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string, description: 当前密码（验证本人；错误返回 401 ERR_BAD_CREDENTIALS） }
+                new_password: { type: string, minLength: 6, description: 新密码（≥6 位） }
+      responses:
+        '200':
+          description: 已修改（当前会话一并失效）
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
   /api/v1/projects:
     get:
       summary: 项目列表

@@ -99,6 +99,7 @@ PaSessionHeartbeat { username, expires_at: Option<i64> }   // 语义照抄现有
 | 类别 | 端点 | 结论 |
 | --- | --- | --- |
 | 自身会话 | `POST /logout`、`POST /heartbeat` | ✅ 允许（principal 从 extensions 取，不可从 body 注入）——**显式放行，防 PA 过期后锁死** |
+| 自助改密 | `POST /me/password`（校验当前密码） | ✅ 允许（主体取自会话扩展，只能改自己；改后该账号全部会话失效，同改密语义） |
 | 项目详情 | `GET /projects/{p}` | ✅ 仅限 P |
 | 项目配置-结构 | `GET/PUT /projects/P/structure-draft`、`POST .../structure-draft/publish` | ✅ 允许 |
 | 项目配置-值 | `GET/PUT /projects/P/branches/{b}/draft`、`POST .../publish`、`POST .../rollback`、**`GET .../config`（含 ?reveal=true，本项目）** | ✅ 允许 |
@@ -128,7 +129,10 @@ POST   /api/v1/projects/{p}/admins            {"username","password"}     创建
 GET    /api/v1/projects/{p}/admins            → [{"username","created_at"}]（不返回哈希/盐）
 DELETE /api/v1/projects/{p}/admins/{username} 删除（连带删会话）
 PUT    /api/v1/projects/{p}/admins/{username} {"password"}               改密（连带删会话）
+POST   /api/v1/me/password                    {"current_password","new_password"}  自助改密（通用，非全局管理员专用）
 ```
+
+> 自助改密（`/api/v1/me/password`，全局管理员与 PA 通用）：校验当前密码（admin 走状态机哈希/节点配置回退，PA 走账号加盐哈希，错误统一 401 `ERR_BAD_CREDENTIALS`），成功后 admin 路径追加 `MultiSessionLogoutAll`（与 `admin_set_password` 一致），PA 路径由 `ProjectAdminSetPassword` apply 级联收回该账号全部会话。审计 action `set_password_self`，operator 按主体（`admin` / `pa:{username}`）。
 
 错误码新增：`ERR_BAD_CREDENTIALS`(401，login 失败统一用此码，替换现有 `"ERR_FORBIDDEN"`+401 的码位冲突 N4；文案统一不区分账号是否存在，防枚举)、`ERR_FORBIDDEN`(403)、`ERR_ACCOUNT_EXISTS`(409)、`ERR_ACCOUNT_NOT_FOUND`(404)。
 
