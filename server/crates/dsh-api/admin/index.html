@@ -559,6 +559,20 @@
   </div>
 </div>
 
+<!-- ========== 统一错误弹窗（报错均在屏幕中心以模态弹窗展示） ========== -->
+<div id="err-overlay" class="overlay hidden">
+  <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="err-title" aria-describedby="err-msg">
+    <div class="err-head">
+      <svg class="ic err-ic"><use href="#i-alert"/></svg>
+      <h3 id="err-title">操作失败</h3>
+    </div>
+    <p id="err-msg" class="modal-msg"></p>
+    <div class="modal-foot">
+      <button type="button" class="btn primary" data-act="closeErrModal" id="err-ok">确定</button>
+    </div>
+  </div>
+</div>
+
 <!-- ========== 通知 ========== -->
 <div id="toasts" aria-live="polite"></div>
 

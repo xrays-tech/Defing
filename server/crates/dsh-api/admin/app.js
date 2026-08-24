@@ -92,11 +92,25 @@ async function withBusy(el, fn) {
   finally { if (el && el.removeAttribute) { el.removeAttribute('data-busy'); el.disabled = false; } }
 }
 
+/* ---------------- 统一错误弹窗（报错一律在屏幕中心以模态弹窗展示） ---------------- */
+function showErrorModal(message, title) {
+  $('err-title').textContent = title || '操作失败';
+  $('err-msg').textContent = message || '';
+  $('err-overlay').classList.remove('hidden');
+  const ok = $('err-ok');
+  if (ok) ok.focus();
+}
+function closeErrorModal() {
+  $('err-overlay').classList.add('hidden');
+}
+
 /* ---------------- 通知 ---------------- */
 function toast(text, kind = 'ok', ms) {
+  // 报错统一走屏幕中心错误弹窗；toast 仅保留成功 / 警告
+  if (kind === 'err') { showErrorModal(text); return; }
   const box = document.createElement('div');
   box.className = 'toast ' + kind;
-  const icon = kind === 'err' ? 'i-alert' : kind === 'warn' ? 'i-info' : 'i-check';
+  const icon = kind === 'warn' ? 'i-info' : 'i-check';
   box.innerHTML =
     '<svg class="ic t-ic"><use href="#' + icon + '"/></svg>' +
     '<div class="toast-text"></div>' +
@@ -106,16 +120,12 @@ function toast(text, kind = 'ok', ms) {
   let gone = false;
   const kill = () => { if (gone) return; gone = true; box.classList.add('out'); setTimeout(() => box.remove(), 160); };
   box.querySelector('.toast-x').addEventListener('click', kill);
-  setTimeout(kill, ms || (kind === 'err' ? 6000 : 4000));
+  setTimeout(kill, ms || 4000);
 }
 
-/* ---------------- 表单内联错误 ---------------- */
+/* ---------------- 表单校验错误（已统一为屏幕中心错误弹窗） ---------------- */
 function showErr(id, text) {
-  const el = $(id);
-  if (!el) return toast(text, 'err');
-  el.innerHTML = '<svg class="ic"><use href="#i-alert"/></svg><span></span>';
-  el.querySelector('span').textContent = text;
-  el.classList.remove('hidden');
+  showErrorModal(text);
 }
 function hideErr(id) { const el = $(id); if (el) el.classList.add('hidden'); }
 
@@ -195,7 +205,7 @@ async function loadTokens() {
     renderTokens(list);
   } catch (e) {
     if (e.status === 403) tbody.innerHTML = '<tr><td colspan="6" class="muted">仅全局管理员可查看访问令牌</td></tr>';
-    else toast('加载令牌失败：' + e.message);
+    else toast('加载令牌失败：' + e.message, 'err');
   }
 }
 
@@ -224,14 +234,14 @@ actions.createToken = async function () {
     okText: '创建',
     onOk: async (name) => {
       name = (name || '').trim();
-      if (!name) { toast('令牌名称不能为空'); return; }
+      if (!name) { toast('令牌名称不能为空', 'err'); return; }
       try {
         const r = await j('POST', '/api/v1/projects/' + encodeURIComponent(S.project) + '/tokens', { name });
         $('token-plaintext').textContent = r.token || '';
         $('token-overlay').classList.remove('hidden');
         toast('令牌已创建（明文仅展示一次）');
         loadTokens();
-      } catch (e) { toast('创建失败：' + e.message); }
+      } catch (e) { toast('创建失败：' + e.message, 'err'); }
     },
   });
 };
@@ -248,7 +258,7 @@ actions.revokeToken = function (el) {
         await j('DELETE', '/api/v1/projects/' + encodeURIComponent(S.project) + '/tokens/' + encodeURIComponent(id));
         toast('已吊销');
         loadTokens();
-      } catch (e) { toast('吊销失败：' + e.message); }
+      } catch (e) { toast('吊销失败：' + e.message, 'err'); }
     },
   });
 };
@@ -256,7 +266,7 @@ actions.revokeToken = function (el) {
 actions.copyToken = function () {
   const txt = $('token-plaintext').textContent || '';
   if (!txt) return;
-  navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动选择复制'));
+  navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动选择复制', 'err'));
 };
 
 /* ---------- 构建脚本取值：curl 命令展示 ---------- */
@@ -273,10 +283,11 @@ actions.tokFmt = function () { renderCurlCmd(); };
 actions.copyCurlUrl = function () {
   const txt = $('tok-curl-cmd').textContent || '';
   if (!txt) return;
-  navigator.clipboard.writeText(txt).then(() => toast('curl 命令已复制')).catch(() => toast('复制失败，请手动选择复制'));
+  navigator.clipboard.writeText(txt).then(() => toast('curl 命令已复制')).catch(() => toast('复制失败，请手动选择复制', 'err'));
 };
 
 actions.closeTokenModal = function () { $('token-overlay').classList.add('hidden'); };
+actions.closeErrModal = function () { closeErrorModal(); };
 actions.toggleTheme = function () {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   localStorage.setItem(LS_THEME, next);
@@ -2018,6 +2029,7 @@ function bindEvents() {
   $('cfg-overlay').addEventListener('mousedown', (e) => { if (e.target === $('cfg-overlay')) actions.closeCfg(); });
   $('token-overlay').addEventListener('mousedown', (e) => { if (e.target === $('token-overlay')) actions.closeTokenModal(); });
   $('pw-overlay').addEventListener('mousedown', (e) => { if (e.target === $('pw-overlay')) actions.closePwModal(); });
+  $('err-overlay').addEventListener('mousedown', (e) => { if (e.target === $('err-overlay')) closeErrorModal(); });
 
   // 修改密码弹窗：Enter 提交（任一输入框）
   for (const id of ['pw-current', 'pw-new', 'pw-new2']) {
@@ -2029,7 +2041,8 @@ function bindEvents() {
   // Esc 关闭弹窗
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (!$('modal-overlay').classList.contains('hidden')) closeModal(false);
+    if (!$('err-overlay').classList.contains('hidden')) closeErrorModal();
+    else if (!$('modal-overlay').classList.contains('hidden')) closeModal(false);
     else if (!$('cfg-overlay').classList.contains('hidden')) actions.closeCfg();
     else if (!$('token-overlay').classList.contains('hidden')) actions.closeTokenModal();
     else if (!$('pw-overlay').classList.contains('hidden')) actions.closePwModal();

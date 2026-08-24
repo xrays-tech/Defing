@@ -804,6 +804,23 @@ textarea.code { min-height: 140px; }
 }
 .modal-toolbar .sel { width: auto; }
 
+/* 统一错误弹窗：屏幕中心，置于其它弹窗（overlay z-index 90）与通知（120）之上 */
+#err-overlay { z-index: 130; }
+.err-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 10px;
+}
+.err-head h3 { margin: 0; }
+.err-ic {
+  color: var(--err);
+  background: var(--err-subtle);
+  border-radius: 50%;
+  padding: 3px;
+  box-sizing: content-box;
+}
+
 .codeblock {
   flex: 1;
   overflow: auto;
