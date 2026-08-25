@@ -20,6 +20,30 @@ const rid = () => 'ui-' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
 const fmtTime = (ms) => (ms ? new Date(ms).toLocaleString('zh-CN', { hour12: false }) : '—');
 const skeleton = (n) => Array.from({ length: n }, () => '<div class="skel"></div>').join('');
 
+/* ---------------- 剪贴板复制 ----------------
+   Clipboard API 仅在安全上下文（HTTPS / localhost）可用；HTTP 部署下 navigator.clipboard
+   为 undefined，直接调用会同步抛错。统一封装：Clipboard API 优先，失败回退
+   textarea + execCommand('copy')（同为用户手势内同步执行）。 */
+async function copyText(txt) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(txt); return true; } catch (_) { /* 权限拒绝等 → 走回退 */ }
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-9999px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length); // iOS Safari 兼容
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return !!ok;
+  } catch (_) { return false; }
+}
+
 /* ---------------- 状态 ---------------- */
 const LS_TOKEN = 'dsh_admin_token', LS_ROLE = 'dsh_admin_role', LS_PROJ = 'dsh_admin_project', LS_THEME = 'dsh_theme';
 const S = {
@@ -263,10 +287,11 @@ actions.revokeToken = function (el) {
   });
 };
 
-actions.copyToken = function () {
+actions.copyToken = async function () {
   const txt = $('token-plaintext').textContent || '';
   if (!txt) return;
-  navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动选择复制', 'err'));
+  if (await copyText(txt)) toast('已复制');
+  else toast('复制失败，请手动选择复制', 'err');
 };
 
 /* ---------- 构建脚本取值：curl 命令展示 ---------- */
@@ -280,10 +305,11 @@ function renderCurlCmd() {
   el.textContent = 'curl -s "' + url + '" -H "Authorization: Bearer <项目访问令牌>"';
 }
 actions.tokFmt = function () { renderCurlCmd(); };
-actions.copyCurlUrl = function () {
+actions.copyCurlUrl = async function () {
   const txt = $('tok-curl-cmd').textContent || '';
   if (!txt) return;
-  navigator.clipboard.writeText(txt).then(() => toast('curl 命令已复制')).catch(() => toast('复制失败，请手动选择复制', 'err'));
+  if (await copyText(txt)) toast('curl 命令已复制');
+  else toast('复制失败，请手动选择复制', 'err');
 };
 
 actions.closeTokenModal = function () { $('token-overlay').classList.add('hidden'); };
@@ -1576,20 +1602,8 @@ async function fetchCfg() {
 actions.copyCfg = async function () {
   const t = $('cfg-out').textContent || '';
   if (!t || t === '加载中…') return;
-  try {
-    await navigator.clipboard.writeText(t);
-    toast('已复制到剪贴板');
-  } catch (_) {
-    try {
-      const ta = document.createElement('textarea');
-      ta.value = t;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
-      toast('已复制到剪贴板');
-    } catch (_2) { toast('复制失败，请手动选择复制', 'err'); }
-  }
+  if (await copyText(t)) toast('已复制到剪贴板');
+  else toast('复制失败，请手动选择复制', 'err');
 };
 
 /* ---------- 分支对比 / 提升 ---------- */
