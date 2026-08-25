@@ -1665,20 +1665,23 @@ async function loadShared() {
     updateSharedStatus();
     const rows = (draft || []).map((x) => ({ ...x, __draft: true }))
       .concat((pub || []).map((x) => ({ ...x, __draft: false })));
-    // 行索引（编辑按钮载入表单的数据源；草稿行优先覆盖发布行）
+    // 行索引（编辑按钮载入表单的数据源）：按行序号取行——点击哪行就载入哪行
+    // （草稿行载入草稿值、发布行载入发布值）；另按 key 建映射（草稿优先）供 saveShared 防呆查询 refs
+    S.sharedRowList = rows;
     S.sharedRows = {};
-    for (const x of rows) S.sharedRows[x.key] = x;
+    for (const x of rows) if (x.__draft) S.sharedRows[x.key] = x;
+    for (const x of rows) if (!x.__draft) S.sharedRows[x.key] = x;
     if (!rows.length) {
       $('shared-body').innerHTML = '<tr><td colspan="8"><div class="empty mini"><svg class="ic"><use href="#i-shared"/></svg><h4>暂无共享项</h4><p>在上方表单创建共享草稿，发布后各项目可在结构页引用。</p></div></td></tr>';
       return;
     }
-    $('shared-body').innerHTML = rows.map((x) => {
+    $('shared-body').innerHTML = rows.map((x, i) => {
       const refs = x.refs || [];
       const refTxt = refs.length ? refs.map((r) => r.project + '/' + r.branch + '/' + r.group + '/' + r.item_key).join('<br>') : '—';
       const delBtn = x.__draft
         ? `<button type="button" class="icon-btn danger" data-act="deleteSharedDraftItem" data-key="${esc(x.key)}" title="删除草稿" aria-label="删除草稿"><svg class="ic"><use href="#i-trash"/></svg></button>`
         : `<button type="button" class="icon-btn danger" data-act="deleteSharedItem" data-key="${esc(x.key)}" data-refs="${esc(refs.map((r) => r.project + '/' + r.branch + '/' + r.group + '/' + r.item_key).join(', '))}" title="删除共享项" aria-label="删除共享项"><svg class="ic"><use href="#i-trash"/></svg></button>`;
-      const editBtn = `<button type="button" class="icon-btn" data-act="editSharedItem" data-key="${esc(x.key)}" title="编辑共享项" aria-label="编辑共享项"><svg class="ic"><use href="#i-edit"/></svg></button>`;
+      const editBtn = `<button type="button" class="icon-btn" data-act="editSharedItem" data-i="${i}" data-key="${esc(x.key)}" title="编辑共享项" aria-label="编辑共享项"><svg class="ic"><use href="#i-edit"/></svg></button>`;
       return `<tr>
       <td class="mono">${esc(x.key)}</td>
       <td class="mono muted">${esc(x.ty || x.type || '')}</td>
@@ -1698,9 +1701,10 @@ actions.refreshShared = function () { loadShared(); };
 
 // shared-edit-ui：编辑已有共享项——载入表单（草稿行载入草稿值，发布行载入发布值）
 actions.editSharedItem = async function (el) {
-  const x = S.sharedRows[el.dataset.key];
-  if (!x) return;
-  const keyEl = $('sh-key'), typeEl = $('sh-type');
+  try {
+    const x = (S.sharedRowList || [])[Number(el.dataset.i)];
+    if (!x) { showErrorModal('未找到共享项行数据，请刷新列表后重试', '编辑失败'); return; }
+    const keyEl = $('sh-key'), typeEl = $('sh-type');
   keyEl.value = x.key;
   keyEl.disabled = true; // key 是绑定锚点，编辑时不可改
   $('sh-desc').value = x.description || '';
@@ -1722,6 +1726,7 @@ actions.editSharedItem = async function (el) {
   if (t === 'secret') valEl.placeholder = '已加密 · 留空不修改，输入以更新'; // 掩码值不填入
   S.sharedEditKey = x.key;
   S.sharedEditOrigType = t;
+  S.sharedEditRow = x; // saveShared 防呆查询 refs 用
   const refs = x.refs || [];
   const hint = $('sh-edit-hint');
   hint.textContent = '正在编辑 ' + x.key + '（key 不可修改）'
@@ -1731,6 +1736,10 @@ actions.editSharedItem = async function (el) {
   $('sh-reset').classList.remove('hidden');
   hideErr('sh-err');
   markSharedDirty(); // 载入了未保存内容
+  } catch (e) {
+    console.error('editSharedItem', e);
+    showErrorModal(e && e.message ? e.message : String(e), '编辑失败');
+  }
 };
 
 // shared-edit-ui：新建/取消——清空表单退出编辑态
@@ -1740,7 +1749,7 @@ actions.resetSharedForm = function () {
   $('sh-secret').checked = false; $('sh-required').checked = false;
   $('sh-type').value = 'string';
   renderSharedValueControl();
-  S.sharedEditKey = null; S.sharedEditOrigType = null;
+  S.sharedEditKey = null; S.sharedEditOrigType = null; S.sharedEditRow = null;
   $('sh-edit-hint').classList.add('hidden');
   $('sh-reset').classList.add('hidden');
   S.sharedDirty = false;
@@ -1768,7 +1777,7 @@ actions.saveShared = async function (el) {
   if (!isSecretKeep && ty !== 'bool' && !String(raw).trim()) { showErr('sh-err', '请填写值'); return; }
   // 类型变更防呆：被引用的共享项改类型 → 确认（发布后绑定失配丢弃）
   if (S.sharedEditKey && S.sharedEditOrigType && S.sharedEditOrigType !== ty) {
-    const x = S.sharedRows[S.sharedEditKey];
+    const x = S.sharedEditRow || S.sharedRows[S.sharedEditKey];
     const refs = (x && x.refs) || [];
     if (refs.length) {
       const confirmed = await new Promise((res) => openModal({
@@ -2063,7 +2072,14 @@ function bindEvents() {
     const name = el.dataset.act;
     if (CHANGE_ONLY.has(name)) return;
     const fn = actions[name];
-    if (typeof fn === 'function') fn.call(el, el, e);
+    if (typeof fn !== 'function') return;
+    try {
+      fn.call(el, el, e);
+    } catch (err) {
+      // 任何动作的同步异常都不静默——统一错误弹窗暴露（避免「点击没反应」类问题难排查）
+      console.error('action ' + name, err);
+      showErrorModal(err && err.message ? err.message : String(err), '操作失败：' + name);
+    }
   });
   document.addEventListener('change', (e) => {
     const el = e.target.closest('[data-act]');
