@@ -81,6 +81,12 @@ J -X POST $BASE/api/v1/shared -d '{"key":"api-key","type":"secret","secret":true
 J -X POST $BASE/api/v1/shared/publish -d '{"comment":"key","request_id":"sp2"}' >/dev/null
 J $BASE/api/v1/shared | python3 -c "import json,sys; l=json.load(sys.stdin); sk=[x for x in l if x['key']=='api-key'][0]; assert sk['value'].get('masked')==True and 'topsecret' not in json.dumps(l), l" && echo "  secret shared masked OK"
 
+# shared-edit-ui：secret 留空 = 保留当前密文（仅改描述/required，不重输密钥）
+J -X PUT $BASE/api/v1/shared-draft -d '{"key":"api-key","type":"secret","secret":true,"description":"更新描述","value":{"type":"string","str_value":""}}' >/dev/null
+J $BASE/api/v1/shared-draft | python3 -c "import json,sys; l=json.load(sys.stdin); sk=[x for x in l if x['key']=='api-key'][0]; assert sk['value'].get('masked')==True and sk.get('description')=='更新描述', l" && echo "  shared secret keep-cipher OK (empty value)"
+CODE=$(curl -s -o /tmp/shnew.json -w '%{http_code}' -X POST $BASE/api/v1/shared -H "$AUTH" -H 'Content-Type: application/json' -d '{"key":"brand-new","type":"secret","secret":true,"value":{"type":"string","str_value":""}}')
+[ "$CODE" = "422" ] && echo "  shared secret empty-first-save rejected OK (422)" || { echo "  shared secret keep guard FAIL code=$CODE"; cat /tmp/shnew.json; exit 1; }
+
 echo "== 8. 共享引用（分支级 shared_bindings）：结构标记 + 分支选择 + 级联 + 删除阻断 =="
 J -X PUT $BASE/api/v1/projects/order-service/structure-draft -d '{"base_version":2,"groups":[{"name":"redis","items":[{"key":"host","type":"string","required":true},{"key":"port","type":"int","shared":true},{"key":"password","type":"secret","secret":true}]}]}' >/dev/null
 J -X POST $BASE/api/v1/projects/order-service/structure-draft/publish -d '{"comment":"ref timeout","request_id":"sr1"}' >/dev/null

@@ -1707,6 +1707,7 @@ async fn write_shared_draft(
     action: &str,
 ) -> Result<serde_json::Value, (StatusCode, Json<ApiErrorBody>)> {
     let mut value = req.value;
+    let mut keep_cipher = false;
     if req.secret {
         // F9：secret 共享项只接受 secret 类型的字符串值——非字符串值无法加密，
         // 明文落库后会经 SharedPublish 级联进项目分支并在数据面明文暴露。
@@ -1716,23 +1717,59 @@ async fn write_shared_draft(
             ))
             .into());
         }
-        let plain = match &value {
-            Value::String(s) => s.clone(),
+        match &value {
+            // shared-edit-ui：value 空字符串 = 保留当前生效密文（get_shared_effective
+            // 草稿优先回落已发布）——仅改描述/required 的编辑无需重输密钥。
+            Value::String(s) if s.is_empty() => {
+                let cur = app
+                    .sm
+                    .read()
+                    .map_err(lock_err)?
+                    .get_shared_effective(&req.key)
+                    .map_err(ApiError::from)?;
+                match cur {
+                    Some(c) => match c.value {
+                        Value::Secret(ct) => {
+                            value = Value::Secret(ct); // 保留既有密文（草稿优先）
+                            keep_cipher = true;
+                        }
+                        _ => {
+                            return Err(ApiError(dsh_core::Error::validation(
+                                "该共享项当前非 secret，请先输入明文值",
+                            ))
+                            .into())
+                        }
+                    },
+                    None => {
+                        return Err(ApiError(dsh_core::Error::validation(
+                            "secret 共享项首次保存必须输入值",
+                        ))
+                        .into())
+                    }
+                }
+            }
+            Value::String(_) => { /* 有明文，走下方加密 */ }
             _ => {
                 return Err(
                     ApiError(dsh_core::Error::validation("secret 共享项值必须为字符串")).into(),
                 )
             }
-        };
-        let cipher = app.cipher.as_ref().ok_or_else(|| {
-            ApiError(dsh_core::Error::validation(
-                "secret 共享项需要主密钥（--master-key-file 或 DSH_MASTER_KEY）",
-            ))
-        })?;
-        let ct = cipher
-            .encrypt_secret(plain.as_bytes())
-            .map_err(|e| ApiError(dsh_core::Error::internal(format!("encrypt: {e}"))))?;
-        value = Value::Secret(ct);
+        }
+        if !keep_cipher {
+            let cipher = app.cipher.as_ref().ok_or_else(|| {
+                ApiError(dsh_core::Error::validation(
+                    "secret 共享项需要主密钥（--master-key-file 或 DSH_MASTER_KEY）",
+                ))
+            })?;
+            let plain = match &value {
+                Value::String(s) => s.clone(),
+                _ => unreachable!("secret 空值路径已分流"),
+            };
+            let ct = cipher
+                .encrypt_secret(plain.as_bytes())
+                .map_err(|e| ApiError(dsh_core::Error::internal(format!("encrypt: {e}"))))?;
+            value = Value::Secret(ct);
+        }
     } else if req.r#type == ValueType::Secret {
         return Err(ApiError(dsh_core::Error::validation(
             "type=secret 的共享项必须标记 secret=true",
@@ -4757,5 +4794,203 @@ mod security_tests {
         // 对端不是可信代理 → 忽略 XFF
         let key2 = super::login_throttle_key(&app, &h, Some("203.0.113.9".parse().unwrap()));
         assert_eq!(key2, "203.0.113.9");
+    }
+}
+
+// ---------------- 共享库编辑（shared-edit-ui）：secret 空值 = 保留密文 ----------------
+
+#[cfg(test)]
+mod shared_secret_keep_tests {
+    use std::sync::{Arc, RwLock};
+
+    use dsh_core::command::Command;
+    use dsh_core::{Ciphertext, InMemoryStore, SharedItem, StateMachine, Value, ValueType};
+    use dsh_watch::WatchHub;
+
+    use super::{write_shared_draft, ApiState, SharedItemReq};
+
+    /// 测试用假密文（keep 路径不触碰内容，无需真实加密）。
+    fn fake_ct() -> Ciphertext {
+        Ciphertext {
+            enc: "aes-256-gcm".into(),
+            v: 1,
+            dek_v: 1,
+            nonce: "bm9uY2U=".into(),
+            ct: "ZHVtbXk=".into(),
+            edek: "ZWRlaw==".into(),
+            edek_nonce: "bm9uY2Uy".into(),
+        }
+    }
+
+    /// 内存态 ApiState（与 join_token_tests 同构造模式；无主密钥——keep 路径不需要）。
+    fn state() -> ApiState {
+        ApiState::with_retention(
+            Arc::new(RwLock::new(StateMachine::new(Box::new(
+                InMemoryStore::new(),
+            )))),
+            WatchHub::new(),
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(86400),
+            "admin-pw".into(),
+            None,
+            0,
+            0,
+            None,
+            std::sync::Arc::new(super::TrustedProxies::empty()),
+            None,
+        )
+    }
+
+    /// 直接经状态机写入种子密文（keep 路径不触碰密文，无需真实主密钥/密文格式）。
+    fn seed_secret_draft(app: &ApiState, key: &str, ct: Ciphertext, description: Option<String>) {
+        app.sm
+            .write()
+            .unwrap()
+            .apply(
+                &Command::SharedDraftUpdate {
+                    item: SharedItem {
+                        key: key.into(),
+                        ty: ValueType::Secret,
+                        secret: true,
+                        required: false,
+                        value: Value::Secret(ct),
+                        version: 0,
+                        description,
+                    },
+                    operator: "admin".into(),
+                },
+                0,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_value_keeps_existing_ciphertext_and_updates_description() {
+        let app = state();
+        seed_secret_draft(&app, "api-key", fake_ct(), None);
+
+        let res = write_shared_draft(
+            &app,
+            SharedItemReq {
+                key: "api-key".into(),
+                r#type: ValueType::Secret,
+                secret: true,
+                required: false,
+                description: Some("新描述".into()),
+                value: Value::String("".into()), // 留空 = 保留密文
+            },
+            "shared_draft_update",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res["saved"], true);
+        let merged = app
+            .sm
+            .read()
+            .unwrap()
+            .get_shared_effective("api-key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.value, Value::Secret(fake_ct()), "密文必须原样保留");
+        assert_eq!(merged.description.as_deref(), Some("新描述"), "描述应更新");
+    }
+
+    #[tokio::test]
+    async fn empty_value_without_existing_item_is_rejected() {
+        let app = state();
+        let err = write_shared_draft(
+            &app,
+            SharedItemReq {
+                key: "no-such-key".into(),
+                r#type: ValueType::Secret,
+                secret: true,
+                required: false,
+                description: None,
+                value: Value::String("".into()),
+            },
+            "shared_draft_update",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.1 .0.message.contains("首次保存必须输入值"),
+            "无既有密文时留空应报错: {}",
+            err.1 .0.message
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_value_on_plaintext_item_is_rejected() {
+        let app = state();
+        // 种子为明文项（非 secret）
+        app.sm
+            .write()
+            .unwrap()
+            .apply(
+                &Command::SharedDraftUpdate {
+                    item: SharedItem {
+                        key: "plain-key".into(),
+                        ty: ValueType::String,
+                        secret: false,
+                        required: false,
+                        value: Value::String("hello".into()),
+                        version: 0,
+                        description: None,
+                    },
+                    operator: "admin".into(),
+                },
+                0,
+            )
+            .unwrap();
+
+        let err = write_shared_draft(
+            &app,
+            SharedItemReq {
+                key: "plain-key".into(),
+                r#type: ValueType::Secret,
+                secret: true,
+                required: false,
+                description: None,
+                value: Value::String("".into()),
+            },
+            "shared_draft_update",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.1 .0.message.contains("当前非 secret"),
+            "明文项留空转 secret 应报错: {}",
+            err.1 .0.message
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_value_with_secret_flag_but_wrong_type_is_rejected() {
+        let app = state();
+        let err = write_shared_draft(
+            &app,
+            SharedItemReq {
+                key: "k".into(),
+                r#type: ValueType::String, // secret=true 但 type 非 secret（既有 F9 校验回归）
+                secret: true,
+                required: false,
+                description: None,
+                value: Value::String("".into()),
+            },
+            "shared_draft_update",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.1 .0.message.contains("type 必须为 secret"),
+            "F9 校验应保持: {}",
+            err.1 .0.message
+        );
     }
 }

@@ -2151,6 +2151,15 @@ impl StateMachine {
         self.load_merged(&shared_key(key))
     }
 
+    /// shared-edit-ui：共享项**当前生效值**（草稿优先，无草稿回落已发布）——
+    /// 供「编辑保留密文」路径按 key 直读既有密文（list_shared_drafts 为全量扫描，不适用）。
+    pub fn get_shared_effective(&self, key: &str) -> Result<Option<SharedItem>, Error> {
+        if let Some(item) = self.load_merged(&shared_draft_key(key))? {
+            return Ok(Some(item));
+        }
+        self.load_merged(&shared_key(key))
+    }
+
     fn apply_shared_publish(
         &mut self,
         comment: &str,

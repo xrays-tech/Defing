@@ -1665,6 +1665,9 @@ async function loadShared() {
     updateSharedStatus();
     const rows = (draft || []).map((x) => ({ ...x, __draft: true }))
       .concat((pub || []).map((x) => ({ ...x, __draft: false })));
+    // 行索引（编辑按钮载入表单的数据源；草稿行优先覆盖发布行）
+    S.sharedRows = {};
+    for (const x of rows) S.sharedRows[x.key] = x;
     if (!rows.length) {
       $('shared-body').innerHTML = '<tr><td colspan="8"><div class="empty mini"><svg class="ic"><use href="#i-shared"/></svg><h4>暂无共享项</h4><p>在上方表单创建共享草稿，发布后各项目可在结构页引用。</p></div></td></tr>';
       return;
@@ -1675,6 +1678,7 @@ async function loadShared() {
       const delBtn = x.__draft
         ? `<button type="button" class="icon-btn danger" data-act="deleteSharedDraftItem" data-key="${esc(x.key)}" title="删除草稿" aria-label="删除草稿"><svg class="ic"><use href="#i-trash"/></svg></button>`
         : `<button type="button" class="icon-btn danger" data-act="deleteSharedItem" data-key="${esc(x.key)}" data-refs="${esc(refs.map((r) => r.project + '/' + r.branch + '/' + r.group + '/' + r.item_key).join(', '))}" title="删除共享项" aria-label="删除共享项"><svg class="ic"><use href="#i-trash"/></svg></button>`;
+      const editBtn = `<button type="button" class="icon-btn" data-act="editSharedItem" data-key="${esc(x.key)}" title="编辑共享项" aria-label="编辑共享项"><svg class="ic"><use href="#i-edit"/></svg></button>`;
       return `<tr>
       <td class="mono">${esc(x.key)}</td>
       <td class="mono muted">${esc(x.ty || x.type || '')}</td>
@@ -1683,7 +1687,7 @@ async function loadShared() {
       <td class="mono muted">${esc(x.description || '')}</td>
       <td class="small" title="被项目结构引用">${refs.length ? `<span class="badge acc" title="${esc(refTxt)}">${refs.length} 处</span>` : '<span class="muted">—</span>'}</td>
       <td>${x.secret ? '<span class="badge err"><svg class="ic ic-xs"><use href="#i-lock"/></svg>secret</span>' : ''}</td>
-      <td>${delBtn}</td>
+      <td><div class="row" style="gap:6px;justify-content:flex-end">${editBtn}${delBtn}</div></td>
     </tr>`;
     }).join('');
   } catch (e) {
@@ -1691,6 +1695,57 @@ async function loadShared() {
   }
 }
 actions.refreshShared = function () { loadShared(); };
+
+// shared-edit-ui：编辑已有共享项——载入表单（草稿行载入草稿值，发布行载入发布值）
+actions.editSharedItem = async function (el) {
+  const x = S.sharedRows[el.dataset.key];
+  if (!x) return;
+  const keyEl = $('sh-key'), typeEl = $('sh-type');
+  keyEl.value = x.key;
+  keyEl.disabled = true; // key 是绑定锚点，编辑时不可改
+  $('sh-desc').value = x.description || '';
+  $('sh-secret').checked = !!x.secret;
+  $('sh-required').checked = !!x.required;
+  typeEl.value = x.ty || x.type || 'string';
+  renderSharedValueControl();
+  const t = typeEl.value;
+  const v = x.value;
+  const valEl = $('sh-value');
+  if (v && !v.masked) {
+    if (t === 'bool') valEl.checked = v.bool_value === true;
+    else if (t === 'int') valEl.value = v.int_value ?? '';
+    else if (t === 'float') valEl.value = v.float_value ?? '';
+    else if (t === 'json') valEl.value = v.json_value ?? '';
+    else if (t === 'array') valEl.value = (v.list_value || []).join(', ');
+    else valEl.value = v.str_value ?? '';
+  }
+  if (t === 'secret') valEl.placeholder = '已加密 · 留空不修改，输入以更新'; // 掩码值不填入
+  S.sharedEditKey = x.key;
+  S.sharedEditOrigType = t;
+  const refs = x.refs || [];
+  const hint = $('sh-edit-hint');
+  hint.textContent = '正在编辑 ' + x.key + '（key 不可修改）'
+    + (refs.length ? ' · 被 ' + refs.length + ' 处引用，发布后自动级联' : '')
+    + (x.__draft ? ' · 载入草稿值' : ' · 载入已发布值');
+  hint.classList.remove('hidden');
+  $('sh-reset').classList.remove('hidden');
+  hideErr('sh-err');
+  markSharedDirty(); // 载入了未保存内容
+};
+
+// shared-edit-ui：新建/取消——清空表单退出编辑态
+actions.resetSharedForm = function () {
+  $('sh-key').value = ''; $('sh-key').disabled = false;
+  $('sh-desc').value = '';
+  $('sh-secret').checked = false; $('sh-required').checked = false;
+  $('sh-type').value = 'string';
+  renderSharedValueControl();
+  S.sharedEditKey = null; S.sharedEditOrigType = null;
+  $('sh-edit-hint').classList.add('hidden');
+  $('sh-reset').classList.add('hidden');
+  S.sharedDirty = false;
+  updateSharedStatus();
+};
 
 // 共享项值输入：按类型渲染控件（与配置管理页一致；不再要求手写 Value JSON）
 function renderSharedValueControl() {
@@ -1702,15 +1757,32 @@ function renderSharedValueControl() {
 actions.shType = function () { renderSharedValueControl(); }; // 仅响应 change
 
 actions.saveShared = async function (el) {
-  const key = $('sh-key').value.trim();
+  const key = S.sharedEditKey || $('sh-key').value.trim();
   if (!key) { showErr('sh-err', 'key 必填'); return; }
   const ty = $('sh-type').value;
   const valEl = $('sh-value');
   if (!valEl) { showErr('sh-err', '请先填写值'); return; }
   const raw = (valEl.type === 'checkbox') ? ((valEl.checked) ? 'true' : 'false') : valEl.value;
-  if (ty !== 'bool' && !raw.trim()) { showErr('sh-err', '请填写值'); return; }
+  // shared-edit-ui：secret 留空 = 保留当前密文（服务端 get_shared_effective 语义）
+  const isSecretKeep = (ty === 'secret') && !String(raw).trim();
+  if (!isSecretKeep && ty !== 'bool' && !String(raw).trim()) { showErr('sh-err', '请填写值'); return; }
+  // 类型变更防呆：被引用的共享项改类型 → 确认（发布后绑定失配丢弃）
+  if (S.sharedEditKey && S.sharedEditOrigType && S.sharedEditOrigType !== ty) {
+    const x = S.sharedRows[S.sharedEditKey];
+    const refs = (x && x.refs) || [];
+    if (refs.length) {
+      const confirmed = await new Promise((res) => openModal({
+        title: '类型变更确认',
+        message: '「' + S.sharedEditKey + '」当前被 ' + refs.length + ' 处引用；类型由 ' + S.sharedEditOrigType + ' 改为 ' + ty + ' 并发布后，绑定它的分支绑定将失配丢弃（需重新选择）。确认继续？',
+        okText: '确认变更', danger: true,
+        onOk: () => res(true),
+        onCancel: () => res(false),
+      }));
+      if (!confirmed) return;
+    }
+  }
   let value;
-  try { value = buildValue(ty, raw); }
+  try { value = isSecretKeep ? { type: 'string', str_value: '' } : buildValue(ty, raw); }
   catch (e) { showErr('sh-err', e.message); return; }
   const desc = $('sh-desc') ? $('sh-desc').value.trim() : '';
   if (desc && desc.length > 200) { showErr('sh-err', '描述超过 200 字节上限'); return; }
@@ -1719,8 +1791,9 @@ actions.saveShared = async function (el) {
   await withBusy(el, async () => {
     try {
       await j('POST', '/api/v1/shared', body);
-      toast('共享草稿已保存');
+      toast(S.sharedEditKey ? '共享草稿已保存（更新 ' + key + '）' : '共享草稿已保存');
       loadShared();
+      resetSharedForm();
     } catch (e) { if (!e.expired) toast(e.message, 'err'); }
   });
 };

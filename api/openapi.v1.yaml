@@ -1203,7 +1203,9 @@ components:
         type: { type: string, enum: [string, int, float, bool, json, array, secret] }
         secret: { type: boolean, default: false }
         required: { type: boolean, default: false }
-        value: { $ref: '#/components/schemas/Value' }
+        value:
+          $ref: '#/components/schemas/Value'
+          description: 'secret 项传空字符串（{type: string, str_value: ""}）表示保留当前密文（编辑场景，仅改描述/required）；无既有值或当前非 secret 时 422'
         version: { type: integer, format: int64 }
         description: { type: string, description: 助记描述（≤200 字节，不渲染） }
         refs:
