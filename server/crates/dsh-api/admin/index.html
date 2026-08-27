@@ -336,7 +336,7 @@
         <div class="stack">
           <div class="grid-2">
             <div class="card">
-              <div class="card-head"><h3>新增 / 更新共享项</h3></div>
+              <div class="card-head"><h3>新增共享项</h3></div>
               <div class="grid-2" style="gap:0 16px">
                 <div class="field">
                   <label for="sh-key">key（全局唯一）</label>
@@ -372,9 +372,7 @@
               </div>
               <div id="sh-err" class="field-err hidden"></div>
               <div class="row" style="gap:10px;align-items:center">
-                <button type="button" class="btn hidden" data-act="resetSharedForm" id="sh-reset" title="清空表单，开始新建">新建</button>
                 <button type="button" class="btn" data-act="saveShared">保存共享草稿</button>
-                <p class="hint hidden" id="sh-edit-hint" style="margin:0"></p>
               </div>
             </div>
             <div class="card">
@@ -560,6 +558,55 @@
     </div>
     <div class="modal-foot">
       <button type="button" class="btn" data-act="closeTokenModal">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 共享库编辑弹窗 ========== -->
+<div id="shared-edit-overlay" class="overlay hidden">
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="she-title">
+    <div class="modal-head-row">
+      <h3 id="she-title">编辑共享项</h3>
+      <button type="button" class="icon-btn" data-act="closeSharedEdit" title="关闭" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="grid-2" style="gap:0 16px">
+      <div class="field">
+        <label for="she-key">key（不可修改）</label>
+        <input class="in mono" id="she-key" disabled>
+      </div>
+      <div class="field">
+        <label for="she-desc">描述（助记，不渲染）</label>
+        <input class="in mono" id="she-desc" placeholder="如 全局日志级别（≤200 字节）">
+      </div>
+    </div>
+    <div class="grid-2" style="gap:0 16px">
+      <div class="field">
+        <label for="she-type">类型</label>
+        <select class="sel" id="she-type" data-act="shTypeEdit">
+          <option value="string">string</option><option value="int">int</option>
+          <option value="float">float</option><option value="bool">bool</option>
+          <option value="json">json</option><option value="array">array</option>
+          <option value="secret">secret</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>标记</label>
+        <div class="row" style="gap:14px">
+          <label class="check"><input type="checkbox" id="she-secret">secret</label>
+          <label class="check"><input type="checkbox" id="she-required">required</label>
+        </div>
+      </div>
+    </div>
+    <div class="field">
+      <label for="she-value">值</label>
+      <div id="she-value-wrap"></div>
+      <p class="hint" id="she-value-hint"></p>
+    </div>
+    <div id="she-err" class="field-err hidden"></div>
+    <p class="hint" id="she-edit-hint" style="margin:8px 0 0"></p>
+    <div class="modal-foot">
+      <button type="button" class="btn" data-act="closeSharedEdit">取消</button>
+      <button type="button" class="btn primary" data-act="saveSharedEdit" id="she-save">保存共享草稿</button>
     </div>
   </div>
 </div>

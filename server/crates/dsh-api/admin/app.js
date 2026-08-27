@@ -1699,50 +1699,56 @@ async function loadShared() {
 }
 actions.refreshShared = function () { loadShared(); };
 
-// shared-edit-ui：编辑已有共享项——载入表单（草稿行载入草稿值，发布行载入发布值）
+// shared-edit-ui：编辑已有共享项——弹出模态窗体编辑（草稿行载入草稿值，发布行载入发布值）
+function closeSharedEditModal() {
+  const ov = $('shared-edit-overlay');
+  if (ov) ov.classList.add('hidden');
+  S.sharedEditKey = null;
+  S.sharedEditOrigType = null;
+  S.sharedEditRow = null;
+}
+actions.closeSharedEdit = function () { closeSharedEditModal(); };
+
 actions.editSharedItem = async function (el) {
   try {
     const x = (S.sharedRowList || [])[Number(el.dataset.i)];
     if (!x) { showErrorModal('未找到共享项行数据，请刷新列表后重试', '编辑失败'); return; }
-    const keyEl = $('sh-key'), typeEl = $('sh-type');
-  keyEl.value = x.key;
-  keyEl.disabled = true; // key 是绑定锚点，编辑时不可改
-  $('sh-desc').value = x.description || '';
-  $('sh-secret').checked = !!x.secret;
-  $('sh-required').checked = !!x.required;
-  typeEl.value = x.ty || x.type || 'string';
-  renderSharedValueControl();
-  const t = typeEl.value;
-  const v = x.value;
-  const valEl = $('sh-value');
-  if (v && !v.masked) {
-    if (t === 'bool') valEl.checked = v.bool_value === true;
-    else if (t === 'int') valEl.value = v.int_value ?? '';
-    else if (t === 'float') valEl.value = v.float_value ?? '';
-    else if (t === 'json') valEl.value = v.json_value ?? '';
-    else if (t === 'array') valEl.value = (v.list_value || []).join(', ');
-    else valEl.value = v.str_value ?? '';
-  }
-  if (t === 'secret') valEl.placeholder = '已加密 · 留空不修改，输入以更新'; // 掩码值不填入
-  S.sharedEditKey = x.key;
-  S.sharedEditOrigType = t;
-  S.sharedEditRow = x; // saveShared 防呆查询 refs 用
-  const refs = x.refs || [];
-  const hint = $('sh-edit-hint');
-  hint.textContent = '正在编辑 ' + x.key + '（key 不可修改）'
-    + (refs.length ? ' · 被 ' + refs.length + ' 处引用，发布后自动级联' : '')
-    + (x.__draft ? ' · 载入草稿值' : ' · 载入已发布值');
-  hint.classList.remove('hidden');
-  $('sh-reset').classList.remove('hidden');
-  hideErr('sh-err');
-  markSharedDirty(); // 载入了未保存内容
+    const typeEl = $('she-type');
+    $('she-key').value = x.key;
+    $('she-desc').value = x.description || '';
+    $('she-secret').checked = !!x.secret;
+    $('she-required').checked = !!x.required;
+    typeEl.value = x.ty || x.type || 'string';
+    renderSharedEditValueControl();
+    const t = typeEl.value;
+    const v = x.value;
+    const valEl = $('she-value');
+    if (v && !v.masked) {
+      if (t === 'bool') valEl.checked = v.bool_value === true;
+      else if (t === 'int') valEl.value = v.int_value ?? '';
+      else if (t === 'float') valEl.value = v.float_value ?? '';
+      else if (t === 'json') valEl.value = v.json_value ?? '';
+      else if (t === 'array') valEl.value = (v.list_value || []).join(', ');
+      else valEl.value = v.str_value ?? '';
+    }
+    if (t === 'secret') valEl.placeholder = '已加密 · 留空不修改，输入以更新'; // 掩码值不填入
+    S.sharedEditKey = x.key;
+    S.sharedEditOrigType = t;
+    S.sharedEditRow = x; // saveShared 防呆查询 refs 用
+    const refs = x.refs || [];
+    $('she-edit-hint').textContent = 'key 不可修改'
+      + (refs.length ? ' · 被 ' + refs.length + ' 处引用，发布后自动级联' : '')
+      + (x.__draft ? ' · 载入草稿值' : ' · 载入已发布值');
+    hideErr('she-err');
+    $('shared-edit-overlay').classList.remove('hidden');
+    $('she-desc').focus();
   } catch (e) {
     console.error('editSharedItem', e);
     showErrorModal(e && e.message ? e.message : String(e), '编辑失败');
   }
 };
 
-// shared-edit-ui：新建/取消——清空表单退出编辑态
+// shared-edit-ui：新建表单复位（顶部表单只用于新增）
 actions.resetSharedForm = function () {
   $('sh-key').value = ''; $('sh-key').disabled = false;
   $('sh-desc').value = '';
@@ -1750,31 +1756,40 @@ actions.resetSharedForm = function () {
   $('sh-type').value = 'string';
   renderSharedValueControl();
   S.sharedEditKey = null; S.sharedEditOrigType = null; S.sharedEditRow = null;
-  $('sh-edit-hint').classList.add('hidden');
-  $('sh-reset').classList.add('hidden');
   S.sharedDirty = false;
   updateSharedStatus();
 };
 
 // 共享项值输入：按类型渲染控件（与配置管理页一致；不再要求手写 Value JSON）
-function renderSharedValueControl() {
-  const ty = $('sh-type') ? $('sh-type').value : 'string';
-  $('sh-value-wrap').innerHTML = valueControlHtml(ty, 'sh-value');
-  const hint = $('sh-value-hint');
+function renderValueControl(ty, wrapId, valueId, hintId) {
+  const wrap = $(wrapId);
+  if (wrap) wrap.innerHTML = valueControlHtml(ty, valueId);
+  const hint = $(hintId);
   if (hint) hint.textContent = '类型 ' + ty + ' · ' + (VAL_HINTS[ty] || '');
 }
+function renderSharedValueControl() {
+  const ty = $('sh-type') ? $('sh-type').value : 'string';
+  renderValueControl(ty, 'sh-value-wrap', 'sh-value', 'sh-value-hint');
+}
+function renderSharedEditValueControl() {
+  const ty = $('she-type') ? $('she-type').value : 'string';
+  renderValueControl(ty, 'she-value-wrap', 'she-value', 'she-value-hint');
+}
 actions.shType = function () { renderSharedValueControl(); }; // 仅响应 change
+actions.shTypeEdit = function () { renderSharedEditValueControl(); }; // 编辑弹窗内类型切换
 
-actions.saveShared = async function (el) {
-  const key = S.sharedEditKey || $('sh-key').value.trim();
-  if (!key) { showErr('sh-err', 'key 必填'); return; }
-  const ty = $('sh-type').value;
-  const valEl = $('sh-value');
-  if (!valEl) { showErr('sh-err', '请先填写值'); return; }
+async function submitSharedDraft({ el, modal }) {
+  const isEdit = !!modal;
+  const errId = isEdit ? 'she-err' : 'sh-err';
+  const key = isEdit ? S.sharedEditKey : $('sh-key').value.trim();
+  if (!key) { showErr(errId, 'key 必填'); return; }
+  const ty = isEdit ? $('she-type').value : $('sh-type').value;
+  const valEl = isEdit ? $('she-value') : $('sh-value');
+  if (!valEl) { showErr(errId, '请先填写值'); return; }
   const raw = (valEl.type === 'checkbox') ? ((valEl.checked) ? 'true' : 'false') : valEl.value;
   // shared-edit-ui：secret 留空 = 保留当前密文（服务端 get_shared_effective 语义）
   const isSecretKeep = (ty === 'secret') && !String(raw).trim();
-  if (!isSecretKeep && ty !== 'bool' && !String(raw).trim()) { showErr('sh-err', '请填写值'); return; }
+  if (!isSecretKeep && ty !== 'bool' && !String(raw).trim()) { showErr(errId, '请填写值'); return; }
   // 类型变更防呆：被引用的共享项改类型 → 确认（发布后绑定失配丢弃）
   if (S.sharedEditKey && S.sharedEditOrigType && S.sharedEditOrigType !== ty) {
     const x = S.sharedEditRow || S.sharedRows[S.sharedEditKey];
@@ -1792,20 +1807,31 @@ actions.saveShared = async function (el) {
   }
   let value;
   try { value = isSecretKeep ? { type: 'string', str_value: '' } : buildValue(ty, raw); }
-  catch (e) { showErr('sh-err', e.message); return; }
-  const desc = $('sh-desc') ? $('sh-desc').value.trim() : '';
-  if (desc && desc.length > 200) { showErr('sh-err', '描述超过 200 字节上限'); return; }
-  hideErr('sh-err');
-  const body = { key, type: ty, secret: $('sh-secret').checked, required: $('sh-required').checked, description: desc || undefined, value };
+  catch (e) { showErr(errId, e.message); return; }
+  const descEl = isEdit ? $('she-desc') : $('sh-desc');
+  const desc = descEl ? descEl.value.trim() : '';
+  if (desc && desc.length > 200) { showErr(errId, '描述超过 200 字节上限'); return; }
+  hideErr(errId);
+  const body = {
+    key,
+    type: ty,
+    secret: (isEdit ? $('she-secret') : $('sh-secret')).checked,
+    required: (isEdit ? $('she-required') : $('sh-required')).checked,
+    description: desc || undefined,
+    value,
+  };
   await withBusy(el, async () => {
     try {
       await j('POST', '/api/v1/shared', body);
-      toast(S.sharedEditKey ? '共享草稿已保存（更新 ' + key + '）' : '共享草稿已保存');
+      toast(isEdit ? '共享草稿已保存（更新 ' + key + '）' : '共享草稿已保存');
+      if (isEdit) closeSharedEditModal(); else actions.resetSharedForm();
       loadShared();
-      actions.resetSharedForm();
     } catch (e) { if (!e.expired) toast(e.message, 'err'); }
   });
-};
+}
+
+actions.saveShared = function (el) { return submitSharedDraft({ el, modal: false }); };
+actions.saveSharedEdit = function (el) { return submitSharedDraft({ el, modal: true }); };
 
 actions.publishShared = function () {
   if (S.sharedDirty) toast('有未保存的表单：本次发布只包含已保存的共享草稿，请先「保存共享草稿」', 'warn', 6000);
@@ -2132,6 +2158,7 @@ function bindEvents() {
   $('cfg-overlay').addEventListener('mousedown', (e) => { if (e.target === $('cfg-overlay')) actions.closeCfg(); });
   $('token-overlay').addEventListener('mousedown', (e) => { if (e.target === $('token-overlay')) actions.closeTokenModal(); });
   $('pw-overlay').addEventListener('mousedown', (e) => { if (e.target === $('pw-overlay')) actions.closePwModal(); });
+  $('shared-edit-overlay').addEventListener('mousedown', (e) => { if (e.target === $('shared-edit-overlay')) closeSharedEditModal(); });
   $('err-overlay').addEventListener('mousedown', (e) => { if (e.target === $('err-overlay')) closeErrorModal(); });
 
   // 修改密码弹窗：Enter 提交（任一输入框）
@@ -2145,6 +2172,7 @@ function bindEvents() {
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (!$('err-overlay').classList.contains('hidden')) closeErrorModal();
+    else if (!$('shared-edit-overlay').classList.contains('hidden')) closeSharedEditModal();
     else if (!$('modal-overlay').classList.contains('hidden')) closeModal(false);
     else if (!$('cfg-overlay').classList.contains('hidden')) actions.closeCfg();
     else if (!$('token-overlay').classList.contains('hidden')) actions.closeTokenModal();
