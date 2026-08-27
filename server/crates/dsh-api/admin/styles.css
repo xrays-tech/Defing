@@ -804,7 +804,7 @@ textarea.code { min-height: 140px; }
 }
 .modal-toolbar .sel { width: auto; }
 
-/* 共享库编辑弹窗：置于普通弹窗（z-index 90）之下，便于类型变更确认等再弹一层 */
+/* 共享配置编辑弹窗：置于普通弹窗（z-index 90）之下，便于类型变更确认等再弹一层 */
 #shared-edit-overlay { z-index: 80; }
 
 /* 统一错误弹窗：屏幕中心，置于其它弹窗（overlay z-index 90）与通知（120）之上 */

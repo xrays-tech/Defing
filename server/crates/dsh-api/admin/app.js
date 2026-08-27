@@ -54,9 +54,9 @@ const S = {
   // 未保存编辑保护：结构 textarea / 灰度规则有用户输入时，后台刷新不覆盖
   structDirty: false, structProj: '',
   grayDirty: false, grayBranch: '',
-  // 保存状态指示（草稿/结构/共享库）：未保存 dirty 标记 + 已保存未发布计数
+  // 保存状态指示（草稿/结构/共享配置）：未保存 dirty 标记 + 已保存未发布计数
   draftDirty: false,        // 草稿页有未保存输入
-  sharedDirty: false,       // 共享库表单有未保存输入
+  sharedDirty: false,       // 共享配置表单有未保存输入
   sharedDraftCount: 0,      // 已保存未发布的共享草稿数
   hasStructDraft: false,    // 服务端存在已保存未发布的结构草稿
   // 结构：编辑器工作副本 / 已发布结构（GET /structure 实时拉取，权威）
@@ -476,7 +476,7 @@ async function loadSharedItems() {
 
 // 就地刷新草稿页「引用共享」下拉的选项（保留当前选择）；下拉不存在时无操作。
 // 注意：不可在此调用 renderStructEditor/loadSharedItems（会与结构页渲染互相递归）。
-// 不按 pane 守卫：共享库页保存/发布共享项时草稿页下拉仍在 DOM（隐藏面板），需同步刷新。
+// 不按 pane 守卫：共享配置页保存/发布共享项时草稿页下拉仍在 DOM（隐藏面板），需同步刷新。
 function refreshDraftBindDropdowns() {
   if (!S.sharedItems) return;
   for (const sel of $$('#pane-draft .draft-shared-bind')) {
@@ -610,7 +610,7 @@ async function loadBranch() {
   }
 }
 
-/* ---------- 保存状态指示（草稿 / 结构 / 共享库） ---------- */
+/* ---------- 保存状态指示（草稿 / 结构 / 共享配置） ---------- */
 // 草稿页：未保存（draftDirty）+ 已保存未发布（draftValKeys 数）
 function updateDraftStatus() {
   const u = $('draft-unsaved'), p = $('draft-unpublished');
@@ -630,7 +630,7 @@ function updateStructStatus() {
   if (p) p.classList.toggle('hidden', !S.hasStructDraft);
 }
 
-// 共享库：未保存（sharedDirty）+ 已保存未发布（sharedDraftCount）
+// 共享配置：未保存（sharedDirty）+ 已保存未发布（sharedDraftCount）
 function updateSharedStatus() {
   const u = $('sh-unsaved'), p = $('sh-unpublished');
   if (u) u.classList.toggle('hidden', !S.sharedDirty);
@@ -651,7 +651,7 @@ function renderDraftEditor(b) {
   // 重渲染后视为已同步：清未保存标记，刷新「N 项草稿未发布」计数
   S.draftDirty = false;
   updateDraftStatus();
-  // 引用项索引（绑定解析：值来自共享库；含未绑定项 shared_key=""）；每次重渲染重置，避免分支切换残留
+  // 引用项索引（绑定解析：值来自共享配置；含未绑定项 shared_key=""）；每次重渲染重置，避免分支切换残留
   S.sharedRefs = {};
   for (const r of (b.shared_refs || [])) S.sharedRefs[r.group + '/' + r.key] = r;
   // 结构驱动：一次性展示已发布结构的全部组/配置项，直接改值保存（草稿不再是「添加配置项」模式）
@@ -663,7 +663,7 @@ function renderDraftEditor(b) {
   }
   $('draft-groups').innerHTML = groups.map((g) => {
     const refCount = g.items.filter((it) => !!it.shared).length;
-    const refBadge = refCount ? `<span class="badge acc" title="值由共享库物化：本分支在下拉选择引用的共享项">${refCount} 引用共享</span>` : '';
+    const refBadge = refCount ? `<span class="badge acc" title="值由共享配置物化：本分支在下拉选择引用的共享项">${refCount} 引用共享</span>` : '';
     const rows = g.items.map((it) => {
       if (it.shared) return sharedBindRowHtml(g, it);
       // 值基线：草稿值优先；无草稿时回退活动版本值（发布后草稿清空，显示已发布的值而非空框）
@@ -735,7 +735,7 @@ function sharedBindRowHtml(g, it) {
     <div class="gkey"><span class="mono">${esc(it.key)}</span><span class="badge acc ref-badge" title="${esc(tip)}">引用共享</span>${it.description ? `<div class="hint small" style="margin:2px 0 0">${esc(it.description)}</div>` : ''}</div>
     <div class="gtype"><span class="ty">${esc(it.type || '')}</span></div>
     <div class="gctl">
-      <select class="sel draft-shared-bind" data-g="${esc(g.name)}" data-k="${esc(it.key)}" title="本分支引用的共享项（值由共享库物化，只读）">${opts}</select>
+      <select class="sel draft-shared-bind" data-g="${esc(g.name)}" data-k="${esc(it.key)}" title="本分支引用的共享项（值由共享配置物化，只读）">${opts}</select>
       <div class="bind-val" style="margin-top:2px">${valHtml}</div>
     </div>
     <div class="gdel"><span class="hint" style="margin:0">${ref && ref.version ? 'v' + ref.version : ''}</span></div>
@@ -1252,7 +1252,7 @@ function structGroupHtml(g, gi) {
 function structItemRowHtml(it, gi, ii) {
   const tyOpts = TYPES.map((t) => `<option value="${t}"${t === it.type ? ' selected' : ''}>${t}</option>`).join('');
   const isShared = !!it.shared;
-  // 引用共享勾选：声明本项为共享来源（值由共享库物化），各分支在草稿页选择引用的共享项
+  // 引用共享勾选：声明本项为共享来源（值由共享配置物化），各分支在草稿页选择引用的共享项
   const sharedChk = `<label class="check" title="勾选后本项值为共享来源：各分支在草稿页按下拉选择引用的共享项；type 声明为分支下拉的类型约束"><input type="checkbox" data-sf="ishared" data-act="structShared" ${isShared ? 'checked' : ''}>引用共享</label>`;
   const hint = isShared ? 'type 为分支下拉的类型约束；required/secret 由所选的共享项决定' : '';
   return `<div class="struct-item"${isShared ? ' data-ref="1"' : ''}>
@@ -1650,7 +1650,7 @@ actions.doPromote = async function (el) {
   });
 };
 
-/* ---------- 共享库 ---------- */
+/* ---------- 共享配置 ---------- */
 async function loadShared() {
   if ($('sh-value-wrap') && !$('sh-value-wrap').innerHTML) renderSharedValueControl(); // 首次进入/类型变更后初始化
   $('shared-body').innerHTML = '<tr><td colspan="8">' + skeleton(4) + '</td></tr>';
@@ -2114,7 +2114,7 @@ function bindEvents() {
     if (typeof fn === 'function') fn.call(el, el, e);
   });
 
-  // 保存状态指示：草稿页值输入/绑定选择 → 未保存标记；共享库表单 → 未保存标记
+  // 保存状态指示：草稿页值输入/绑定选择 → 未保存标记；共享配置表单 → 未保存标记
   document.addEventListener('change', (e) => {
     const t = e.target;
     if (!t || !t.classList) return;
