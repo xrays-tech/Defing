@@ -1802,7 +1802,7 @@ actions.saveShared = async function (el) {
       await j('POST', '/api/v1/shared', body);
       toast(S.sharedEditKey ? '共享草稿已保存（更新 ' + key + '）' : '共享草稿已保存');
       loadShared();
-      resetSharedForm();
+      actions.resetSharedForm();
     } catch (e) { if (!e.expired) toast(e.message, 'err'); }
   });
 };
