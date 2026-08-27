@@ -1710,15 +1710,33 @@ impl StateMachine {
     /// 返回 (快照, 校验告警列表——Warn 模式下非空)。
     fn materialize_resolved(
         &self,
-        _id: &ProjectId,
         st: &BranchState,
         structure: &Structure,
+        old: &SnapshotMap,
         policy: PublishPolicy,
     ) -> Result<(SnapshotMap, Vec<String>), Error> {
         // 完整性校验（G1/D35：策略编码进命令——确定性由日志序保证）。
         // 注意：共享解析（未绑定/悬空/类型失配）产生的 errs 也在本策略判定范围内——
         // 判定须在完整 errs 收集之后（未绑定是分支级正常态，Block 必须拦住）。
-        let draft_map: BTreeMap<String, BTreeMap<String, DraftValue>> = st.value_draft.clone();
+        let mut draft_map: BTreeMap<String, BTreeMap<String, DraftValue>> = st.value_draft.clone();
+        // secret 保留语义（与草稿页「留空不修改」一致）：草稿未给 secret 新值时，
+        // 沿用已发布快照中的密文，避免每次发布必填 secret 都要重输；非 secret 仍以草稿为完整快照。
+        for g in &structure.groups {
+            for item in &g.items {
+                if item.shared || item.ty != ValueType::Secret {
+                    continue;
+                }
+                if draft_map.get(&g.name).and_then(|m| m.get(&item.key)).is_some() {
+                    continue;
+                }
+                if let Some(v) = old.get(&g.name).and_then(|m| m.get(&item.key)) {
+                    draft_map
+                        .entry(g.name.clone())
+                        .or_default()
+                        .insert(item.key.clone(), DraftValue { value: v.clone(), updated_at: 0 });
+                }
+            }
+        }
         let mut errs = validator::validate_publish(&draft_map, structure);
 
         // 物化：草稿值 + 共享引用（引用项只读：值来自本分支 shared_bindings 选定的共享项）
@@ -1801,13 +1819,12 @@ impl StateMachine {
         }
 
         // 完整性校验 + 物化（草稿值 + 共享库引用）
-        let (resolved, _warnings) = self.materialize_resolved(id, &st, &structure, policy)?;
-
         let old = if st.active_version == 0 {
             SnapshotMap::new()
         } else {
             self.snapshot_of(id, branch, st.active_version)?
         };
+        let (resolved, _warnings) = self.materialize_resolved(&st, &structure, &old, policy)?;
         let diff = compute_diff(&old, &resolved);
 
         let vno = st.active_version + 1;
@@ -1943,12 +1960,12 @@ impl StateMachine {
         }
 
         // 完整性校验 + 物化（草稿值 + 共享库引用；与普通发布同一路径）
-        let (gray_snap, _warnings) = self.materialize_resolved(id, &st, &structure, policy)?;
         let old = if st.active_version == 0 {
             SnapshotMap::new()
         } else {
             self.snapshot_of(id, branch, st.active_version)?
         };
+        let (gray_snap, _warnings) = self.materialize_resolved(&st, &structure, &old, policy)?;
         let diff = compute_diff(&old, &gray_snap);
 
         // Q1：独立灰度序号 + 独立前缀（gray-snap/），与 active_version 版本号空间完全隔离

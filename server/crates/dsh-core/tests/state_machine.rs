@@ -4419,3 +4419,42 @@ fn g1_manual_cascade_shared_publish() {
         "下次发布物化新共享值"
     );
 }
+
+#[test]
+fn required_secret_is_preserved_when_not_in_next_draft() {
+    let mut s = sm();
+    let pid: ProjectId = "order-service".into();
+    assert!(s.apply(&Command::ProjectCreate { name: "order-service".into(), operator: String::new(), ts: 0 }, 1).is_ok());
+    let branches = s.list_branches(&pid).unwrap();
+    let dev = BranchName("dev".into());
+    assert_eq!(branches.len(), 3);
+    s.apply(&Command::StructureDraftSet {
+        project: pid.clone(),
+        base_version: 1,
+        groups: vec![GroupDef {
+            name: "g".into(),
+            items: vec![
+                ItemDef { key: "host".into(), ty: ValueType::String, required: true, secret: false, validate: None, description: None, shared: false },
+                ItemDef { key: "pass".into(), ty: ValueType::Secret, required: true, secret: true, validate: None, description: None, shared: false },
+            ],
+        }],
+        operator: String::new(),
+    }, 2).unwrap();
+    s.apply(&Command::PublishStructure { project: pid.clone(), comment: "s".into(), request_id: "s1".into(), operator: String::new(), ts: 0, policy: PublishPolicy::Block }, 3).unwrap();
+    let secret = Value::Secret(dsh_core::model::Ciphertext { enc: "aes-256-gcm".into(), v: 1, dek_v: 1, nonce: "n".into(), ct: "c".into(), edek: "e".into(), edek_nonce: "en".into() });
+    // 首次发布：host + secret
+    s.apply(&Command::DraftUpdate { project: pid.clone(), branch: dev.clone(), updates: vec![
+        DraftUpdateItem { group: "g".into(), key: "host".into(), value: Value::String("h1".into()) },
+        DraftUpdateItem { group: "g".into(), key: "pass".into(), value: secret.clone() },
+    ], deletes: vec![], shared_bindings: vec![], operator: String::new(), ts: 0, expected_draft_rev: None }, 4).unwrap();
+    s.apply(&Command::Publish { project: pid.clone(), branch: dev.clone(), comment: "v1".into(), request_id: "r1".into(), operator: String::new(), ts: 0, policy: PublishPolicy::Block }, 5).unwrap();
+    // 第二次只改 host，secret 留空（UI 的“不修改”路径不会写入 pass 草稿）
+    s.apply(&Command::DraftUpdate { project: pid.clone(), branch: dev.clone(), updates: vec![
+        DraftUpdateItem { group: "g".into(), key: "host".into(), value: Value::String("h2".into()) },
+    ], deletes: vec![], shared_bindings: vec![], operator: String::new(), ts: 0, expected_draft_rev: None }, 6).unwrap();
+    s.apply(&Command::Publish { project: pid.clone(), branch: dev.clone(), comment: "v2".into(), request_id: "r2".into(), operator: String::new(), ts: 0, policy: PublishPolicy::Block }, 7).unwrap();
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(cfg.version, 3);
+    assert_eq!(cfg.groups["g"]["host"], Value::String("h2".into()));
+    assert_eq!(cfg.groups["g"]["pass"], secret, "未重填的必填 secret 应保留旧密文");
+}
