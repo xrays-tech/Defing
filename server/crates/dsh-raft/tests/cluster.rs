@@ -132,6 +132,7 @@ async fn three_node_bootstrap_join_failover() {
 
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         Duration::from_secs(10),
     )
@@ -289,6 +290,7 @@ async fn three_node_bootstrap_join_failover() {
 
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         Duration::from_secs(10),
     )
@@ -444,6 +446,7 @@ async fn cluster_watch_events_reach_subscribers() {
 
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         Duration::from_secs(10),
     )
@@ -597,6 +600,7 @@ async fn gray_percentage_consistent_across_nodes() {
             name: "gray-cluster".into(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         Command::StructureDraftSet {
             project: pid.clone(),
@@ -823,6 +827,7 @@ async fn three_node_static_map_bootstrap() {
             name: "static-map".into(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         Duration::from_secs(10),
     )

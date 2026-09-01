@@ -28,6 +28,7 @@ fn setup_project(name: &str) -> StateMachine {
             name: name.to_string(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         1_000,
     )
@@ -378,6 +379,7 @@ fn project_delete_cascades_pa_accounts_and_sessions() {
                 name: "beta".to_string(),
                 operator: String::new(),
                 ts: 0,
+                clone_from: None,
             },
             1_000,
         )
@@ -595,7 +597,17 @@ fn operator_field_serde_backward_compatible() {
     let old_create = r#"{"ProjectCreate":{"name":"alpha"}}"#;
     let cmd: Command = serde_json::from_str(old_create).expect("旧 ProjectCreate JSON 必须兼容");
     match cmd {
-        Command::ProjectCreate { operator, .. } => assert_eq!(operator, ""),
+        Command::ProjectCreate {
+            operator,
+            clone_from,
+            ..
+        } => {
+            assert_eq!(operator, "");
+            assert!(
+                clone_from.is_none(),
+                "旧日志无 clone_from 字段 → 默认 None（普通创建）"
+            );
+        }
         other => panic!("反序列化类型错误: {other:?}"),
     }
 }

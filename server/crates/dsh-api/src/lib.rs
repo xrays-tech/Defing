@@ -252,6 +252,9 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiErrorBody>)>;
 #[derive(Deserialize)]
 struct CreateProjectReq {
     name: String,
+    /// 可选：从该项目的已发布结构克隆初始化结构。
+    #[serde(default)]
+    clone_from: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -755,16 +758,27 @@ async fn create_project(
     State(app): State<ApiState>,
     Json(req): Json<CreateProjectReq>,
 ) -> ApiResult<serde_json::Value> {
+    // 空串归一 None（可选语义：不传/空串 = 普通创建）
+    let clone_from = req
+        .clone_from
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     let pid = ProjectId(req.name.clone());
     app.write(
         &Command::ProjectCreate {
             name: req.name.clone(),
             operator: "admin".to_string(),
             ts: now_ms(),
+            clone_from: clone_from.clone(),
         },
         now_ms(),
     )
     .await?;
+    let mut detail = serde_json::json!({});
+    if let Some(src) = &clone_from {
+        detail["clone_from"] = serde_json::Value::String(src.clone());
+    }
     app.audit
         .append(
             "project_create",
@@ -772,7 +786,7 @@ async fn create_project(
             None,
             None,
             None,
-            serde_json::json!({}),
+            detail,
             &principal_op(&principal),
         )
         .await;

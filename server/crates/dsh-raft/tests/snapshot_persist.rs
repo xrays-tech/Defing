@@ -34,6 +34,7 @@ async fn snapshot_persists_across_restart() {
                     name: "p".into(),
                     operator: String::new(),
                     ts: 0,
+                    clone_from: None,
                 },
                 1,
             )

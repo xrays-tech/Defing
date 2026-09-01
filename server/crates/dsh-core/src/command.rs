@@ -33,6 +33,9 @@ pub enum Command {
         /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
         #[serde(default)]
         ts: i64,
+        /// 可选：从该项目的已发布结构克隆初始化结构（groups 直接进入新项目已发布结构 v1）。
+        #[serde(default)]
+        clone_from: Option<String>,
     },
     ProjectDelete {
         id: ProjectId,

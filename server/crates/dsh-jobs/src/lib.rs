@@ -294,6 +294,7 @@ mod tests {
                 name: "p".into(),
                 operator: String::new(),
                 ts: 0,
+                clone_from: None,
             },
             1,
         )
@@ -494,6 +495,7 @@ mod rewrap_tests {
                 name: "p".into(),
                 operator: String::new(),
                 ts: 0,
+                clone_from: None,
             },
             1,
         )
@@ -668,6 +670,7 @@ mod auto_rollback_tests {
                 name: "p".into(),
                 operator: String::new(),
                 ts: 0,
+                clone_from: None,
             },
             1,
         )

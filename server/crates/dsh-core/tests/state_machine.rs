@@ -51,6 +51,7 @@ fn setup(s: &mut StateMachine) -> (ProjectId, Vec<BranchName>) {
                 name: "order-service".into(),
                 operator: String::new(),
                 ts: 0,
+                clone_from: None,
             },
             1
         )
@@ -386,6 +387,7 @@ fn duplicate_project_conflicts() {
             name: "p1".into(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         1,
     )
@@ -396,6 +398,7 @@ fn duplicate_project_conflicts() {
                 name: "p1".into(),
                 operator: String::new(),
                 ts: 0,
+                clone_from: None,
             },
             2,
         )
@@ -2571,6 +2574,7 @@ fn multi_session_coexists() {
             name: "p".into(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         19,
     )
@@ -2781,6 +2785,7 @@ fn multi_session_cascade_clears_all() {
             name: "p".into(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         1,
     )
@@ -4443,7 +4448,8 @@ fn required_secret_is_preserved_when_not_in_next_draft() {
             &Command::ProjectCreate {
                 name: "order-service".into(),
                 operator: String::new(),
-                ts: 0
+                ts: 0,
+                clone_from: None,
             },
             1
         )

@@ -946,9 +946,17 @@ impl StateMachine {
 
     fn apply_inner(&mut self, cmd: &Command, now_ms: i64) -> ApplyOutcome {
         match cmd {
-            Command::ProjectCreate { name, operator, ts } => {
-                self.apply_project_create(name, Self::eff_ts(ts, now_ms), operator)
-            }
+            Command::ProjectCreate {
+                name,
+                operator,
+                ts,
+                clone_from,
+            } => self.apply_project_create(
+                name,
+                Self::eff_ts(ts, now_ms),
+                operator,
+                clone_from.as_deref(),
+            ),
             Command::ProjectDelete { id, operator } => self.apply_project_delete(id, operator),
             Command::BranchCreate {
                 project,
@@ -1219,7 +1227,13 @@ impl StateMachine {
         }
     }
 
-    fn apply_project_create(&mut self, name: &str, now_ms: i64, _operator: &str) -> ApplyOutcome {
+    fn apply_project_create(
+        &mut self,
+        name: &str,
+        now_ms: i64,
+        _operator: &str,
+        clone_from: Option<&str>,
+    ) -> ApplyOutcome {
         if !valid_name(name) {
             return Err(Error::validation(format!("invalid project name: {name:?}")));
         }
@@ -1231,15 +1245,39 @@ impl StateMachine {
         if self.get_project(&id)?.is_some() {
             return Err(Error::conflict(format!("project {name} already exists")));
         }
+        // 克隆源：读取源项目已发布结构（确定性：仅读 Raft 复制状态，D20）
+        let mut groups: Vec<GroupDef> = Vec::new();
+        if let Some(src) = clone_from {
+            if src == name {
+                return Err(Error::validation(
+                    "clone source must differ from new project name",
+                ));
+            }
+            if !valid_name(src) {
+                return Err(Error::validation(format!("invalid clone source: {src:?}")));
+            }
+            let src_struct = self
+                .get_structure(&ProjectId(src.to_string()))?
+                .ok_or_else(|| Error::validation(format!("clone source {src:?} not found")))?;
+            // 防御：克隆组落地前校验（API 路径源结构恒有效——draft-set 无条件校验；
+            // 此步防御 Warn 发布策略边缘，确定性不受影响）
+            let errs = validator::validate_structure(&Structure {
+                version: src_struct.version,
+                groups: src_struct.groups.clone(),
+            });
+            if !errs.is_empty() {
+                return Err(Error::publish_blocked(
+                    serde_json::json!({ "errors": errs }),
+                ));
+            }
+            groups = src_struct.groups;
+        }
         let project = Project {
             id: id.clone(),
             name: name.to_string(),
             created_at: now_ms,
         };
-        let structure = Structure {
-            version: 1,
-            groups: vec![],
-        };
+        let structure = Structure { version: 1, groups };
         self.save_pending(&project_key(&id), &project)?;
         self.save_pending(&idx_pname(name), &"1")?;
         self.save_pending(&struct_key(&id), &structure)?;
@@ -2900,6 +2938,7 @@ mod tests {
                 name: proj.into(),
                 operator: String::new(),
                 ts: 0,
+                clone_from: None,
             },
             1,
         )
@@ -3047,6 +3086,7 @@ mod tests {
                 name: "p".into(),
                 operator: String::new(),
                 ts: 0,
+                clone_from: None,
             },
             1,
         )
@@ -3147,5 +3187,186 @@ mod tests {
                 6,
             )
             .is_ok());
+    }
+
+    /// project-clone：从源项目已发布结构克隆初始化新项目结构（v1 落地，分支无版本）。
+    #[test]
+    fn project_create_clone_from_structure() {
+        let mut s = sm();
+        // 源项目：发布含 required/secret/shared/description 项的结构
+        s.apply(
+            &Command::ProjectCreate {
+                name: "src".into(),
+                operator: String::new(),
+                ts: 0,
+                clone_from: None,
+            },
+            1,
+        )
+        .unwrap();
+        s.apply(
+            &Command::StructureDraftSet {
+                project: ProjectId("src".into()),
+                base_version: 1,
+                groups: vec![GroupDef {
+                    name: "app".into(),
+                    items: vec![
+                        ItemDef {
+                            key: "host".into(),
+                            ty: ValueType::String,
+                            required: true,
+                            secret: false,
+                            validate: None,
+                            description: Some("主机".into()),
+                            shared: false,
+                        },
+                        ItemDef {
+                            key: "token".into(),
+                            ty: ValueType::Secret,
+                            required: true,
+                            secret: true,
+                            validate: None,
+                            description: None,
+                            shared: false,
+                        },
+                        ItemDef {
+                            key: "timeout".into(),
+                            ty: ValueType::Int,
+                            required: false,
+                            secret: false,
+                            validate: None,
+                            description: None,
+                            shared: true,
+                        },
+                    ],
+                }],
+                operator: String::new(),
+            },
+            2,
+        )
+        .unwrap();
+        s.apply(
+            &Command::PublishStructure {
+                project: ProjectId("src".into()),
+                comment: "init".into(),
+                request_id: "r1".into(),
+                operator: String::new(),
+                ts: 0,
+                policy: PublishPolicy::Block,
+            },
+            3,
+        )
+        .unwrap();
+
+        // 克隆创建
+        s.apply(
+            &Command::ProjectCreate {
+                name: "dst".into(),
+                operator: String::new(),
+                ts: 0,
+                clone_from: Some("src".into()),
+            },
+            4,
+        )
+        .unwrap();
+        let st = s.get_structure(&ProjectId("dst".into())).unwrap().unwrap();
+        assert_eq!(st.version, 1, "克隆结构直接以 v1 落地");
+        assert_eq!(st.groups.len(), 1);
+        let items = &st.groups[0].items;
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].key, "host");
+        assert!(items[0].required);
+        assert_eq!(items[0].description.as_deref(), Some("主机"));
+        assert_eq!(items[1].ty, ValueType::Secret);
+        assert!(items[1].secret);
+        assert!(items[2].shared, "shared 标记随结构克隆");
+        // 无结构草稿
+        assert!(s
+            .get_structure_draft(&ProjectId("dst".into()))
+            .unwrap()
+            .is_none());
+        // 分支照旧创建且无版本
+        for b in ["dev", "test", "prod"] {
+            let bs = s
+                .get_branch_state(&ProjectId("dst".into()), &BranchName(b.into()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(bs.active_version, 0, "{b} 无版本记录");
+            assert_eq!(bs.structure_version, 1);
+        }
+    }
+
+    /// project-clone：克隆源校验负例。
+    #[test]
+    fn project_create_clone_errors() {
+        let mut s = sm();
+        // 源不存在
+        let e = s
+            .apply(
+                &Command::ProjectCreate {
+                    name: "dst".into(),
+                    operator: String::new(),
+                    ts: 0,
+                    clone_from: Some("nope".into()),
+                },
+                1,
+            )
+            .expect_err("clone source must exist");
+        assert_eq!(e.kind, ErrorKind::Validation);
+        // 自克隆（新项目尚不存在，走 validation 而非 conflict）
+        let e = s
+            .apply(
+                &Command::ProjectCreate {
+                    name: "self".into(),
+                    operator: String::new(),
+                    ts: 0,
+                    clone_from: Some("self".into()),
+                },
+                1,
+            )
+            .expect_err("self clone rejected");
+        assert_eq!(e.kind, ErrorKind::Validation);
+        // 非法源名
+        let e = s
+            .apply(
+                &Command::ProjectCreate {
+                    name: "dst2".into(),
+                    operator: String::new(),
+                    ts: 0,
+                    clone_from: Some("a/b".into()),
+                },
+                1,
+            )
+            .expect_err("invalid clone source");
+        assert_eq!(e.kind, ErrorKind::Validation);
+    }
+
+    /// project-clone：源从未发布结构（空 groups）→ 克隆等价普通创建。
+    #[test]
+    fn project_create_clone_empty_source_equivalent_plain() {
+        let mut s = sm();
+        s.apply(
+            &Command::ProjectCreate {
+                name: "src".into(),
+                operator: String::new(),
+                ts: 0,
+                clone_from: None,
+            },
+            1,
+        )
+        .unwrap();
+        s.apply(
+            &Command::ProjectCreate {
+                name: "dst".into(),
+                operator: String::new(),
+                ts: 0,
+                clone_from: Some("src".into()),
+            },
+            2,
+        )
+        .unwrap();
+        let st = s.get_structure(&ProjectId("dst".into())).unwrap().unwrap();
+        assert_eq!(st.version, 1);
+        assert!(st.groups.is_empty());
     }
 }

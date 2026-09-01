@@ -15,6 +15,7 @@ fn seed_project(s: &mut StateMachine) {
             name: "p".into(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         1,
     )
@@ -24,6 +25,7 @@ fn seed_project(s: &mut StateMachine) {
             name: "q".into(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         2,
     )

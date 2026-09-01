@@ -81,7 +81,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/Project' }
     post:
-      summary: 创建项目（name 全局唯一）
+      summary: 创建项目（name 全局唯一；可选 clone_from 克隆源项目已发布结构）
       requestBody:
         required: true
         content:
@@ -91,13 +91,24 @@ paths:
               required: [name]
               properties:
                 name: { type: string, maxLength: 128 }
+                clone_from:
+                  type: string
+                  description: 可选：从该项目克隆已发布结构（新项目结构直接以 v1 落地；不传/空串 = 空结构普通创建）
       responses:
-        '201':
+        '200':
           description: 已创建（默认创建 dev/test/prod 分支）
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Project' }
+              schema:
+                type: object
+                required: [id, branches]
+                properties:
+                  id: { type: string }
+                  branches:
+                    type: array
+                    items: { type: string }
         '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
   /api/v1/projects/{p}:
     get:
       summary: 项目详情

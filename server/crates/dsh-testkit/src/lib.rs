@@ -66,6 +66,7 @@ pub fn seed_demo_project(
 
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
         1,
     )?;

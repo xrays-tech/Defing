@@ -33,6 +33,7 @@ async fn start_with_cipher(cipher: Option<std::sync::Arc<dsh_crypto::Cipher>>) -
                     name: name.to_string(),
                     operator: String::new(),
                     ts: 0,
+                    clone_from: None,
                 },
                 1,
             )

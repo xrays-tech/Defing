@@ -26,6 +26,7 @@ async fn start() -> TestServer {
                     name: name.to_string(),
                     operator: String::new(),
                     ts: 0,
+                    clone_from: None,
                 },
                 1,
             )

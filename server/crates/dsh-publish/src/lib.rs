@@ -382,6 +382,7 @@ mod tests {
                 name: "p".into(),
                 operator: "test".to_string(),
                 ts: 0,
+                clone_from: None,
             },
             1,
         )

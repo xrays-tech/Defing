@@ -58,6 +58,7 @@ async fn learner_forward_hint() {
             name: "x".into(),
             operator: String::new(),
             ts: 0,
+            clone_from: None,
         },
     )
     .await;

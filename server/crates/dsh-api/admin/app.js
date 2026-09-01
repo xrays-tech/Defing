@@ -182,6 +182,15 @@ function openModal(o) {
     input.value = o.value || '';
     input.type = o.inputType || 'text';
   } else field.classList.add('hidden');
+  // 可选下拉（如新建项目「从现有项目克隆结构」）；无选项时不显示，既有弹窗零影响
+  const sField = $('modal-select-field'), sSel = $('modal-select'), sLabel = $('modal-select-label');
+  if (o.select && o.select.options && o.select.options.length) {
+    sField.classList.remove('hidden');
+    sLabel.textContent = o.select.label || '';
+    sSel.innerHTML = o.select.options
+      .map((op) => `<option value="${esc(op.value)}">${esc(op.label)}</option>`)
+      .join('');
+  } else sField.classList.add('hidden');
   const ok = $('modal-ok');
   ok.textContent = o.okText || '确定';
   ok.className = 'btn ' + (o.danger ? 'danger' : 'primary');
@@ -411,17 +420,26 @@ actions.selectProject = function (el) {
 };
 
 actions.newProjectModal = function () {
+  // 克隆源 = 当前可见项目列表（管理员可见全部；PA 无创建权限，服务端 403 兜底）
+  const sources = (S.projects || []).map((p) => ({ value: p.id, label: p.name }));
   openModal({
     title: '新建项目',
     input: true, label: '项目名', placeholder: '小写字母 / 数字 / 连字符，如 mall-order',
+    select: sources.length ? {
+      label: '从现有项目克隆结构（可选）',
+      options: [{ value: '', label: '不克隆（空结构）' }, ...sources],
+    } : null,
     okText: '创建',
-    onOk: async (v) => {
-      const name = (v || '').trim();
+    onOk: async (r) => {
+      const name = ((typeof r === 'string' ? r : (r && r.value) || '') || '').trim();
+      const cloneFrom = (typeof r === 'string' ? '' : ((r && r.select) || ''));
       if (!name) { toast('请输入项目名', 'err'); return; }
       try {
-        const r = await j('POST', '/api/v1/projects', { name });
-        toast('项目已创建');
-        S.project = (r && r.id) || name;
+        const body = { name };
+        if (cloneFrom) body.clone_from = cloneFrom;
+        const resp = await j('POST', '/api/v1/projects', body);
+        toast(cloneFrom ? `项目已创建（结构克隆自 ${cloneFrom}）` : '项目已创建');
+        S.project = (resp && resp.id) || name;
         await loadProjects();
       } catch (e) { toast(e.message, 'err'); }
     },
@@ -2367,12 +2385,13 @@ function bindEvents() {
   // 登录（Enter 提交）
   $('login-form').addEventListener('submit', (e) => { e.preventDefault(); doLogin(); });
 
-  // 弹窗
+  // 弹窗（含可选下拉：select 可见时回调收到 { value, select }，否则保持字符串，既有弹窗零影响）
   $('modal-ok').addEventListener('click', () => {
     const v = $('modal-input').value;
+    const sv = $('modal-select-field').classList.contains('hidden') ? null : $('modal-select').value;
     const cb = modalCb;
     closeModal(true);
-    if (cb) cb(v);
+    if (cb) cb(sv === null ? v : { value: v, select: sv });
   });
   $('modal-cancel').addEventListener('click', () => closeModal(false));
   $('modal-overlay').addEventListener('mousedown', (e) => { if (e.target === $('modal-overlay')) closeModal(false); });
