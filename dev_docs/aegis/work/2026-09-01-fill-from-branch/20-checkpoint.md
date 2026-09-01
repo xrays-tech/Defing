@@ -14,16 +14,20 @@
 
 ## 已完成 / 证据
 - 基线 `cargo test --workspace` 全绿（job bash-354, exit 0）
-- 无头 Chrome CDP 冒烟通过（/tmp/cdp-smoke.mjs：CDP OK: hello|2）
-- 事实核实：build.rs rerun-if-changed=admin（dsh-api/build.rs:8-13）；CLI 支持 --master-key-file/--allow-no-master-key/--dev-single；api-surface-test 用 8384、dev-single-demo 用 8384、cluster 用 8383 → UI e2e 用 8396（避 gray-obs-demo 8397）
-- **dev-single 实测数据形状**：分支详情 draft/active 形状、secret 掩码、reveal JSON 树、config_reveal 审计、项目创建自动生成 dev/test/prod 默认分支（state.rs apply_project_create:1222）
-- **第 1 轮交叉复核**（subagent 0384d0a3）：1 阻塞（e2e 主密钥）+ 6 非阻塞 → 全部修复；**第 2 轮复审**：1 功能级（空串规则误伤 secret 草稿行）+ 4 文档残留 → 全部修复 → 开发条件满足
-- **实现完成**（T1-T4）：index.html sprite i-import + #fill-pop；app.js 状态/缓存失效/行内图标(data-act)/填充模块/事件绑定（修复计划遗漏的 data-act）；styles.css；docs/04-draft.md；scripts/ui-e2e-fill-branch.js
-- **验证全绿**：node --check ×2；cargo build -p dsh-cli（二进制嵌入最新资源）；**UI e2e 27 断言全过**（图标/草稿优先+发布并列/类型化填充/secret 明文不显示+审计/空态/Esc/外部点击）；cargo test --workspace exit 0；check-contracts OK；api-surface-test OK
-- **实现 reviewer**（subagent 3d103397）：运行中
+- 无头 Chrome CDP 冒烟通过；dev-single 实测数据形状（分支详情/secret 掩码/reveal JSON/审计/默认分支）
+- **第 1 轮交叉复核**：1 阻塞 + 6 非阻塞 → 修复；**第 2 轮复审**：1 功能级 + 4 残留 → 修复 → 开发条件满足
+- **实现完成**（T1-T4）：index.html / app.js / styles.css / docs/04-draft.md / scripts/ui-e2e-fill-branch.js
+- **实现 reviewer**（subagent 3d103397）：无阻塞；4 处代码小修（bool 回退/secret 判定显式化/代次守卫/死变量）+ e2e 补齐 4 项覆盖 → 全部修复，34 断言全过
+- **验证全绿**：node --check；cargo test --workspace 35 套件 0 失败；check-contracts；api-surface-test；UI e2e 34 断言；fmt/clippy/deny
+- **CI 全绿**：run 33463124701 completed/success（lint/unit/contract/raft/sdk/e2e/bench/release 8 job 全 ✓）
+- **提交**（4 个，全部推送 origin/main）：
+  - 505880b feat(admin-ui): 草稿页支持从其他分支取值填充
+  - 380577d docs: fill-from-branch 设计文档、开发计划与工作记录
+  - 5d149dc ci: 修复既有 CI 失败（rustfmt 漂移/clippy 新 lint/dev-single-demo watch 鉴权与竞态）
+  - 3bd26cd ci: 修复 g1/gray 演示脚本数据面 token 化遗漏 + result-large-err lint
 
 ## 阻塞项
 - 无
 
 ## 下一步
-- 收实现 reviewer 结论 → 修复发现的问题（如需）→ 全部提交 → push → CI 全绿
+- 无（目标达成：设计→计划→交叉复核→开发→reviewer→测试→提交→push→CI 全绿 全链路完成）
