@@ -568,6 +568,31 @@ textarea.code { min-height: 140px; }
 .gctl textarea { max-width: 560px; }
 .grow .icon-btn { margin-top: 2px; }
 
+/* fill-from-branch：行内填充图标（输入控件右侧水平对齐） */
+.fill-ctl { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.fill-ctl .in, .fill-ctl textarea { max-width: 520px; flex: 1 1 auto; }
+.grow .icon-btn.draft-fill { margin-top: 0; flex-shrink: 0; }
+
+/* 填充浮层：置于普通模态 overlay（z-index 90）之下、页面内容之上 */
+.fill-pop {
+  position: fixed; z-index: 70; min-width: 260px; max-width: 420px;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: 8px; box-shadow: var(--shadow-md);
+  padding: 8px; max-height: 300px; overflow-y: auto;
+}
+.fill-head { display: flex; align-items: center; gap: 6px; padding: 2px 4px 8px; border-bottom: 1px solid var(--border); }
+.fill-head .mono { flex: 1 1 auto; overflow-wrap: anywhere; }
+.fill-row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 8px; border-radius: 6px; cursor: pointer; text-align: left;
+  background: none; border: 0; font: inherit; color: inherit;
+}
+.fill-row:hover { background: var(--surface-2); }
+.fill-row[disabled] { opacity: .55; cursor: not-allowed; }
+.fill-row .fill-val { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12px; }
+.fill-empty, .fill-err { padding: 10px 8px; color: var(--fg-faint); font-size: 12px; }
+.fill-err { color: var(--err); }
+
 .addcard { border-style: dashed; border-color: var(--border-strong); box-shadow: none; }
 .addcard-title {
   display: flex;

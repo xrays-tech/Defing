@@ -63,6 +63,7 @@ const S = {
   structDraft: null,          // {base_version, groups:[{name, items:[...]}]}
   pubStruct: null,            // {version, groups} 最近拉取的已发布结构（值新增级联首选源 + 无草稿时的基线）
   defs: { src: 'none', groups: [] }, // 值新增选择器数据源：①已发布 > ②结构草稿 > ③自由输入回退
+  branchValues: null,   // { project, byName: {branch: {draft, active, active_version}}, errors: [] } —— 填充浮层数据缓存（会话内）
 };
 
 /* ---------------- 请求层 ---------------- */
@@ -118,6 +119,7 @@ async function withBusy(el, fn) {
 
 /* ---------------- 统一错误弹窗（报错一律在屏幕中心以模态弹窗展示） ---------------- */
 function showErrorModal(message, title) {
+  closeFillPop(); // fill-from-branch：打开模态前先关闭填充浮层（z-index 低于模态遮罩）
   $('err-title').textContent = title || '操作失败';
   $('err-msg').textContent = message || '';
   $('err-overlay').classList.remove('hidden');
@@ -167,6 +169,7 @@ function initTheme() {
 /* ---------------- 弹窗（确认 / 输入） ---------------- */
 let modalCb = null, modalCancelCb = null;
 function openModal(o) {
+  closeFillPop(); // fill-from-branch：打开模态前先关闭填充浮层
   $('modal-title').textContent = o.title || '确认';
   const msg = $('modal-msg');
   if (o.message) { msg.textContent = o.message; msg.classList.remove('hidden'); }
@@ -466,6 +469,7 @@ function renderBranchSelects() {
 
 // 已发布共享项缓存（草稿页「引用共享」绑定下拉的数据源）
 async function loadSharedItems() {
+  S.branchValues = null; // 共享发布只级联共享引用项、不重载分支：经此兜底填充缓存「发布 vN」徽标过期（引用项无填充图标，取值正确性不受影响）
   try {
     S.sharedItems = (await j('GET', '/api/v1/shared')) || [];
   } catch (_) {
@@ -597,6 +601,8 @@ async function loadBranch() {
   S.branch = nb;
   if (branchChanged) S.grayDirty = false; // 切换分支时才重置灰度规则表单
   S.grayBranch = nb;
+  closeFillPop();
+  S.branchValues = null; // 分支上下文变化（切换/保存/发布/提升/回滚/结构发布等全部经此）→ 填充缓存失效
   try {
     const b = await j('GET', `/api/v1/projects/${S.project}/branches/${S.branch}`);
     loadVersions();
@@ -609,6 +615,209 @@ async function loadBranch() {
     if (!e.expired) toast(e.message, 'err');
   }
 }
+
+/* ---------- 从其他分支取值填充（fill-from-branch） ---------- */
+// 设计：dev_docs/design/fill-from-branch.md。纯前端复用分支详情接口 + 会话内缓存；
+// 非共享项行内图标 → 弹出「有值分支」列表（草稿优先 + 发布并列，排除当前分支）→ 点击类型化填入；
+// secret 仅「已发布值」可填充：经既有 reveal 审计通道（config_reveal）取明文写入，明文不显示。
+
+// 源 Value JSON → 原始文本（填充用；secret 密文/掩码对象无字段 → ''）
+function fillValueRaw(v) {
+  if (!v || typeof v !== 'object') return '';
+  if (v.str_value !== undefined) return String(v.str_value);
+  if (v.int_value !== undefined) return String(v.int_value);
+  if (v.float_value !== undefined) return String(v.float_value);
+  if (v.bool_value !== undefined) return v.bool_value ? 'true' : 'false';
+  if (v.json_value !== undefined) return String(v.json_value);
+  if (Array.isArray(v.list_value)) return v.list_value.join(', ');
+  return '';
+}
+
+// secret 判定：草稿密文 {type:'secret', ciphertext} 或活动掩码 {masked:true}
+function isSecretValue(v) {
+  return !!(v && typeof v === 'object' && (v.masked === true || v.type === 'secret'));
+}
+
+// 候选行构建：草稿优先 + 发布并列（两者存在且原始文本不同才并列；secret 恒并列——密文与掩码原始文本
+// 不可比，统一按存在性列出：草稿行置灰、发布行经 reveal 填充）；空串源值视为「无值」（仅非 secret，
+// 避免填充后保存被当「清空=删除」处理）；排除当前分支。
+function fillCandidates(g, k) {
+  const out = [];
+  const cache = S.branchValues;
+  if (!cache || cache.project !== S.project) return out;
+  for (const b of (S.branches || [])) {
+    if (b.name === S.branch) continue;
+    const br = cache.byName[b.name];
+    if (!br) continue; // 拉取失败的分支由浮层错误区展示
+    const dv = (br.draft && br.draft[g] && br.draft[g][k]) ? br.draft[g][k].value : null;
+    const av = (br.active && br.active[g] && br.active[g][k]) ? br.active[g][k].value : null;
+    const hasDraft = dv !== null && dv !== undefined;
+    if (hasDraft && (fillValueRaw(dv) !== '' || isSecretValue(dv))) {
+      out.push({ branch: b.name, version: br.active_version, source: 'draft', value: dv, secret: isSecretValue(dv) });
+    }
+    if (av !== null && av !== undefined && (fillValueRaw(av) !== '' || isSecretValue(av))) {
+      if (!hasDraft || isSecretValue(dv) || isSecretValue(av) || fillValueRaw(dv) !== fillValueRaw(av)) {
+        out.push({ branch: b.name, version: br.active_version, source: 'active', value: av, secret: isSecretValue(av) });
+      }
+    }
+  }
+  return out;
+}
+
+// 缓存 → 并行拉取各分支详情（排除当前分支）；单分支失败降级为 errors 列表，不阻断整体
+async function ensureBranchValues() {
+  if (S.branchValues && S.branchValues.project === S.project) return S.branchValues;
+  const others = (S.branches || []).filter((b) => b.name !== S.branch);
+  const results = await Promise.all(others.map(async (b) => {
+    try {
+      const d = await j('GET', `/api/v1/projects/${encodeURIComponent(S.project)}/branches/${encodeURIComponent(b.name)}`);
+      return { name: b.name, data: d };
+    } catch (e) {
+      if (e.expired) throw e; // 会话过期交给 j() 统一处理
+      return { name: b.name, error: e.message };
+    }
+  }));
+  const byName = {}, errors = [];
+  for (const r of results) {
+    if (r.data) byName[r.name] = r.data;
+    else if (r.error) errors.push({ name: r.name, message: r.error });
+  }
+  S.branchValues = { project: S.project, byName, errors };
+  return S.branchValues;
+}
+
+// 按当前控件类型填入值并标记未保存
+function applyFillToControl(g, k, row, plaintext) {
+  const inp = document.querySelector(`#pane-draft .draft-in[data-g="${g}"][data-k="${k}"]`);
+  if (!inp) { showErrorModal('未找到当前配置项输入框，请刷新草稿页后重试'); return false; }
+  if (row.secret) {
+    if (plaintext === null || plaintext === undefined) { showErrorModal('源分支该配置项明文不可获取'); return false; }
+    inp.value = plaintext; // 写入明文，界面仍为密码框不显示
+  } else if (inp.type === 'checkbox') {
+    // bool：源值本身为 bool 直接取；否则（结构迁移遗留的字符串源值）按原始文本 'true' 回退判定（设计 §4.4）
+    const raw = fillValueRaw(row.value);
+    inp.checked = !!(row.value && (row.value.bool_value === true || (!('bool_value' in row.value) && raw === 'true')));
+  } else {
+    inp.value = fillValueRaw(row.value);
+  }
+  markDraftDirty();
+  return true;
+}
+
+// secret 明文：既有 reveal 审计通道（管理面会话解密 + config_reveal 审计），只取 tree[g][k] 字符串
+async function fillSecretPlaintext(g, k, branch) {
+  const txt = await jtext(`/v1/projects/${encodeURIComponent(S.project)}/branches/${encodeURIComponent(branch)}/config?format=json&reveal=true`);
+  let tree = {};
+  try { tree = JSON.parse(txt || '{}'); } catch (_) { return null; }
+  const v = tree[g] && tree[g][k];
+  return (v === undefined || v === null) ? null : String(v);
+}
+
+function closeFillPop() {
+  const pop = $('fill-pop');
+  if (pop) pop.classList.add('hidden');
+}
+
+// 浮层定位：锚定图标下方，视口越界上翻/夹紧
+function anchorFillPop(anchor) {
+  const pop = $('fill-pop');
+  if (!pop) return;
+  const r = anchor.getBoundingClientRect();
+  const pw = pop.offsetWidth || 300, ph = pop.offsetHeight || 220;
+  let top = r.bottom + 6;
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, r.top - ph - 6);
+  const left = Math.min(Math.max(8, r.left), window.innerWidth - pw - 8);
+  pop.style.left = left + 'px';
+  pop.style.top = top + 'px';
+}
+
+// 浮层渲染代次守卫：快速连点不同图标时，后发起的渲染覆盖先发起者（防内容串 key）
+let fillPopReq = null;
+
+async function renderFillPop(g, k, ty, anchor) {
+  const pop = $('fill-pop');
+  if (!pop) return;
+  const req = { g, k };
+  fillPopReq = req;
+  const noOthers = (S.branches || []).filter((b) => b.name !== S.branch).length === 0;
+  let rows = [], errors = [];
+  try {
+    const cache = await ensureBranchValues();
+    rows = fillCandidates(g, k);
+    errors = (cache && cache.errors) || [];
+  } catch (e) {
+    if (e.expired) return;
+    if (fillPopReq !== req) return; // 已被更新的请求取代
+    pop.innerHTML = `<div class="fill-head"><span class="mono small">${esc(g + '/' + k)}</span></div>` +
+      `<div class="fill-err">加载失败：${esc(e.message)}</div>` +
+      `<button type="button" class="btn sm ghost" data-act="fillRefresh" data-g="${esc(g)}" data-k="${esc(k)}" data-ty="${esc(ty)}">重试</button>`;
+    pop.classList.remove('hidden');
+    anchorFillPop(anchor);
+    return;
+  }
+  if (fillPopReq !== req) return; // 已被更新的请求取代
+  const head = `<div class="fill-head"><span class="mono small">${esc(g + '/' + k)}</span>` +
+    `<button type="button" class="icon-btn" data-act="fillRefresh" data-g="${esc(g)}" data-k="${esc(k)}" data-ty="${esc(ty)}" title="刷新" aria-label="刷新"><svg class="ic"><use href="#i-refresh"/></svg></button></div>`;
+  const errs = errors.map((er) =>
+    `<div class="fill-err">分支 ${esc(er.name)} 拉取失败：${esc(er.message)}</div>`).join('');
+  let body;
+  if (noOthers) {
+    body = '<div class="fill-empty">暂无其他分支</div>';
+  } else if (!rows.length) {
+    body = '<div class="fill-empty">其他分支暂无该配置项的值</div>';
+  } else {
+    body = rows.map((r) => {
+      const badge = r.source === 'draft'
+        ? '<span class="badge warn" style="flex-shrink:0">草稿</span>'
+        : `<span class="badge" style="flex-shrink:0">发布 v${r.version}</span>`;
+      const valHtml = r.secret
+        ? '<span class="hint" style="flex-shrink:0">已加密</span>'
+        : `<span class="fill-val">${esc(fmtVal(r.value))}</span>`;
+      const dis = (r.secret && r.source === 'draft')
+        ? ' disabled title="草稿明文不可回读，仅支持从已发布版本填充"'
+        : '';
+      return `<button type="button" class="fill-row"${dis} data-act="fillPick" data-branch="${esc(r.branch)}" data-source="${r.source}" data-secret="${r.secret ? '1' : ''}" data-g="${esc(g)}" data-k="${esc(k)}" data-ty="${esc(ty)}">` +
+        `<span class="mono small" style="flex-shrink:0">${esc(r.branch)}</span>${badge}${valHtml}</button>`;
+    }).join('');
+  }
+  pop.innerHTML = head + errs + body;
+  pop.classList.remove('hidden');
+  anchorFillPop(anchor);
+}
+
+actions.fillFromBranch = async function (el) {
+  if (!S.project || !S.branch) return;
+  const g = el.dataset.g, k = el.dataset.k, ty = el.dataset.ty || 'string';
+  closeFillPop();
+  await withBusy(el, async () => { await renderFillPop(g, k, ty, el); });
+};
+
+actions.fillPick = async function (el) {
+  const g = el.dataset.g, k = el.dataset.k;
+  const branch = el.dataset.branch, source = el.dataset.source;
+  const cand = fillCandidates(g, k).find((c) => c.branch === branch && c.source === source);
+  if (!cand) { showErrorModal('候选值已失效，请点刷新后重试'); return; }
+  if (cand.secret) {
+    await withBusy(el, async () => {
+      try {
+        const plain = await fillSecretPlaintext(g, k, branch);
+        if (applyFillToControl(g, k, cand, plain)) {
+          toast(`已从分支 ${branch} 填充 secret（明文不显示，保存后生效）`);
+          closeFillPop();
+        }
+      } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+    });
+  } else if (applyFillToControl(g, k, cand, null)) {
+    toast(`已从分支 ${branch} 填充`);
+    closeFillPop();
+  }
+};
+
+actions.fillRefresh = async function (el) {
+  const g = el.dataset.g, k = el.dataset.k, ty = el.dataset.ty || 'string';
+  S.branchValues = null;
+  await withBusy(el, async () => { await renderFillPop(g, k, ty, el); });
+};
 
 /* ---------- 保存状态指示（草稿 / 结构 / 共享配置） ---------- */
 // 草稿页：未保存（draftDirty）+ 已保存未发布（draftValKeys 数）
@@ -705,6 +914,8 @@ function draftStructRowHtml(g, it, v, av, hasActive) {
   } else {
     ctl = `<input class="in draft-in" ${common} data-ty="string" value="${esc(val ? val.str_value ?? '' : '')}">`;
   }
+  // fill-from-branch：非共享行输入控件右侧水平对齐「从其他分支取值填充」图标
+  ctl = `<div class="fill-ctl">${ctl}${fillBtn(g, it)}</div>`;
   const icon = type === 'secret' ? '<svg class="ic ic-xs"><use href="#i-lock"/></svg>' : '';
   const badges = [];
   if (it.required) badges.push('<span class="badge warn" title="发布前必须有值">required</span>');
@@ -720,6 +931,11 @@ function draftStructRowHtml(g, it, v, av, hasActive) {
     <div class="gctl">${ctl}</div>
     <div class="gdel">${hasVal}</div>
   </div>`;
+}
+
+// fill-from-branch：行内「从其他分支取值填充」图标按钮（无 draft-in class，不参与保存收集与 dirty 监听）
+function fillBtn(g, it) {
+  return `<button type="button" class="icon-btn draft-fill" data-act="fillFromBranch" data-g="${esc(g.name)}" data-k="${esc(it.key)}" data-ty="${esc(it.type || 'string')}" title="从其他分支取值填充" aria-label="从其他分支取值填充"><svg class="ic"><use href="#i-import"/></svg></button>`;
 }
 
 // 引用共享绑定行（草稿页）：下拉选择本分支引用的共享项（按结构声明 type 过滤）+ 物化值展示。
@@ -2140,6 +2356,14 @@ function bindEvents() {
     else if (t.id === 'sh-key' || t.id === 'sh-desc' || t.id === 'sh-value') markSharedDirty();
   });
 
+  // fill-from-branch：点击浮层外关闭（浮层自身与填充图标点击不关闭）
+  document.addEventListener('click', (e) => {
+    const pop = $('fill-pop');
+    if (!pop || pop.classList.contains('hidden')) return;
+    if (e.target.closest('#fill-pop') || e.target.closest('.draft-fill')) return;
+    closeFillPop();
+  });
+
   // 登录（Enter 提交）
   $('login-form').addEventListener('submit', (e) => { e.preventDefault(); doLogin(); });
 
@@ -2172,6 +2396,7 @@ function bindEvents() {
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (!$('err-overlay').classList.contains('hidden')) closeErrorModal();
+    else if (!$('fill-pop').classList.contains('hidden')) closeFillPop(); // fill-from-branch：低于错误弹窗、高于普通弹窗
     else if (!$('shared-edit-overlay').classList.contains('hidden')) closeSharedEditModal();
     else if (!$('modal-overlay').classList.contains('hidden')) closeModal(false);
     else if (!$('cfg-overlay').classList.contains('hidden')) actions.closeCfg();
