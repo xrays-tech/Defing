@@ -39,16 +39,28 @@ assert r.get('warnings'), 'warn 模式应带 warnings: %s' % r
 " && echo "  warn 放行 + warnings 明细 OK"
 
 echo "== 3. --shared-cascade manual：共享发布不级联引用分支 =="
-J -X POST $BASE/api/v1/shared -d '{"group":"lib","key":"timeout","type":"int","value":{"type":"int","int_value":30}}' >/dev/null
+# 共享引用（shared-ref-rework 后模型）：结构 shared 标记 + 分支 shared_bindings（旧 group/refs 端点已移除）
+J -X POST $BASE/api/v1/shared -d '{"key":"timeout","type":"int","description":"全局超时","value":{"type":"int","int_value":30}}' >/dev/null
 J -X POST $BASE/api/v1/shared/publish -d '{"comment":"v1","request_id":"sp1"}' >/dev/null
-J -X POST $BASE/api/v1/shared/refs -d '{"project":"g1","group":"redis","item_key":"port","shared_group":"lib","shared_key":"timeout"}' >/dev/null
+J -X PUT $BASE/api/v1/projects/g1/structure-draft -d '{"base_version":2,"groups":[{"name":"redis","items":[{"key":"host","type":"string","required":true},{"key":"port","type":"int","shared":true}]}]}' >/dev/null
+J -X POST $BASE/api/v1/projects/g1/structure-draft/publish -d '{"comment":"shared ref","request_id":"sr1"}' >/dev/null
+J -X PUT $BASE/api/v1/projects/g1/branches/dev/draft -d '{"updates":[{"group":"redis","key":"host","value":{"type":"string","str_value":"10.0.0.1"}}],"shared_bindings":[{"group":"redis","key":"port","shared_key":"timeout"}]}' >/dev/null
+J -X POST $BASE/api/v1/projects/g1/branches/dev/publish -d '{"comment":"bind","request_id":"pb1"}' >/dev/null
 BEFORE=$(J $BASE/api/v1/projects/g1/branches/dev | python3 -c "import json,sys; print(json.load(sys.stdin)['active_version'])")
-J -X POST $BASE/api/v1/shared -d '{"group":"lib","key":"timeout","type":"int","value":{"type":"int","int_value":60}}' >/dev/null
+J -X POST $BASE/api/v1/shared -d '{"key":"timeout","type":"int","description":"全局超时","value":{"type":"int","int_value":60}}' >/dev/null
 J -X POST $BASE/api/v1/shared/publish -d '{"comment":"v2","request_id":"sp2"}' >/dev/null
 AFTER=$(J $BASE/api/v1/projects/g1/branches/dev | python3 -c "import json,sys; print(json.load(sys.stdin)['active_version'])")
 [ "$BEFORE" = "$AFTER" ] && echo "  manual: shared publish does NOT cascade (branch stays v$AFTER) OK" || { echo "  FAIL: branch was cascaded"; exit 1; }
 
 echo "== 4. manual materialize: next publish reads new shared value 60 =="
+# 共享发布不自动级联，但分支下次显式发布会物化新共享值
+J -X PUT $BASE/api/v1/projects/g1/branches/dev/draft -d '{"updates":[{"group":"redis","key":"host","value":{"type":"string","str_value":"10.0.0.2"}}]}' >/dev/null
+J -X POST $BASE/api/v1/projects/g1/branches/dev/publish -d '{"comment":"next","request_id":"pb2"}' >/dev/null
+curl -sf -H "$AUTH" "$BASE/v1/projects/g1/branches/dev/config?format=json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['redis']['port']==60, d['redis']
+" && echo "  manual materialize OK（下次发布读到 port=60）"
 echo "== 5. --read-mode linear：读正常（dev-single 恒满足）=="
 curl -sf $BASE/v1/projects/g1/branches/dev/snapshot >/dev/null && echo "  linear 读 OK"
 J "$BASE/api/v1/projects/g1/diff?branch_a=dev&branch_b=test" >/dev/null && echo "  diff 读 OK"

@@ -27,6 +27,9 @@ pub struct HttpNetwork {
 }
 
 impl HttpNetwork {
+    // 返回类型 RPCError<NodeId, NodeInfo, …> 由 openraft RaftNetwork trait 契约固定（体积大）；
+    // 装箱会改签名/波及调用点，显式豁免 result-large-err（CI stable clippy 1.98 新增 lint）。
+    #[allow(clippy::result_large_err)]
     async fn post<T: serde::Serialize, R: DeserializeOwned>(
         &self,
         path: &str,
@@ -55,6 +58,8 @@ impl HttpNetwork {
 /// 占位错误类型（RPCError 的 E 参数；实际错误以 Network 变体返回）。
 pub type RaftErrorPlaceholder = openraft::error::RaftError<NodeId>;
 
+// result-large-err：RPCError 体积由 openraft trait 契约决定，豁免（同上）。
+#[allow(clippy::result_large_err)]
 impl RaftNetwork<TypeConfig> for HttpNetwork {
     async fn append_entries(
         &mut self,
