@@ -256,7 +256,10 @@ async fn config_render_session_exemption() {
         None,
     )
     .await;
-    assert_ne!(code, 401, "admin session can render masked config, got {code}");
+    assert_ne!(
+        code, 401,
+        "admin session can render masked config, got {code}"
+    );
     // PA 会话访问自己项目 → 鉴权通过
     let (code, _) = req(
         &ts.base,
@@ -266,7 +269,10 @@ async fn config_render_session_exemption() {
         None,
     )
     .await;
-    assert_ne!(code, 401, "PA session can render own project config, got {code}");
+    assert_ne!(
+        code, 401,
+        "PA session can render own project config, got {code}"
+    );
     // PA 会话访问其他项目 → 401（会话豁免拒绝 + 无项目 token）
     let (code, _) = req(
         &ts.base,

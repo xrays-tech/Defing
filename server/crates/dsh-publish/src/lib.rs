@@ -120,6 +120,9 @@ impl PublishService {
 
     /// 值草稿更新（secret 项自动加密）。
     /// `expected_draft_rev`（乐观锁）：0 = 不校验（旧客户端）；>0 校验，不匹配 → Conflict。
+    // 既有签名（7 显式参数 + self，clippy 阈值 7）；重构为参数结构体将波及 4 处调用点，
+    // 与 CI 门禁 lint 相比风险更高，保留签名并显式豁免。
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_draft(
         &self,
         project: &ProjectId,
@@ -396,8 +399,8 @@ mod tests {
                             required: true,
                             secret: false,
                             validate: None,
-                description: None,
-                shared: false,
+                            description: None,
+                            shared: false,
                         },
                         ItemDef {
                             key: "pass".into(),
@@ -405,8 +408,8 @@ mod tests {
                             required: false,
                             secret: true,
                             validate: None,
-                description: None,
-                shared: false,
+                            description: None,
+                            shared: false,
                         },
                     ],
                 }],

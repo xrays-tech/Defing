@@ -21,9 +21,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use dsh_core::command::{Command, DraftUpdateItem};
-use dsh_core::model::{
-    BranchName, GrayRule, GroupDef, ProjectId, SharedItem, Value, ValueType,
-};
+use dsh_core::model::{BranchName, GrayRule, GroupDef, ProjectId, SharedItem, Value, ValueType};
 use dsh_core::wire::masked_value;
 use dsh_core::{ErrorKind, StateMachine};
 use dsh_crypto::Cipher;
@@ -1412,7 +1410,10 @@ async fn branch_detail(
                         }),
                         other => serde_json::json!(other),
                     };
-                    m.insert(k.clone(), serde_json::json!({ "value": vj, "updated_at": 0 }));
+                    m.insert(
+                        k.clone(),
+                        serde_json::json!({ "value": vj, "updated_at": 0 }),
+                    );
                 }
                 gmap.insert(g.clone(), serde_json::Value::Object(m));
             }
@@ -1686,16 +1687,15 @@ fn shared_item_json(
         obj["description"] = serde_json::Value::String(d.clone());
     }
     if let Some(r) = refs {
-        obj["refs"] = serde_json::json!(
-            r.iter()
-                .map(|(p, b, g, k)| serde_json::json!({
-                    "project": p.as_str(),
-                    "branch": b.as_str(),
-                    "group": g,
-                    "item_key": k,
-                }))
-                .collect::<Vec<_>>()
-        );
+        obj["refs"] = serde_json::json!(r
+            .iter()
+            .map(|(p, b, g, k)| serde_json::json!({
+                "project": p.as_str(),
+                "branch": b.as_str(),
+                "group": g,
+                "item_key": k,
+            }))
+            .collect::<Vec<_>>());
     }
     obj
 }
@@ -1778,10 +1778,7 @@ async fn write_shared_draft(
     }
     if let Some(d) = &req.description {
         if d.len() > dsh_core::limits::MAX_DESC_BYTES {
-            return Err(ApiError(dsh_core::Error::validation(
-                "描述超过上限（200 字节）",
-            ))
-            .into());
+            return Err(ApiError(dsh_core::Error::validation("描述超过上限（200 字节）")).into());
         }
     }
     let item = SharedItem {
@@ -1842,22 +1839,19 @@ async fn list_shared(
     principal: axum::Extension<dsh_core::Principal>,
 ) -> ApiResult<serde_json::Value> {
     let sm = app.sm.read().map_err(lock_err)?;
-    let items = sm
-        .list_shared_published()
-        .map_err(ApiError::from)?;
+    let items = sm.list_shared_published().map_err(ApiError::from)?;
     let out = items
         .iter()
         .map(|item| {
             // N11：PA 只读共享列表时 refs 过滤为仅自己项目（防跨项目元数据读取）
             let refs = match &*principal {
-                dsh_core::Principal::ProjectAdmin { project, .. } => sm
-                    .shared_usage(&item.key)
-                    .ok()
-                    .map(|all| {
+                dsh_core::Principal::ProjectAdmin { project, .. } => {
+                    sm.shared_usage(&item.key).ok().map(|all| {
                         all.into_iter()
                             .filter(|(p, _, _, _)| p.as_str() == project.0)
                             .collect::<Vec<_>>()
-                    }),
+                    })
+                }
                 _ => sm.shared_usage(&item.key).ok(),
             };
             shared_item_json(item, refs.as_deref())
@@ -3780,6 +3774,7 @@ fn bad_current_password() -> (StatusCode, Json<ApiErrorBody>) {
 /// - admin：校验全局管理员密码（状态机哈希优先，回退节点配置 --admin-password，同 login）
 ///   → AdminSetPassword + 踢全部管理员会话（改密即重登）；
 /// - PA：校验账号加盐哈希 → ProjectAdminSetPassword（apply 级联收回该账号全部会话）。
+///
 /// 只能改自己的密码：主体取自会话扩展（中间件注入），不可由请求体伪造。
 async fn change_my_password(
     State(app): State<ApiState>,
@@ -3804,8 +3799,13 @@ async fn change_my_password(
                 return Err(bad_current_password());
             }
             let hash = hash_password(&req.new_password).map_err(ApiError::from)?;
-            app.write(&Command::AdminSetPassword { password_hash: hash }, now)
-                .await?;
+            app.write(
+                &Command::AdminSetPassword {
+                    password_hash: hash,
+                },
+                now,
+            )
+            .await?;
             // 改密后强制下线全部管理员会话（旧+新格式全清），与 admin_set_password 一致
             app.write(&Command::MultiSessionLogoutAll, now).await?;
             app.audit
@@ -4296,10 +4296,7 @@ async fn forward_leader_writes(
                 .await
         }
     };
-    let req = axum::extract::Request::from_parts(
-        parts,
-        axum::body::Body::from(body_bytes.clone()),
-    );
+    let req = axum::extract::Request::from_parts(parts, axum::body::Body::from(body_bytes.clone()));
     let resp = next.run(req).await;
     if resp.status() != StatusCode::PRECONDITION_REQUIRED {
         return resp;
@@ -4309,9 +4306,7 @@ async fn forward_leader_writes(
     let (rparts, rbody) = resp.into_parts();
     let rbytes = match axum::body::to_bytes(rbody, 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => {
-            return axum::response::Response::from_parts(rparts, axum::body::Body::empty())
-        }
+        Err(_) => return axum::response::Response::from_parts(rparts, axum::body::Body::empty()),
     };
     let hint: Option<String> = serde_json::from_slice::<serde_json::Value>(&rbytes)
         .ok()
@@ -4333,10 +4328,7 @@ async fn forward_leader_writes(
     } else {
         format!("http://{hint}")
     };
-    let query = uri
-        .query()
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     let target = format!("{base}{path}{query}");
 
     let client = reqwest::Client::new();
@@ -4577,7 +4569,6 @@ mod join_token_tests {
     }
 }
 
-
 // ---------------- PA 授权矩阵单元测试（N11：默认拒绝、显式放行） ----------------
 
 #[cfg(test)]
@@ -4618,15 +4609,31 @@ mod pa_matrix_tests {
         assert!(!pa_allowed(&p, "POST", "/api/v1/admin/set-password"));
         assert!(!pa_allowed(&p, "GET", "/api/v1/admin/snapshot"));
         // 本项目内 admins 也拒绝
-        assert!(!pa_allowed(&p, "GET", "/api/v1/projects/order-service/admins"));
+        assert!(!pa_allowed(
+            &p,
+            "GET",
+            "/api/v1/projects/order-service/admins"
+        ));
     }
 
     #[test]
     fn pa_own_project_allowed_cross_project_denied() {
         let p = pa("order-service");
-        assert!(pa_allowed(&p, "GET", "/api/v1/projects/order-service/branches"));
-        assert!(pa_allowed(&p, "PUT", "/api/v1/projects/order-service/branches/dev/draft"));
-        assert!(!pa_allowed(&p, "GET", "/api/v1/projects/other-svc/branches"));
+        assert!(pa_allowed(
+            &p,
+            "GET",
+            "/api/v1/projects/order-service/branches"
+        ));
+        assert!(pa_allowed(
+            &p,
+            "PUT",
+            "/api/v1/projects/order-service/branches/dev/draft"
+        ));
+        assert!(!pa_allowed(
+            &p,
+            "GET",
+            "/api/v1/projects/other-svc/branches"
+        ));
         assert!(!pa_allowed(&p, "DELETE", "/api/v1/projects/order-service"));
     }
 
@@ -4639,7 +4646,11 @@ mod pa_matrix_tests {
         assert!(!pa_allowed(&p, "GET", "/api/v1/me/password"));
         assert!(!pa_allowed(&p, "PUT", "/api/v1/me/password"));
         // 账号管理面仍拒绝（改别人密码仍仅全局管理员）
-        assert!(!pa_allowed(&p, "PUT", "/api/v1/projects/order-service/admins/u"));
+        assert!(!pa_allowed(
+            &p,
+            "PUT",
+            "/api/v1/projects/order-service/admins/u"
+        ));
     }
 }
 // ---------------- 安全加固单元测试（S6 节流 / argon2 密码哈希） ----------------

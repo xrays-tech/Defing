@@ -21,8 +21,7 @@ pub use model::{
     AdminSession, AuditEntry, BranchName, BranchState, ChangeKind, Ciphertext, DiffEntry,
     DraftValue, EventType, GrayRule, GroupDef, ItemDef, LabelSelector, Principal, Project,
     ProjectAdminAccount, ProjectId, ProjectTokenRecord, PublishEvent, SharedItem, SnapshotMap,
-    Structure,
-    StructureDraft, Value, ValueType, VersionKind, VersionRecord,
+    Structure, StructureDraft, Value, ValueType, VersionKind, VersionRecord,
 };
 pub use state::{
     token_hash, ApplyOutcome, ClientCtx, ConfigSnapshot, ResolvedVersion, StateMachine,

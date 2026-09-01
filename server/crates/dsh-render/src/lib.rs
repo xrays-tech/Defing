@@ -59,7 +59,7 @@ impl Renderer {
 /// 值：含空白/#/引号/反斜杠/换行的字符串加双引号转义；数组逗号连接；其余按字面输出。
 fn render_env(tree: &BTreeMap<String, BTreeMap<String, serde_json::Value>>) -> String {
     let mut out = String::new();
-    for (_g, items) in tree {
+    for items in tree.values() {
         for (k, v) in items {
             let key = k.to_uppercase();
             out.push_str(&format!("{key}={}\n", env_value(v)));
@@ -188,7 +188,7 @@ mod tests {
         assert!(out.contains("PORT=6379"), "{out}");
         assert!(out.contains("TLS=true"), "{out}");
         assert!(out.contains("PASSWORD=***"), "{out}"); // secret 掩码
-        // 无分组前缀：输出仅含键（大写）
+                                                        // 无分组前缀：输出仅含键（大写）
         assert!(!out.contains("__"), "group 前缀已去除: {out}");
     }
 

@@ -1511,17 +1511,16 @@ impl StateMachine {
             }
             // 分支级绑定清理：仅保留仍在结构中、仍 shared=true、且绑定共享项类型与新结构 ty 一致的条目
             // （删除 item / shared→local 翻转 / ty 变更致失配 → 绑定丢弃，分支需重新选择）
-            let new_shared: std::collections::HashMap<(String, String), ValueType> =
-                new_structure
-                    .groups
-                    .iter()
-                    .flat_map(|g| {
-                        g.items
-                            .iter()
-                            .filter(|i| i.shared)
-                            .map(|i| ((g.name.clone(), i.key.clone()), i.ty))
-                    })
-                    .collect();
+            let new_shared: std::collections::HashMap<(String, String), ValueType> = new_structure
+                .groups
+                .iter()
+                .flat_map(|g| {
+                    g.items
+                        .iter()
+                        .filter(|i| i.shared)
+                        .map(|i| ((g.name.clone(), i.key.clone()), i.ty))
+                })
+                .collect();
             st.shared_bindings.retain(|g, m| {
                 m.retain(|k, rk| {
                     match new_shared.get(&(g.clone(), k.clone())) {
@@ -1726,14 +1725,21 @@ impl StateMachine {
                 if item.shared || item.ty != ValueType::Secret {
                     continue;
                 }
-                if draft_map.get(&g.name).and_then(|m| m.get(&item.key)).is_some() {
+                if draft_map
+                    .get(&g.name)
+                    .and_then(|m| m.get(&item.key))
+                    .is_some()
+                {
                     continue;
                 }
                 if let Some(v) = old.get(&g.name).and_then(|m| m.get(&item.key)) {
-                    draft_map
-                        .entry(g.name.clone())
-                        .or_default()
-                        .insert(item.key.clone(), DraftValue { value: v.clone(), updated_at: 0 });
+                    draft_map.entry(g.name.clone()).or_default().insert(
+                        item.key.clone(),
+                        DraftValue {
+                            value: v.clone(),
+                            updated_at: 0,
+                        },
+                    );
                 }
             }
         }
@@ -2114,9 +2120,7 @@ impl StateMachine {
 
     fn apply_shared_draft_update(&mut self, item: &SharedItem, _operator: &str) -> ApplyOutcome {
         if item.key.is_empty() || !validator::valid_key_name(&item.key) {
-            return Err(Error::validation(
-                "shared key 须为 1-128 位 [A-Za-z0-9._-]",
-            ));
+            return Err(Error::validation("shared key 须为 1-128 位 [A-Za-z0-9._-]"));
         }
         // F9（状态机兜底，防绕过 API 层校验）：secret 标志与类型一致性——
         // secret 项只能是 Secret 类型（密文）；Secret 类型必须标记 secret=true。
@@ -2626,7 +2630,11 @@ impl StateMachine {
             }
         }
         // operator 空串（旧日志）按 command.rs 约定归一为 "admin"
-        let created_by = if operator.is_empty() { "admin" } else { operator };
+        let created_by = if operator.is_empty() {
+            "admin"
+        } else {
+            operator
+        };
         let id: String = token_hash.chars().take(16).collect();
         let rec = ProjectTokenRecord {
             id,
@@ -2685,7 +2693,7 @@ impl StateMachine {
                 }
             }
         }
-        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.sort_by_key(|a| a.created_at);
         Ok(out)
     }
 
@@ -2853,13 +2861,7 @@ mod tests {
             .apply_shared_draft_update(&shared_item("k/x"), "")
             .is_err());
         // HTML/XSS 载荷（S1）、非 ASCII、空白、引号
-        for k in [
-            "<img>",
-            "配置",
-            "a b",
-            "a'b",
-            "a&b",
-        ] {
+        for k in ["<img>", "配置", "a b", "a'b", "a&b"] {
             assert!(
                 s.apply_shared_draft_update(&shared_item(k), "").is_err(),
                 "{k:?} must be rejected"
@@ -2882,9 +2884,7 @@ mod tests {
     fn shared_delete_rejects_dangerous_key() {
         let mut s = sm();
         for k in ["a/b", "<img>", "配置", "a b"] {
-            let e = s
-                .apply_shared_delete(k, "")
-                .expect_err("must reject");
+            let e = s.apply_shared_delete(k, "").expect_err("must reject");
             assert_eq!(e.kind, ErrorKind::Validation, "{k:?}: {e:?}");
         }
     }

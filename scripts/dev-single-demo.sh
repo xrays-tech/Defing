@@ -15,6 +15,10 @@ sleep 1
 curl -sf $BASE/healthz >/dev/null && echo "  healthz OK" || { echo "  healthz FAIL"; cat /tmp/dsh-dev-single.log; exit 1; }
 TOKEN=$(curl -sf -X POST $BASE/api/v1/login -H 'Content-Type: application/json' -d '{"password":"admin123"}' | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
 AUTH="Authorization: Bearer $TOKEN"
+# 数据面端点（/v1/...，含 watch）需数据面 token（管理会话不适用，数据面 token 化后回归）：
+# dev-single 启动时打印全局开发数据面 token
+DEV_TOKEN=$(sed -n 's/.*开发数据面 token = \([a-f0-9]*\).*/\1/p' /tmp/dsh-dev-single.log)
+[ -n "$DEV_TOKEN" ] || { echo "  dev token 未打印"; cat /tmp/dsh-dev-single.log; exit 1; }
 echo "  admin login ok"
 
 echo "== 1. 创建项目 order-service（自动建 dev/test/prod 分支）=="
@@ -50,8 +54,8 @@ curl -sf -H "$AUTH" $BASE/api/v1/projects/order-service/branches/dev/config | te
 echo
 grep -q '"version":1' /tmp/r3.json && echo "  草稿隔离 OK（版本仍为 1）" || echo "  FAIL: 发布前版本应仍为 1"
 
-echo "== 5b. 启动 watch（SSE）=="
-curl -sN $BASE/v1/projects/order-service/branches/dev/watch >/tmp/watch.out 2>/dev/null &
+echo "== 5b. 启动 watch（SSE，数据面 token 鉴权）=="
+curl -sN -H "Authorization: Bearer $DEV_TOKEN" $BASE/v1/projects/order-service/branches/dev/watch >/tmp/watch.out 2>/dev/null &
 WPID=\$!
 echo "  watch started (pid $WPID)"
 
@@ -71,7 +75,16 @@ echo
 grep -q '"version":2' /tmp/r6.json && echo "  幂等 OK（仍为 version=2）" || echo "  FAIL: 幂等发布应返回同一版本"
 
 echo "== 8b. watch 应收到发布事件 =="
-sleep 0.5
+# 订阅窗口竞态兜底：SSE 订阅若晚于广播会错过事件（CI 慢机偶发）。
+# 参照 sdk-contract-test.sh 的成熟模式——重存草稿 + 唯一 request_id 重发，直到 watch 收到事件（有界重试）。
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  curl -sf -H "$AUTH" -X PUT $BASE/api/v1/projects/order-service/branches/dev/draft -H 'Content-Type: application/json' \
+    -d '{"updates":[{"group":"app","key":"host","value":{"type":"string","str_value":"127.0.0.1"}}]}' >/dev/null 2>&1 || true
+  curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/order-service/branches/dev/publish -H 'Content-Type: application/json' \
+    -d "{\"comment\":\"dev host\",\"request_id\":\"r-watch-$i\"}" >/dev/null 2>&1 || true
+  sleep 0.3
+  grep -q 'value_publish' /tmp/watch.out && break
+done
 kill \$WPID 2>/dev/null || true
 grep -q 'value_publish' /tmp/watch.out && echo "  watch 收到发布事件 ✅" || { echo "  FAIL: watch 未收到事件"; cat /tmp/watch.out; exit 1; }
 

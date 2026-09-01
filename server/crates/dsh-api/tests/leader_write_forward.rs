@@ -51,9 +51,16 @@ async fn start3() -> Vec<TestNode> {
             raft_addr: format!("127.0.0.1:{}", 17000 + id),
         };
         seed.insert(id, info.clone());
-        let raft = new_raft_node(id, info.clone(), log_store, sm_store, &network, dev_config())
-            .await
-            .unwrap();
+        let raft = new_raft_node(
+            id,
+            info.clone(),
+            log_store,
+            sm_store,
+            &network,
+            dev_config(),
+        )
+        .await
+        .unwrap();
         network.register(id, raft.clone());
         rafts.push(raft.clone());
         pending.push((id, listener, sm, raft));
@@ -130,10 +137,7 @@ async fn login(any_base: &str) -> String {
         200,
         "login via any node should forward to leader"
     );
-    login
-        .json::<serde_json::Value>()
-        .await
-        .unwrap()["token"]
+    login.json::<serde_json::Value>().await.unwrap()["token"]
         .as_str()
         .unwrap()
         .to_string()

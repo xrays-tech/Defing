@@ -117,7 +117,11 @@ async fn client_at(url: &str) -> ConfigServiceClient<tonic::transport::Channel> 
 type AuthedClient = ConfigServiceClient<
     tonic::service::interceptor::InterceptedService<
         tonic::transport::Channel,
-        Box<dyn FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send + Sync>,
+        Box<
+            dyn FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>
+                + Send
+                + Sync,
+        >,
     >,
 >;
 
@@ -152,11 +156,7 @@ async fn get_config_and_get_item() {
     let (url, _state) = start_server().await;
     let mut client = authed_client(&url, RAW_TOKEN).await;
 
-    let snap = client
-        .get_config(get_req("p"))
-        .await
-        .unwrap()
-        .into_inner();
+    let snap = client.get_config(get_req("p")).await.unwrap().into_inner();
     assert_eq!(snap.version, 3); // testkit v2 + secret v3
     assert_eq!(snap.structure_version, 2); // 结构发布后版本=2（base_version=1 → published 2）
     let host = snap.groups.get("redis").unwrap().items.get("host").unwrap();
@@ -229,7 +229,10 @@ async fn project_token_auth_matrix() {
     // 吊销后 → Unauthenticated（即时生效）
     let id = {
         let sm = state.sm.read().unwrap();
-        sm.get_data_token(&dsh_core::token_hash(RAW_TOKEN)).unwrap().unwrap().id
+        sm.get_data_token(&dsh_core::token_hash(RAW_TOKEN))
+            .unwrap()
+            .unwrap()
+            .id
     };
     state
         .sm
@@ -312,7 +315,10 @@ async fn list_members_requires_valid_token() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
     // 任一有效项目 token → 通过鉴权；dev-single 无 raft → FailedPrecondition
     let mut authed = authed_client(&url, RAW_TOKEN).await;
-    let err = authed.list_members(ListMembersRequest {}).await.unwrap_err();
+    let err = authed
+        .list_members(ListMembersRequest {})
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 

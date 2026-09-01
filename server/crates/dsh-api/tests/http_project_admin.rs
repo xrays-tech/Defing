@@ -303,7 +303,10 @@ async fn pa_authorization_matrix() {
 
     // ✅ 集群成员端点只读放行（PA 配置 SDK 连接用）：dev-single 无 raft 路由 → 404 而非 403
     let (c, _) = req(&s.base, "GET", "/api/v1/cluster/members", Some(&pa), None).await;
-    assert_ne!(c, 403, "PA 应可读集群成员端点列表（集群模式 200 / dev-single 404）");
+    assert_ne!(
+        c, 403,
+        "PA 应可读集群成员端点列表（集群模式 200 / dev-single 404）"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -417,12 +420,18 @@ async fn pa_shared_read_masked_and_refs_filtered() {
     let arr = b.as_array().unwrap();
     assert!(!arr.is_empty(), "PA 应看到共享列表: {b}");
     let text = serde_json::to_string(&b).unwrap();
-    assert!(!text.contains("topsecret"), "secret 明文不得出现在共享列表: {b}");
+    assert!(
+        !text.contains("topsecret"),
+        "secret 明文不得出现在共享列表: {b}"
+    );
     let api_key = arr
         .iter()
         .find(|x| x["key"] == "api-key")
         .expect("api-key 应在列表中");
-    assert_eq!(api_key["value"]["masked"], true, "secret 共享项应掩码: {api_key}");
+    assert_eq!(
+        api_key["value"]["masked"], true,
+        "secret 共享项应掩码: {api_key}"
+    );
     let timeout = arr
         .iter()
         .find(|x| x["key"] == "timeout")

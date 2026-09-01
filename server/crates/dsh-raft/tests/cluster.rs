@@ -458,8 +458,8 @@ async fn cluster_watch_events_reach_subscribers() {
             required: true,
             secret: false,
             validate: None,
-                description: None,
-                shared: false,
+            description: None,
+            shared: false,
         }],
     }];
     client_write(
@@ -609,8 +609,8 @@ async fn gray_percentage_consistent_across_nodes() {
                     required: true,
                     secret: false,
                     validate: None,
-                description: None,
-                shared: false,
+                    description: None,
+                    shared: false,
                 }],
             }],
             operator: String::new(),

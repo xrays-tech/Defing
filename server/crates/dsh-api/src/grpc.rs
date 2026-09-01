@@ -52,7 +52,10 @@ fn authorize_project(
 }
 
 /// 数据面鉴权（list_members：无 project 字段；任一有效项目 token 或 dev token 即放行）。
-fn authorize_data_plane(state: &ApiState, meta: &tonic::metadata::MetadataMap) -> Result<(), Status> {
+fn authorize_data_plane(
+    state: &ApiState,
+    meta: &tonic::metadata::MetadataMap,
+) -> Result<(), Status> {
     let Some(raw) = metadata_bearer(meta) else {
         return Err(Status::unauthenticated("data-plane token required"));
     };
