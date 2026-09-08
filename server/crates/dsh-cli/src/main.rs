@@ -28,8 +28,13 @@ enum AdminCmd {
     },
     /// 强制下线当前管理员会话（I7 兜底）
     ForceLogout,
-    /// 修改管理员密码（旧会话失效）
+    /// 修改管理员密码（旧会话失效；需已持有管理员会话）
     SetPassword {
+        /// 新密码（≥6 位）
+        password: String,
+    },
+    /// 忘记管理员密码时免旧密码恢复（需 --ops-token = 节点 --join-token，见 resolve_ops_token）
+    ResetPassword {
         /// 新密码（≥6 位）
         password: String,
     },
@@ -56,7 +61,7 @@ enum AdminCmd {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// 管理员运维（design-v2 §13.2）：gen-master-key / rotate-master-key /
-    /// force-logout / set-password / promote / remove-node / snapshot / retention-status
+    /// force-logout / set-password / reset-password / promote / remove-node / snapshot / retention-status
     Admin {
         #[command(subcommand)]
         cmd: AdminCmd,
@@ -156,6 +161,11 @@ struct Cli {
     /// 管理面会话令牌（客户端模式；缺省时用 --admin-password 登录；单会话下建议直接传 token）
     #[arg(long, global = true)]
     admin_token: Option<String>,
+    /// 忘记密码恢复凭据（admin reset-password 用；免旧密码/会话）：值 = 节点 --join-token
+    /// （k3s Secret cluster-token / compose DSH_CLUSTER_TOKEN）。缺省回退环境变量
+    /// DSH_OPS_TOKEN，再回退 DSH_CLUSTER_TOKEN。
+    #[arg(long, global = true)]
+    ops_token: Option<String>,
     /// 顶层子命令（defing admin <cmd>；客户端模式，不启动服务）
     #[command(subcommand)]
     cmd: Option<Command>,
@@ -192,6 +202,24 @@ async fn admin_token(cli: &Cli) -> Result<String, Box<dyn std::error::Error + Se
     Ok(token.to_string())
 }
 
+/// 忘记密码恢复凭据（admin reset-password）：--ops-token 优先；其次环境变量
+/// DSH_OPS_TOKEN，再回退 DSH_CLUSTER_TOKEN（compose 用同一变量作 join-token）。
+/// 值必须等于节点的 --join-token（k8s Secret cluster-token / compose DSH_CLUSTER_TOKEN）。
+fn resolve_ops_token(cli: &Cli) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(t) = &cli.ops_token {
+        return Ok(t.clone());
+    }
+    for var in ["DSH_OPS_TOKEN", "DSH_CLUSTER_TOKEN"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                return Ok(v);
+            }
+        }
+    }
+    Err("reset-password 需要 --ops-token（= 节点 --join-token：k3s Secret cluster-token / compose DSH_CLUSTER_TOKEN）或环境变量 DSH_OPS_TOKEN / DSH_CLUSTER_TOKEN"
+        .into())
+}
+
 /// `defing admin <cmd>` 分派（客户端模式，调管理面 HTTP）。
 async fn run_admin_cmd(
     cli: &Cli,
@@ -219,6 +247,29 @@ async fn run_admin_cmd(
             if !status.is_success() {
                 std::process::exit(1);
             }
+            return Ok(());
+        }
+        AdminCmd::ResetPassword { password } => {
+            // 忘记密码恢复通道：无需旧密码/管理员会话，仅需 --ops-token（= 节点 --join-token）。
+            // 命中 follower 时服务端写转发中间件会透明转 leader。
+            let ops_token = resolve_ops_token(cli)?;
+            let resp = reqwest::Client::new()
+                .post(format!(
+                    "{}/api/v1/admin/reset-password",
+                    cli.admin_endpoint.trim_end_matches('/')
+                ))
+                .bearer_auth(&ops_token)
+                .json(&serde_json::json!({ "password": password }))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            println!("{body}");
+            if !status.is_success() {
+                eprintln!("重置失败：确认 --ops-token 与节点 --join-token 一致，且节点启动时已配置 --join-token");
+                std::process::exit(1);
+            }
+            eprintln!("管理员密码已重置，旧会话已下线，请用新密码登录");
             return Ok(());
         }
         _ => {}
@@ -316,7 +367,11 @@ async fn run_admin_cmd(
                 std::process::exit(1);
             }
         }
-        AdminCmd::GenMasterKey | AdminCmd::RotateMasterKey { .. } => unreachable!(),
+        AdminCmd::GenMasterKey
+        | AdminCmd::RotateMasterKey { .. }
+        | AdminCmd::ResetPassword { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
 }

@@ -62,6 +62,34 @@ async fn start_with_cipher(cipher: Option<std::sync::Arc<dsh_crypto::Cipher>>) -
         None,
     );
     let app = build_router(state.clone());
+    start_server(state, app).await
+}
+
+/// 带 --join-token（恢复通道 ops token）的启动：reset-password 集成测试用。
+async fn start_with_join_token(join_token: Option<Arc<str>>) -> TestServer {
+    let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(
+        InMemoryStore::new(),
+    ))));
+    let state = ApiState::with_retention(
+        sm,
+        WatchHub::new(),
+        None,
+        None,
+        None,
+        std::time::Duration::from_secs(86400),
+        "admin-pw".into(),
+        None,
+        0,
+        0,
+        join_token,
+        std::sync::Arc::new(dsh_api::TrustedProxies::empty()),
+        None,
+    );
+    let app = build_router(state.clone());
+    start_server(state, app).await
+}
+
+async fn start_server(state: ApiState, app: axum::Router) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -966,4 +994,127 @@ async fn structure_endpoint_returns_published_structure() {
     // 未认证：401
     let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1/structure", None, None).await;
     assert_eq!(c, 401);
+}
+
+// ---------------- 忘记密码恢复通道（admin/reset-password，ops token = --join-token） ----------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_password_with_ops_token_no_old_password() {
+    let s = start_with_join_token(Some(Arc::from("ops-secret"))).await;
+    let admin = admin_login(&s.base).await; // 旧密码 admin-pw
+
+    // 无凭据 / 错误 token / 管理员会话均不能触发（仅节点 --join-token 可）
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/admin/reset-password",
+        None,
+        Some(serde_json::json!({"password": "new-admin-pw"})),
+    )
+    .await;
+    assert_eq!(c, 401, "{b}");
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/admin/reset-password",
+        Some("wrong-token"),
+        Some(serde_json::json!({"password": "new-admin-pw"})),
+    )
+    .await;
+    assert_eq!(c, 401, "错误 ops token 应拒绝");
+    // 管理员会话不是恢复凭据（防止会话持有人借恢复通道绕过当前密码校验）
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/admin/reset-password",
+        Some(&admin),
+        Some(serde_json::json!({"password": "new-admin-pw"})),
+    )
+    .await;
+    assert_eq!(c, 401, "管理员会话不能调用恢复通道（须节点 --join-token）");
+
+    // 正确 ops token + 新密码（不带旧密码）→ 200
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/admin/reset-password",
+        Some("ops-secret"),
+        Some(serde_json::json!({"password": "new-admin-pw"})),
+    )
+    .await;
+    assert_eq!(c, 200, "{b}");
+    assert_eq!(b["changed"], true);
+
+    // 重置后：全部管理员会话下线 + 旧密码不可登 + 新密码可登
+    let (c, _) = req(&s.base, "GET", "/api/v1/projects", Some(&admin), None).await;
+    assert_eq!(c, 401, "重置后旧会话应失效");
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/login",
+        None,
+        Some(serde_json::json!({"password": "admin-pw"})),
+    )
+    .await;
+    assert_eq!(c, 401, "旧密码应不可登录");
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/login",
+        None,
+        Some(serde_json::json!({"password": "new-admin-pw"})),
+    )
+    .await;
+    assert_eq!(c, 200, "新密码应可登录: {b}");
+    let admin2 = b["token"].as_str().unwrap().to_string();
+
+    // 审计记录恢复动作（operator=ops-token）
+    let (c, audit) = req(
+        &s.base,
+        "GET",
+        "/api/v1/audit?limit=50",
+        Some(&admin2),
+        None,
+    )
+    .await;
+    assert_eq!(c, 200);
+    assert!(
+        audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "admin_password_reset" && e["operator"] == "ops-token"),
+        "audit: {audit}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_password_channel_closed_without_join_token() {
+    let s = start().await; // 未配置 --join-token
+                           // 恢复通道关闭：任何凭据（含任意 Bearer）都应 401，杜绝单机无令牌部署被远程重置
+    for token in [None, Some("whatever-token")] {
+        let (c, b) = req(
+            &s.base,
+            "POST",
+            "/api/v1/admin/reset-password",
+            token,
+            Some(serde_json::json!({"password": "new-admin-pw"})),
+        )
+        .await;
+        assert_eq!(c, 401, "token={token:?}: {b}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_password_validates_password_length() {
+    let s = start_with_join_token(Some(Arc::from("ops-secret"))).await;
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/admin/reset-password",
+        Some("ops-secret"),
+        Some(serde_json::json!({"password": "123"})),
+    )
+    .await;
+    assert_eq!(c, 422, "{b}");
 }

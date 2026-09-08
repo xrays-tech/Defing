@@ -666,6 +666,27 @@ paths:
                 password: { type: string, minLength: 6 }
       responses:
         '200': { description: 已修改 }
+  /api/v1/admin/reset-password:
+    post:
+      summary: 忘记管理员密码时免旧密码恢复（Bearer 须为节点 --join-token；成功后全部管理员会话下线）
+      security: []
+      description: |
+        恢复通道：免旧密码/免会话，但 Authorization 必须携带节点的 --join-token
+        （与 /api/v1/cluster/join 同一引导信任边界；节点未配置 --join-token 时恒 401）。
+        CLI：defing admin reset-password '<新密码>' --ops-token '<join-token>'。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, minLength: 6 }
+      responses:
+        '200': { description: 已重置（changed 为 true） }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
   /api/v1/admin/snapshot:
     get:
       summary: 备份快照（状态机 KV dump；`dsh admin snapshot --out` 存盘）

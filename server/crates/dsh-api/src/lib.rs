@@ -668,11 +668,14 @@ async fn auth_middleware(
     let path = req.uri().path().to_string();
     let method = req.method().as_str().to_string();
     // cluster/join 是节点加入前的引导调用（尚无管理员会话），豁免会话鉴权；
-    // 引导令牌（--join-token）校验在 handler 内完成（join_token_ok）
+    // 引导令牌（--join-token）校验在 handler 内完成（join_token_ok）。
+    // admin/reset-password 是忘记密码恢复通道：同样无会话，以节点 --join-token
+    // 作 Bearer（ops_token_ok，handler 内校验，未配置则恒拒绝）。
     if path == "/api/v1/login"
         || path == "/healthz"
         || path == "/readyz"
         || path == "/api/v1/cluster/join"
+        || path == "/api/v1/admin/reset-password"
     {
         return Ok(next.run(req).await);
     }
@@ -3304,6 +3307,22 @@ fn join_token_ok(app: &ApiState, headers: &axum::http::HeaderMap) -> bool {
     }
 }
 
+/// 忘记密码恢复通道（POST /api/v1/admin/reset-password）鉴权：
+/// 复用节点 --join-token（Bearer）作运维凭据（与 cluster/join 同一引导信任边界），
+/// 但比 join_token_ok **更严格**——节点未配置 --join-token 时恒拒绝（通道关闭），
+/// 避免 dev-single/单机无令牌部署被网络可达者无凭据远程重置。
+fn ops_token_ok(app: &ApiState, headers: &axum::http::HeaderMap) -> bool {
+    let Some(expected) = &app.join_token else {
+        return false;
+    };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .map(|t| t == expected.as_ref())
+        .unwrap_or(false)
+}
+
 async fn cluster_join(
     State(app): State<ApiState>,
     headers: axum::http::HeaderMap,
@@ -3905,6 +3924,54 @@ async fn admin_set_password(
     Ok(Json(serde_json::json!({ "changed": true })))
 }
 
+/// 忘记管理员密码时的恢复通道（CLI defing admin reset-password）：
+/// 免旧密码、免会话，但必须以节点 --join-token 作为 Bearer 运维凭据
+/// （与 /api/v1/cluster/join 同一引导信任边界；未配置 join-token 的节点恒拒绝，通道关闭）。
+/// 命中 follower 时由写转发中间件透明转 leader，改密经 Raft 集群一致。
+/// 成功后与 admin_set_password 语义一致：argon2 哈希落状态机 + 全部管理员会话下线 + 审计。
+async fn admin_reset_password(
+    State(app): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<SetPasswordReq>,
+) -> ApiResult<serde_json::Value> {
+    // 统一 401 文案（不区分 token 错误与节点未配置，防探测节点配置状态）
+    if !ops_token_ok(&app, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorBody {
+                code: "ERR_UNAUTHORIZED".into(),
+                message: "ops token required（= 节点 --join-token）".into(),
+                detail: None,
+            }),
+        ));
+    }
+    if req.password.len() < 6 {
+        return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
+    }
+    let hash = hash_password(&req.password).map_err(ApiError::from)?;
+    app.write(
+        &Command::AdminSetPassword {
+            password_hash: hash,
+        },
+        now_ms(),
+    )
+    .await?;
+    // 重置即视同改密：全部管理员会话下线（防旧会话留存，与 admin_set_password 一致）
+    app.write(&Command::MultiSessionLogoutAll, now_ms()).await?;
+    app.audit
+        .append(
+            "admin_password_reset",
+            None,
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+            "ops-token",
+        )
+        .await;
+    Ok(Json(serde_json::json!({ "changed": true })))
+}
+
 /// 触发备份快照：返回状态机全量 KV dump（`dsh admin snapshot` 备份用；恢复走 dump/restore）。
 async fn admin_snapshot(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
     let pairs = {
@@ -4391,6 +4458,7 @@ pub fn build_router(app: ApiState) -> Router {
         .route("/api/v1/admin/rotate-master-key", post(rotate_master_key))
         .route("/api/v1/admin/force-logout", post(admin_force_logout))
         .route("/api/v1/admin/set-password", post(admin_set_password))
+        .route("/api/v1/admin/reset-password", post(admin_reset_password))
         .route("/api/v1/admin/snapshot", get(admin_snapshot))
         .route(
             "/api/v1/admin/retention-status",
@@ -4511,7 +4579,7 @@ mod join_token_tests {
     use super::{join_token_ok, ApiState};
 
     /// 用内存态构造 ApiState（仿照 ApiState::new 传参，经 with_retention 注入 join_token）。
-    fn state_with_join_token(token: Option<Arc<str>>) -> ApiState {
+    pub(super) fn state_with_join_token(token: Option<Arc<str>>) -> ApiState {
         ApiState::with_retention(
             Arc::new(RwLock::new(StateMachine::new(Box::new(
                 InMemoryStore::new(),
@@ -4531,7 +4599,7 @@ mod join_token_tests {
         )
     }
 
-    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+    pub(super) fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (_k, v) in pairs {
             h.insert(
@@ -4577,6 +4645,55 @@ mod join_token_tests {
         let app = state_with_join_token(None);
         assert!(join_token_ok(&app, &headers(&[])));
         assert!(join_token_ok(
+            &app,
+            &headers(&[("authorization", "Bearer whatever")])
+        ));
+    }
+}
+
+// ---------------- 忘记密码恢复通道 ops_token 单元测试（reset-password） ----------------
+
+#[cfg(test)]
+mod ops_token_tests {
+    use std::sync::Arc;
+
+    use super::join_token_tests::{headers, state_with_join_token};
+    use super::ops_token_ok;
+
+    #[test]
+    fn configured_token_accepts_exact_bearer() {
+        let app = state_with_join_token(Some(Arc::from("ops-secret")));
+        assert!(ops_token_ok(
+            &app,
+            &headers(&[("authorization", "Bearer ops-secret")])
+        ));
+    }
+
+    #[test]
+    fn configured_token_rejects_wrong_missing_or_non_bearer() {
+        let app = state_with_join_token(Some(Arc::from("ops-secret")));
+        assert!(!ops_token_ok(
+            &app,
+            &headers(&[("authorization", "Bearer wrong")])
+        ));
+        assert!(!ops_token_ok(&app, &headers(&[])));
+        assert!(!ops_token_ok(
+            &app,
+            &headers(&[("authorization", "Basic ops-secret")])
+        ));
+        assert!(!ops_token_ok(
+            &app,
+            &headers(&[("authorization", "ops-secret")])
+        ));
+    }
+
+    /// 与 join_token_ok 不同：节点未配置 join-token 时恢复通道必须关闭
+    /// （防 dev-single/单机无令牌部署被网络可达者无凭据远程重置）。
+    #[test]
+    fn unconfigured_node_denies_reset_channel() {
+        let app = state_with_join_token(None);
+        assert!(!ops_token_ok(&app, &headers(&[])));
+        assert!(!ops_token_ok(
             &app,
             &headers(&[("authorization", "Bearer whatever")])
         ));
