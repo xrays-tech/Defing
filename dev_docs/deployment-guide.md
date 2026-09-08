@@ -107,6 +107,7 @@
 | `--trusted-proxy <cidrs>` | string | — | 可信代理 CIDR 列表（逗号分隔，如 `10.0.0.0/8,192.168.0.0/16`）；仅信任来自这些网段的 X-Forwarded-For 作登录节流键（F4） |
 | `--admin-endpoint <url>` | string | `http://127.0.0.1:8384` | 客户端模式管理面端点（global） |
 | `--admin-token <token>` | string | — | 客户端模式会话令牌（global）；缺省用 `--admin-password` 登录获取 |
+| `--ops-token <token>` | string | — | 客户端模式**忘记密码恢复**凭据（global，仅 `reset-password` 用）；值 = 节点 `--join-token`；缺省回退环境变量 `DSH_OPS_TOKEN` / `DSH_CLUSTER_TOKEN` |
 
 > **数据面鉴权（project-token）**：数据面 `/v1/*` 与 gRPC 一律要求**项目访问令牌**（`Authorization: Bearer <token>` 或 SSE `?token=`）。
 > 令牌在 Admin UI 项目页「访问令牌」Tab 或 `POST /api/v1/projects/{p}/tokens` 创建（**仅全局管理员**）；
@@ -125,14 +126,15 @@
 
 ### 3.7 客户端运维子命令（不启动服务）
 
-`defing admin <cmd>`（需 `--admin-endpoint`，配合 `--admin-password`/`--admin-token`）：
+`defing admin <cmd>`（需 `--admin-endpoint`，配合 `--admin-password`/`--admin-token`；唯一例外是 `reset-password`——免旧密码/会话，改用 `--ops-token` = 节点 `--join-token`）：
 
 | 子命令 | 说明 |
 |---|---|
 | `gen-master-key` | 生成新主密钥（base64 32B）并打印指引（等价顶层 `--gen-master-key`） |
 | `rotate-master-key <new_key>` | 轮换主密钥（调管理面 API；DEK 重包由后台任务执行） |
 | `force-logout` | 强制下线当前管理员会话（I7 兜底） |
-| `set-password <password>` | 修改管理员密码（旧会话失效；≥6 位） |
+| `set-password <password>` | 修改管理员密码（旧会话失效；≥6 位，需已持有会话） |
+| `reset-password <password>` | **忘记密码恢复**：免旧密码/会话，仅需 `--ops-token`（= 节点 `--join-token`）；改后全部管理员会话下线 |
 | `promote --node <id>` | learner → voter |
 | `remove-node --node <id>` | 移除节点 |
 | `snapshot [--out <path>]` | 触发备份快照（状态机 KV dump；可存盘） |
@@ -302,6 +304,7 @@ curl -s -H "$AUTH" -X POST http://127.0.0.1:8384/api/v1/cluster/promote \
 | 重启/崩溃恢复 | **同 data-dir 直接启动**（无需再传建群参数，自动 resume；join 409 幂等成功） |
 | 备份 | `defing admin snapshot --out backup.json` 或 `GET /api/v1/admin/snapshot` |
 | 密码修改 | `defing admin set-password '<新密码>'`（旧会话下线） |
+| 忘记密码恢复 | `defing admin reset-password '<新密码>' --ops-token '<join-token>'`（免旧密码；节点需已配置 `--join-token`，未配置恒 401；旧会话全下线） |
 | 强制下线 | `defing admin force-logout` |
 
 > **重启恢复幂等（坑 C3/C4 根治）**：二进制内部以 raft-meta 持久化状态判断——已有状态即忽略

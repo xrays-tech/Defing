@@ -65,7 +65,7 @@ defing --node-id 3 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8388 --raft-a
 | `--shared-cascade` | `auto` | 共享发布级联：`auto` 自动级联 / `manual` |
 | `--read-mode` | `stale` | 读取模式：`stale` 本地直读 / `linear` ReadIndex 门控 |
 
-> **运维子命令**：`defing admin <cmd>`（客户端模式，不启动服务）——`gen-master-key` / `rotate-master-key` / `force-logout` / `set-password` / `promote` / `remove-node` / `snapshot` / `retention-status`。客户端模式经 `--admin-endpoint`（默认 `http://127.0.0.1:8384`）+ `--admin-token`（或 `--admin-password` 登录）调用管理面。
+> **运维子命令**：`defing admin <cmd>`（客户端模式，不启动服务）——`gen-master-key` / `rotate-master-key` / `force-logout` / `set-password` / `reset-password` / `promote` / `remove-node` / `snapshot` / `retention-status`。客户端模式经 `--admin-endpoint`（默认 `http://127.0.0.1:8384`）+ `--admin-token`（或 `--admin-password` 登录）调用管理面；`reset-password` 例外——**忘记管理员密码**时免旧密码/会话，用 `--ops-token`（值 = 节点 `--join-token`，k3s Secret `cluster-token` / compose `DSH_CLUSTER_TOKEN`），详见 [09 管理员与审计]({{ site.baseurl }}/09-admin/)。
 >
 > **构建版本标记**：`/healthz`、`/readyz` 返回 `build` 信息（git 短哈希 + 构建时间），Admin UI 页脚同步显示 `Defing · build <commit> · <时间>`，便于确认部署产物是否为最新构建。
 

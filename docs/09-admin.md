@@ -21,6 +21,19 @@ prev: {title: 08 构建脚本取值（curl）, url: /08-curl/}
 - 修改成功后**该主体的全部旧会话立即失效**，需重新登录（全局管理员改密使全部管理员会话失效；项目管理员改密仅使该账号自身的全部会话失效）
 - 项目管理员只能修改**自己账号**的密码，不能触碰账号管理面
 
+### 忘记全局管理员密码（免旧密码恢复）
+
+生产环境忘记全局管理员密码、又无有效管理员会话时，在能访问管理面的主机上执行（客户端模式，不启动服务）：
+
+```bash
+defing admin reset-password '<新密码≥6位>' --ops-token '<集群 join-token>'
+```
+
+- `--ops-token` 的值 = 节点的 `--join-token`（k3s Secret `cluster-token`、compose `DSH_CLUSTER_TOKEN`）；也可用环境变量 `DSH_OPS_TOKEN` / `DSH_CLUSTER_TOKEN`，避免明文进 shell 历史；
+- 节点必须配置过 `--join-token` 该恢复通道才可用（未配置恒返回 401）；命中任意节点均可，非 leader 自动转发；
+- 成功后与改密一致：全部管理员会话立即下线、旧密码失效，需用新密码重新登录；审计记录 `admin_password_reset`（operator `ops-token`）；
+- **信任边界**：能触发恢复者等价于持有 `--join-token`（可注册 learner 拉取全量日志），请与主密钥同级保管该令牌。
+
 ### 项目管理员（PA）
 
 - 一个账号绑定一个项目；一个项目可有多个账号
