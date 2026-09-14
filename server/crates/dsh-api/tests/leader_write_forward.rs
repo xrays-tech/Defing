@@ -258,3 +258,84 @@ async fn join_428_is_not_forwarded() {
     assert_eq!(body["code"], "ERR_LEADER_REDIRECT");
     assert!(body["detail"]["leader_hint"].is_string());
 }
+
+/// 全局管理员在集群下的转发与授权（设计 global-admin §13 第 15 条）：
+/// 经 follower 登录 GA → 200 且响应回填 role=global_admin / username（转发回落）；
+/// 集群下 members → 200（只读）、promote → 403、建项目 → 403。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ga_login_forwarded_with_username_and_cluster_authz() {
+    let nodes = start3().await;
+    let any = &nodes[0].base;
+    let sup = login(any).await;
+
+    // 建 GA（写请求命中 follower 时会由中间件转发到 leader）
+    let resp = reqwest::Client::new()
+        .post(format!("{any}/api/v1/admins"))
+        .bearer_auth(&sup)
+        .json(&serde_json::json!({"username": "ga1", "password": "pw12345"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201, "create ga1");
+
+    let (leader, members) = cluster_view(any, &sup).await;
+    let follower = members
+        .iter()
+        .find(|(node_id, _)| node_id != &leader)
+        .map(|(_, base)| base.clone())
+        .expect("follower member");
+
+    // 经 follower 登录 GA：login 内联转发到 leader。
+    // 注意 follower 的 GA 分派读的是**本地** sm（read_mode 默认 Stale，login 无线性读门控），
+    // 复制未跟上时会回落 pa_login → 401 ⇒ 这里做有界重试（避免偶发红）。
+    let mut last = (0u16, serde_json::Value::Null);
+    for _ in 0..40 {
+        let resp = reqwest::Client::new()
+            .post(format!("{follower}/api/v1/login"))
+            .json(&serde_json::json!({"username": "ga1", "password": "pw12345"}))
+            .send()
+            .await
+            .unwrap();
+        let code = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if code == 200 {
+            last = (code, body);
+            break;
+        }
+        last = (code, body);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(last.0, 200, "经 follower 的 GA 登录应成功: {}", last.1);
+    let body = last.1;
+    assert_eq!(body["role"], "global_admin");
+    assert_eq!(body["username"], "ga1", "转发响应必须回填 username");
+    let ga = body["token"].as_str().unwrap().to_string();
+    assert!(ga.starts_with("ga.ga1."), "token 前缀: {ga}");
+
+    // 集群环境（这里才是 members 200 的正确断言位置）
+    let resp = reqwest::Client::new()
+        .get(format!("{follower}/api/v1/cluster/members"))
+        .bearer_auth(&ga)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GA 可只读集群成员");
+
+    let resp = reqwest::Client::new()
+        .post(format!("{follower}/api/v1/cluster/promote"))
+        .bearer_auth(&ga)
+        .json(&serde_json::json!({"node_id": 2}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403, "GA 不得 promote");
+
+    let resp = reqwest::Client::new()
+        .post(format!("{follower}/api/v1/projects"))
+        .bearer_auth(&ga)
+        .json(&serde_json::json!({"name": "by-ga"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403, "GA 不得创建项目");
+}
