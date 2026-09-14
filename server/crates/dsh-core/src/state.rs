@@ -1157,6 +1157,52 @@ impl StateMachine {
             Command::MultiPaSessionLogoutAll { username } => {
                 self.apply_multi_pa_session_logout_all(username)
             }
+            // ---------------- 全局管理员（Global Admin，设计 global-admin §6） ----------------
+            Command::GlobalAdminCreate {
+                username,
+                salt,
+                password_hash,
+                ts,
+            } => self.apply_global_admin_create(
+                username,
+                salt,
+                password_hash,
+                Self::eff_ts(ts, now_ms),
+            ),
+            Command::GlobalAdminDelete { username } => self.apply_global_admin_delete(username),
+            Command::GlobalAdminSetPassword {
+                username,
+                salt,
+                password_hash,
+            } => self.apply_global_admin_set_password(username, salt, password_hash),
+            Command::MultiGaSessionLogin {
+                username,
+                token_hash,
+                issued_at,
+                expires_at,
+                device_id,
+                session_id,
+            } => self.apply_multi_ga_session_login(
+                username,
+                token_hash,
+                *issued_at,
+                *expires_at,
+                device_id,
+                session_id,
+            ),
+            Command::MultiGaSessionLogout {
+                username,
+                session_id,
+            } => self.apply_multi_ga_session_logout(username, session_id),
+            Command::MultiGaSessionHeartbeat {
+                username,
+                session_id,
+                expires_at,
+            } => self.apply_multi_ga_session_heartbeat(username, session_id, *expires_at),
+            Command::MultiGaSessionLogoutAll { username } => {
+                self.apply_multi_ga_session_logout_all(username)
+            }
+            Command::GlobalAdminSessionsRevokeAll => self.apply_global_admin_sessions_revoke_all(),
             Command::AuditAppend { entry } => self.apply_audit_append(entry),
             Command::RotateMasterKey { .. } => self.apply_rotate_master_key(),
             Command::GrayPublish {
@@ -2530,9 +2576,11 @@ impl StateMachine {
     // 设计文档 dev_docs/design/project-admin.md §3.1/§6。
     // 会话判定只看 is_some()，不读墙钟（D16 确定性）。
 
-    fn valid_pa_username(name: &str) -> bool {
+    /// 账号用户名校验（GA 与 PA 共用）：2-64 位 [A-Za-z0-9_-]；
+    /// **保留名 admin 不区分大小写**（否则 Admin/ADMIN 可注册，与超级管理员在审计里视觉难辨）。
+    fn valid_account_username(name: &str) -> bool {
         !name.is_empty()
-            && name != "admin"
+            && !name.eq_ignore_ascii_case("admin")
             && name.len() <= 64
             && name
                 .chars()
@@ -2548,10 +2596,10 @@ impl StateMachine {
         password_hash: &str,
         now_ms: i64,
     ) -> ApplyOutcome {
-        if !Self::valid_pa_username(username) {
+        if !Self::valid_account_username(username) {
             return Err(Error::new(
                 ErrorKind::Validation,
-                "用户名须为 2-64 位 [A-Za-z0-9_-] 且不可为 admin",
+                "用户名须为 2-64 位 [A-Za-z0-9_-] 且不可为 admin（不区分大小写）",
             ));
         }
         if load::<Project>(&*self.store, &project_key(project))?.is_none() {
@@ -2563,6 +2611,12 @@ impl StateMachine {
         let key = project_admin_key(username);
         if load::<ProjectAdminAccount>(&*self.store, &key)?.is_some() {
             return Err(Error::new(ErrorKind::Conflict, "账号已存在"));
+        }
+        // D3（设计 §4）：GA 与 PA 用户名全局唯一、**不区分大小写**。精确键比对只是快路径，
+        // 必须再扫 adm/ga/ 的 key 后缀（不解析值——filter_map(ok()) 会静默丢弃损坏记录）。
+        // 纯状态读 + eq_ignore_ascii_case，无时钟/随机数 → 各节点重放一致。
+        if self.global_admin_username_taken(username)? {
+            return Err(Error::new(ErrorKind::Conflict, "用户名已被全局管理员占用"));
         }
         let acct = ProjectAdminAccount {
             username: username.to_string(),
@@ -2586,6 +2640,176 @@ impl StateMachine {
             self.delete_pending(&k)?;
         }
         Ok(())
+    }
+
+    // ---------------- 全局管理员（Global Admin）----------------
+    // 设计文档 dev_docs/design/global-admin.md §4/§6。
+    // 会话判定只看 is_some()，不读墙钟（D16 确定性）。
+
+    /// 是否存在同名（**不区分大小写**）的项目管理员账号。
+    /// 按 adm/pa/ 的 **key 后缀**比对，不解析值（`list_project_admins` 的 filter_map(ok())
+    /// 会静默丢弃损坏记录，键空间判定不受影响且更稳）。纯状态读 → 重放一致。
+    fn project_admin_username_taken(&self, username: &str) -> Result<bool, Error> {
+        for (k, _) in self.get_prefix_merged(K_PA_ACCOUNT.as_bytes())? {
+            if let Some(u) = std::str::from_utf8(&k)
+                .ok()
+                .and_then(|s| s.strip_prefix(K_PA_ACCOUNT))
+            {
+                if u.eq_ignore_ascii_case(username) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// 是否存在同名（**不区分大小写**）的全局管理员账号（供 PA 创建的反向互斥用）。
+    fn global_admin_username_taken(&self, username: &str) -> Result<bool, Error> {
+        for (k, _) in self.get_prefix_merged(K_GA_ACCOUNT.as_bytes())? {
+            if let Some(u) = std::str::from_utf8(&k)
+                .ok()
+                .and_then(|s| s.strip_prefix(K_GA_ACCOUNT))
+            {
+                if u.eq_ignore_ascii_case(username) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn apply_global_admin_create(
+        &mut self,
+        username: &str,
+        salt: &str,
+        password_hash: &str,
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        if !Self::valid_account_username(username) {
+            return Err(Error::new(
+                ErrorKind::Validation,
+                "用户名须为 2-64 位 [A-Za-z0-9_-] 且不可为 admin（不区分大小写）",
+            ));
+        }
+        let key = global_admin_key(username);
+        // GA 内部：精确键唯一（设计 §4 的显式取舍：ga:alice 与 ga:Alice 可并存）
+        if load::<GlobalAdminAccount>(&*self.store, &key)?.is_some() {
+            return Err(Error::new(ErrorKind::Conflict, "账号已存在"));
+        }
+        // D3（设计 §4）：GA 与 PA 用户名全局唯一、**不区分大小写**（跨命名空间折叠）
+        if self.project_admin_username_taken(username)? {
+            return Err(Error::new(ErrorKind::Conflict, "用户名已被项目管理员占用"));
+        }
+        let acct = GlobalAdminAccount {
+            username: username.to_string(),
+            salt: salt.to_string(),
+            password_hash: password_hash.to_string(),
+            created_at: now_ms,
+        };
+        self.save_pending(&key, &acct)?;
+        Ok(vec![])
+    }
+
+    fn apply_global_admin_delete(&mut self, username: &str) -> ApplyOutcome {
+        let key = global_admin_key(username);
+        if load::<GlobalAdminAccount>(&*self.store, &key)?.is_none() {
+            return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
+        }
+        self.delete_pending(key.as_bytes())?;
+        self.delete_all_ga_sessions(username)?;
+        Ok(vec![])
+    }
+
+    fn apply_global_admin_set_password(
+        &mut self,
+        username: &str,
+        salt: &str,
+        password_hash: &str,
+    ) -> ApplyOutcome {
+        let key = global_admin_key(username);
+        let Some(mut acct) = load::<GlobalAdminAccount>(&*self.store, &key)? else {
+            return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
+        };
+        acct.salt = salt.to_string();
+        acct.password_hash = password_hash.to_string();
+        self.save_pending(&key, &acct)?;
+        self.delete_all_ga_sessions(username)?; // 改密即收回该账号全部会话
+        Ok(vec![])
+    }
+
+    /// 删除某 GA 账号的全部会话（前缀扫 sess/ga/{username}/；GA 无旧格式单会话键）。
+    fn delete_all_ga_sessions(&mut self, username: &str) -> Result<(), Error> {
+        let prefix = ga_session_prefix(username);
+        let rows = self.get_prefix_merged(prefix.as_bytes())?;
+        for (k, _) in rows {
+            self.delete_pending(&k)?;
+        }
+        Ok(())
+    }
+
+    fn apply_multi_ga_session_login(
+        &mut self,
+        username: &str,
+        token_hash: &str,
+        issued_at: i64,
+        expires_at: Option<i64>,
+        device_id: &str,
+        session_id: &str,
+    ) -> ApplyOutcome {
+        // 账号必须存在（与 PA 语义一致）；**不得**复用 get_project_admin
+        let Some(acct) = self.get_global_admin(username)? else {
+            return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
+        };
+        let session = AdminSession {
+            token_hash: token_hash.to_string(),
+            issued_at,
+            expires_at,
+            device_id: device_id.to_string(),
+            principal: Principal::GlobalAdmin {
+                username: acct.username,
+            },
+        };
+        self.save_pending(&ga_session_key_with(username, session_id), &session)?;
+        Ok(vec![])
+    }
+
+    fn apply_multi_ga_session_logout(&mut self, username: &str, session_id: &str) -> ApplyOutcome {
+        self.delete_pending(ga_session_key_with(username, session_id).as_bytes())?;
+        Ok(vec![])
+    }
+
+    fn apply_multi_ga_session_heartbeat(
+        &mut self,
+        username: &str,
+        session_id: &str,
+        expires_at: Option<i64>,
+    ) -> ApplyOutcome {
+        let key = ga_session_key_with(username, session_id);
+        let mut session: AdminSession = self
+            .load_merged(&key)?
+            .ok_or_else(|| Error::new(ErrorKind::SessionExpired, "会话不存在或已过期"))?;
+        session.expires_at = expires_at;
+        self.save_pending(&key, &session)?;
+        Ok(vec![])
+    }
+
+    fn apply_multi_ga_session_logout_all(&mut self, username: &str) -> ApplyOutcome {
+        self.delete_all_ga_sessions(username)?;
+        Ok(vec![])
+    }
+
+    /// 踢全部 GA 账号的全部会话：直接扫 adm/ga/ 前缀取 **key 后缀**当用户名
+    /// （不解析值——损坏记录若仍有活会话，用 list_global_admins 的 filter_map 会被静默丢弃而漏收）。
+    fn apply_global_admin_sessions_revoke_all(&mut self) -> ApplyOutcome {
+        for (k, _) in self.get_prefix_merged(K_GA_ACCOUNT.as_bytes())? {
+            if let Some(u) = std::str::from_utf8(&k)
+                .ok()
+                .and_then(|s| s.strip_prefix(K_GA_ACCOUNT))
+            {
+                self.delete_all_ga_sessions(u)?;
+            }
+        }
+        Ok(vec![])
     }
 
     /// 删除全部管理员会话（multisession 改造）：旧 key + 前缀双删。
@@ -2805,6 +3029,42 @@ impl StateMachine {
 
     pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
         self.load_merged(&pa_session_key(username))
+    }
+
+    /// 读取全局管理员账号。
+    pub fn get_global_admin(&self, username: &str) -> Result<Option<GlobalAdminAccount>, Error> {
+        self.load_merged(&global_admin_key(username))
+    }
+
+    /// 列出全部全局管理员（扫 adm/ga/ 前缀，O(账号数)）。
+    /// 注意：无法反序列化的记录被静默丢弃——**不要**用它做「是否存在 GA」的判定
+    ///（见 has_global_admins），也不要用它做全量收口（见 apply_global_admin_sessions_revoke_all）。
+    pub fn list_global_admins(&self) -> Result<Vec<GlobalAdminAccount>, Error> {
+        let mut out = vec![];
+        for (_, raw) in self.get_prefix_merged(K_GA_ACCOUNT.as_bytes())? {
+            if let Ok(acct) = serde_json::from_slice::<GlobalAdminAccount>(&raw) {
+                out.push(acct);
+            }
+        }
+        out.sort_by(|a, b| a.username.cmp(&b.username));
+        Ok(out)
+    }
+
+    /// 是否存在任何 GA 账号（**只判键空间，不解析值**）。
+    /// 供「无 GA 时不写新变体」的兼容守卫使用（恢复通道 / force-logout 全量）：
+    /// 后者若用 list_global_admins 的 filter_map(ok())，一条损坏的 adm/ga/{u} 记录
+    /// （可能仍有活会话）会被静默丢弃 → 守卫误判「无 GA」→ 漏收会话。
+    pub fn has_global_admins(&self) -> Result<bool, Error> {
+        Ok(!self.get_prefix_merged(K_GA_ACCOUNT.as_bytes())?.is_empty())
+    }
+
+    /// 多会话 GA 会话：读 sess/ga/{username}/{session_id}。
+    pub fn get_ga_session_with(
+        &self,
+        username: &str,
+        session_id: &str,
+    ) -> Result<Option<AdminSession>, Error> {
+        self.load_merged(&ga_session_key_with(username, session_id))
     }
 
     /// 多会话 PA 会话：读 sess/pa/{username}/{session_id}（multisession 改造）。

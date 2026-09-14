@@ -464,6 +464,21 @@ fn resolve_principal(app: &ApiState, auth_header: Option<&str>) -> Result<dsh_co
             },
             session,
         )
+    } else if let Some(rest) = token.strip_prefix("ga.") {
+        let parts: Vec<&str> = rest.split('.').collect();
+        // 新格式 ga.{username}.{sid}.{secret}；段数不足 → 无会话 → 401（负形测试锁定）
+        let session = if parts.len() >= 3 {
+            sm.get_ga_session_with(parts[0], parts[1]).ok().flatten()
+        } else {
+            None
+        };
+        // 占位 principal：身份一律以状态机存的 session.principal 为准（见函数末），不可由 token 伪造
+        (
+            dsh_core::Principal::GlobalAdmin {
+                username: String::new(),
+            },
+            session,
+        )
     } else if let Some(rest) = token.strip_prefix("adm.") {
         let parts: Vec<&str> = rest.split('.').collect();
         let session = if parts.len() >= 2 {
@@ -499,6 +514,12 @@ fn resolve_principal(app: &ApiState, auth_header: Option<&str>) -> Result<dsh_co
 fn token_session_id(auth_header: Option<&str>) -> Option<String> {
     let token = auth_header?.strip_prefix("Bearer ")?;
     if let Some(rest) = token.strip_prefix("pa.") {
+        let parts: Vec<&str> = rest.split('.').collect();
+        if parts.len() >= 3 {
+            return Some(parts[1].to_string());
+        }
+    } else if let Some(rest) = token.strip_prefix("ga.") {
+        // ga.{username}.{sid}.{secret} → 第 2 段是 sid
         let parts: Vec<&str> = rest.split('.').collect();
         if parts.len() >= 3 {
             return Some(parts[1].to_string());
@@ -603,8 +624,78 @@ fn data_plane_operator(app: &ApiState, req: &axum::extract::Request) -> String {
     }
 }
 
+/// 是否超级管理员（根账号）。仅用于 handler 内防御性校验。
+fn is_super(p: &dsh_core::Principal) -> bool {
+    matches!(p, dsh_core::Principal::Admin)
+}
+
+/// 授权矩阵唯一入口（设计 global-admin §7：默认拒绝、显式放行）。
+/// super 恒放行；GA = 全部项目配置 + 全部共享配置；PA = 所属项目（沿用 pa_allowed 原实现）。
+fn authorize(principal: &dsh_core::Principal, method: &str, path: &str) -> bool {
+    match principal {
+        dsh_core::Principal::Admin => true,
+        dsh_core::Principal::GlobalAdmin { .. } => ga_allowed(method, path),
+        dsh_core::Principal::ProjectAdmin { .. } => pa_allowed(principal, method, path),
+    }
+}
+
+/// 全局管理员矩阵（设计 §7 / D1 最小集：仅全部项目配置 + 全部共享配置）。
+fn ga_allowed(method: &str, path: &str) -> bool {
+    // 自身会话 + 自助改密
+    if method == "POST"
+        && (path == "/api/v1/logout"
+            || path == "/api/v1/heartbeat"
+            || path == "/api/v1/me/password")
+    {
+        return true;
+    }
+    // 全量项目列表 / 全量审计 / 集群只读
+    if (method == "GET" && path == "/api/v1/projects")
+        || (method == "GET" && path == "/api/v1/audit")
+        || (method == "GET" && path == "/api/v1/cluster/members")
+    {
+        return true;
+    }
+    // 共享配置：读 + 写 + 发布 + 删除（全部放行）
+    if path == "/api/v1/shared"
+        || path == "/api/v1/shared-draft"
+        || path == "/api/v1/shared/publish"
+        || (path.starts_with("/api/v1/shared/") && method == "DELETE")
+        || (path.starts_with("/api/v1/shared-draft/") && method == "DELETE")
+    {
+        return true;
+    }
+    // 项目路径：全部项目放行，但剔除全局面子路径
+    if let Some(p) = project_segment(path) {
+        let rest = path
+            .strip_prefix(&format!("/api/v1/projects/{p}"))
+            .unwrap_or("");
+        // 项目本体：GET 详情放行（设计 §7），DELETE 删除项目仅 super
+        if rest.is_empty() {
+            return method == "GET";
+        }
+        // 防御：残留路径禁止空段 / "." / ".."（黑名单前缀判定在归一化差异下不可靠：
+        // "//admins"、"/../admins" 都不以 "/admins" 开头；"%61dmins" 只能靠路由 404 兜底）
+        if !rest.starts_with('/')
+            || rest[1..]
+                .split('/')
+                .any(|s| s.is_empty() || s == "." || s == "..")
+        {
+            return false;
+        }
+        // 账号管理 / 访问令牌：仅 super
+        if rest.starts_with("/admins") || rest.starts_with("/tokens") {
+            return false;
+        }
+        return true;
+    }
+    // 非项目路径：默认拒绝（/api/v1/admins、/admin/*、集群写、POST /projects 等）
+    false
+}
+
 /// 项目管理员授权矩阵（§4：默认拒绝、显式放行）。
-/// 返回 true=放行。全局管理员永远放行（调用方判断）。
+/// 返回 true=放行。**保留原名与三元签名**（mod pa_matrix_tests 的 22 处调用依赖它）；
+/// 仅由 authorize 的 ProjectAdmin 分支调用。
 fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool {
     let dsh_core::Principal::ProjectAdmin { project, .. } = principal else {
         return true; // 全局管理员
@@ -699,12 +790,12 @@ async fn auth_middleware(
             }
         };
         // 授权矩阵：项目管理员默认拒绝、显式放行（§4）
-        if !pa_allowed(&principal, &method, &path) {
+        if !authorize(&principal, &method, &path) {
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(ApiErrorBody {
                     code: "ERR_FORBIDDEN".into(),
-                    message: "项目管理员无权访问该资源".into(),
+                    message: "无权访问该资源".into(),
                     detail: None,
                 }),
             ));
@@ -731,7 +822,7 @@ async fn auth_middleware(
                     .get(axum::http::header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok()),
             ) {
-                Ok(dsh_core::Principal::Admin) => true,
+                Ok(dsh_core::Principal::Admin | dsh_core::Principal::GlobalAdmin { .. }) => true,
                 Ok(dsh_core::Principal::ProjectAdmin { project, .. }) => {
                     data_plane_project_segment(&path)
                         .map(|p| p == project.0)
@@ -1722,6 +1813,7 @@ async fn write_shared_draft(
     app: &ApiState,
     req: SharedItemReq,
     action: &str,
+    operator: &str,
 ) -> Result<serde_json::Value, (StatusCode, Json<ApiErrorBody>)> {
     let mut value = req.value;
     let mut keep_cipher = false;
@@ -1810,7 +1902,7 @@ async fn write_shared_draft(
     app.write(
         &Command::SharedDraftUpdate {
             item,
-            operator: "admin".to_string(),
+            operator: operator.to_string(),
         },
         now_ms(),
     )
@@ -1824,7 +1916,7 @@ async fn write_shared_draft(
             None,
             None,
             serde_json::json!({ "key": req.key }),
-            "admin",
+            operator,
         )
         .await;
     Ok(serde_json::json!({
@@ -1834,19 +1926,22 @@ async fn write_shared_draft(
 }
 
 async fn create_shared(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     Json(req): Json<SharedItemReq>,
 ) -> ApiResult<serde_json::Value> {
-    write_shared_draft(&app, req, "shared_draft_update")
+    // 任务 4.7：共享草稿写按主体记账——GA 的共享写是其最强提权动作，必须可归因
+    write_shared_draft(&app, req, "shared_draft_update", &principal_op(&principal))
         .await
         .map(Json)
 }
 
 async fn update_shared_draft(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     Json(req): Json<SharedItemReq>,
 ) -> ApiResult<serde_json::Value> {
-    write_shared_draft(&app, req, "shared_draft_update")
+    write_shared_draft(&app, req, "shared_draft_update", &principal_op(&principal))
         .await
         .map(Json)
 }
@@ -2099,6 +2194,18 @@ struct ProjectAdminResp {
     created_at: i64,
 }
 
+#[derive(Deserialize)]
+struct GlobalAdminCreateReq {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct GlobalAdminResp {
+    username: String,
+    created_at: i64,
+}
+
 /// argon2id 哈希密码 → PHC 字符串（盐内嵌；新格式）。
 fn hash_password(password: &str) -> Result<String, dsh_core::Error> {
     use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
@@ -2196,6 +2303,209 @@ async fn list_project_admins(
     Ok(Json(serde_json::json!(accounts)))
 }
 
+/// 创建全局管理员（仅超级管理员：矩阵默认拒绝 + handler 内防御性再校验）。
+async fn create_global_admin(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+    Json(req): Json<GlobalAdminCreateReq>,
+) -> Result<(StatusCode, Json<GlobalAdminResp>), (StatusCode, Json<ApiErrorBody>)> {
+    if !is_super(&principal) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorBody {
+                code: "ERR_FORBIDDEN".into(),
+                message: "仅超级管理员可管理全局管理员".into(),
+                detail: None,
+            }),
+        ));
+    }
+    if req.password.len() < 6 {
+        return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
+    }
+    let now = now_ms();
+    // 与 PA 同用 argon2 PHC（salted_password_hash 的 salt 为 "" 占位，盐内嵌 PHC）
+    let (salt, hash) = salted_password_hash(&req.password).map_err(ApiError::from)?;
+    match app
+        .write(
+            &Command::GlobalAdminCreate {
+                username: req.username.clone(),
+                salt,
+                password_hash: hash,
+                ts: now,
+            },
+            now,
+        )
+        .await
+    {
+        Ok(_) => {
+            app.audit
+                .append(
+                    "global_admin_create",
+                    None,
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({ "username": req.username }),
+                    &principal_op(&principal),
+                )
+                .await;
+        }
+        // Conflict 必须显式 return，否则会落到下面的 201（账号并未创建）
+        Err(e) if e.0.kind == ErrorKind::Conflict => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiErrorBody {
+                    code: "ERR_ACCOUNT_EXISTS".into(),
+                    message: e.0.message.clone(),
+                    detail: e.0.detail.clone(),
+                }),
+            ))
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(GlobalAdminResp {
+            username: req.username,
+            created_at: now,
+        }),
+    ))
+}
+
+/// 列出全局管理员（仅超级管理员；**不含 salt/password_hash**）。
+async fn list_global_admins(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+) -> ApiResult<serde_json::Value> {
+    if !is_super(&principal) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorBody {
+                code: "ERR_FORBIDDEN".into(),
+                message: "仅超级管理员可管理全局管理员".into(),
+                detail: None,
+            }),
+        ));
+    }
+    let sm = app.sm.read().map_err(lock_err)?;
+    let accounts = sm
+        .list_global_admins()
+        .map_err(ApiError::from)?
+        .into_iter()
+        .map(|a| serde_json::json!({ "username": a.username, "created_at": a.created_at }))
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!(accounts)))
+}
+
+/// 重置全局管理员密码（仅超级管理员；成功后该账号全部会话失效，返回 {"changed":true}）。
+async fn set_global_admin_password(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+    AxumPath(username): AxumPath<String>,
+    Json(req): Json<SetPasswordReq>,
+) -> ApiResult<serde_json::Value> {
+    if !is_super(&principal) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorBody {
+                code: "ERR_FORBIDDEN".into(),
+                message: "仅超级管理员可管理全局管理员".into(),
+                detail: None,
+            }),
+        ));
+    }
+    if req.password.len() < 6 {
+        return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
+    }
+    let (salt, hash) = salted_password_hash(&req.password).map_err(ApiError::from)?;
+    match app
+        .write(
+            &Command::GlobalAdminSetPassword {
+                username: username.clone(),
+                salt,
+                password_hash: hash,
+            },
+            now_ms(),
+        )
+        .await
+    {
+        Ok(_) => {
+            app.audit
+                .append(
+                    "global_admin_set_password",
+                    None,
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({ "username": username }),
+                    &principal_op(&principal),
+                )
+                .await;
+            Ok(Json(serde_json::json!({ "changed": true })))
+        }
+        Err(e) if e.0.kind == ErrorKind::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                code: "ERR_ACCOUNT_NOT_FOUND".into(),
+                message: e.0.message.clone(),
+                detail: e.0.detail.clone(),
+            }),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 删除全局管理员（仅超级管理员；级联删除其全部会话）。
+async fn delete_global_admin(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+    AxumPath(username): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
+    if !is_super(&principal) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorBody {
+                code: "ERR_FORBIDDEN".into(),
+                message: "仅超级管理员可管理全局管理员".into(),
+                detail: None,
+            }),
+        ));
+    }
+    match app
+        .write(
+            &Command::GlobalAdminDelete {
+                username: username.clone(),
+            },
+            now_ms(),
+        )
+        .await
+    {
+        Ok(_) => {
+            app.audit
+                .append(
+                    "global_admin_delete",
+                    None,
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({ "username": username }),
+                    &principal_op(&principal),
+                )
+                .await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) if e.0.kind == ErrorKind::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                code: "ERR_ACCOUNT_NOT_FOUND".into(),
+                message: e.0.message.clone(),
+                detail: e.0.detail.clone(),
+            }),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
 async fn delete_project_admin(
     State(app): State<ApiState>,
     AxumPath((pid, username)): AxumPath<(String, String)>,
@@ -2248,7 +2558,7 @@ async fn create_project_token(
     AxumPath(pid): AxumPath<String>,
     Json(req): Json<CreateProjectTokenReq>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiErrorBody>)> {
-    if !matches!(&*principal, dsh_core::Principal::Admin) {
+    if !is_super(&principal) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ApiErrorBody {
@@ -2341,7 +2651,7 @@ async fn delete_project_token(
     State(app): State<ApiState>,
     AxumPath((pid, tid)): AxumPath<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
-    if !matches!(&*principal, dsh_core::Principal::Admin) {
+    if !is_super(&principal) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ApiErrorBody {
@@ -2633,7 +2943,7 @@ async fn render_config(
             .and_then(|v| v.to_str().ok()),
     );
     let session_ok = match &principal {
-        Ok(dsh_core::Principal::Admin) => true,
+        Ok(dsh_core::Principal::Admin | dsh_core::Principal::GlobalAdmin { .. }) => true,
         Ok(dsh_core::Principal::ProjectAdmin { project, .. }) => project.0 == pid,
         Err(_) => false,
     };
@@ -2712,7 +3022,8 @@ async fn render_config(
 #[derive(Deserialize, Serialize)]
 struct LoginReq {
     password: String,
-    /// 项目管理员用户名（缺省/空 = 全局管理员，向后兼容）。
+    /// 账号用户名（缺省/空 = 超级管理员，向后兼容）。
+    /// 非空时**先匹配 adm/ga/{username}，未命中再匹配 adm/pa/{username}**（D3：命名空间互斥）。
     #[serde(default)]
     username: Option<String>,
 }
@@ -2720,11 +3031,14 @@ struct LoginReq {
 #[derive(Serialize)]
 struct LoginResp {
     token: String,
-    /// "admin" | "project_admin"（调用方感知身份）。
+    /// "admin" | "global_admin" | "project_admin"（调用方感知身份）。
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     project: Option<String>,
+    /// 账号用户名（GA/PA 回填；超级管理员不返回）。UI 用它显示「是谁」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
 }
 
 /// 会话标识（multisession 改造）：随机 32B hex，作会话 key 的一部分 + token 内嵌。
@@ -2740,6 +3054,11 @@ fn new_admin_token(session_id: &str) -> String {
 /// 生成项目管理员 token：pa.{username}.{session_id}.{secret}（multisession）。
 fn new_pa_token(username: &str, session_id: &str) -> String {
     format!("pa.{username}.{session_id}.{}", new_token())
+}
+
+/// 生成全局管理员 token：ga.{username}.{session_id}.{secret}（multisession）。
+fn new_ga_token(username: &str, session_id: &str) -> String {
+    format!("ga.{username}.{session_id}.{}", new_token())
 }
 
 async fn login(
@@ -2762,15 +3081,24 @@ async fn login(
             }),
         ));
     }
-    // 项目管理员登录分支（§3）：username 非空 → 校验 adm/pa/{username}。
-    let pa_username = req
+    // 账号登录分支（设计 global-admin §8）：username 非空 → **先查 GA，未命中回退 PA**
+    // （D3：GA/PA 用户名互斥，故最多命中一个；两条既有路径语义都不变）。
+    let account_username = req
         .username
         .as_deref()
         .map(str::trim)
         .filter(|u| !u.is_empty())
         .map(str::to_string);
-    if let Some(username) = pa_username {
-        return pa_login(app, req, username, &ip, &headers).await;
+    if let Some(username) = account_username {
+        let is_ga = {
+            let sm = app.sm.read().map_err(lock_err)?;
+            sm.get_global_admin(&username).ok().flatten().is_some()
+        };
+        return if is_ga {
+            ga_login(app, req, username, &ip, &headers).await
+        } else {
+            pa_login(app, req, username, &ip, &headers).await
+        };
     }
     // 密码校验：set-password 落状态机后优先；未设置时回退节点配置（--admin-password）。
     let sm_pw_ok = {
@@ -2842,6 +3170,7 @@ async fn login(
                     token,
                     role: Some("admin".into()),
                     project: None,
+                    username: None,
                 }));
             }
             Err(ApiError(e)) if e.kind == ErrorKind::LeaderRedirect => {
@@ -2879,10 +3208,16 @@ async fn login(
                                     .get("project")
                                     .and_then(|p| p.as_str())
                                     .map(str::to_string);
+                                // 转发响应必须回落 username（否则 follower 登录响应缺该字段）
+                                let username = body
+                                    .get("username")
+                                    .and_then(|u| u.as_str())
+                                    .map(str::to_string);
                                 return Ok(Json(LoginResp {
                                     token,
                                     role,
                                     project,
+                                    username,
                                 }));
                             }
                             // 409 ERR_SESSION_IN_USE 等：原样转发 leader 的错误体
@@ -3007,6 +3342,7 @@ async fn pa_login(
                     token,
                     role: Some("project_admin".into()),
                     project: Some(project),
+                    username: Some(username.clone()),
                 }));
             }
             Err(ApiError(e)) if e.kind == ErrorKind::LeaderRedirect => {
@@ -3042,6 +3378,171 @@ async fn pa_login(
                                 project: body
                                     .get("project")
                                     .and_then(|p| p.as_str())
+                                    .map(str::to_string),
+                                username: body
+                                    .get("username")
+                                    .and_then(|u| u.as_str())
+                                    .map(str::to_string),
+                            }));
+                        }
+                        let code = body
+                            .get("code")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("ERR_INTERNAL")
+                            .to_string();
+                        let message = body
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("login failed")
+                            .to_string();
+                        let detail = body.get("detail").cloned();
+                        return Err((
+                            status,
+                            Json(ApiErrorBody {
+                                code,
+                                message,
+                                detail,
+                            }),
+                        ));
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ApiErrorBody {
+                    code: "ERR_LEADER_REDIRECT".into(),
+                    message: "login forwarding to leader timed out".into(),
+                    detail: None,
+                }),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// 全局管理员登录（设计 global-admin §8）：与 pa_login 同构，差异 6 处——
+/// 账号读取用 get_global_admin、会话命令用 MultiGaSessionLogin、token 用 ga. 前缀、
+/// operator 为 ga:{u}、审计 project=None、响应 role=global_admin 且回填 username。
+async fn ga_login(
+    app: ApiState,
+    req: LoginReq,
+    username: String,
+    ip: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
+    // 校验账号与密码（统一 401，防枚举）
+    let account = {
+        let sm = app.sm.read().map_err(lock_err)?;
+        sm.get_global_admin(&username).ok().flatten()
+    };
+    let ok = account
+        .as_ref()
+        .map(|acct| verify_password(&req.password, &acct.password_hash, &acct.salt))
+        .unwrap_or(false);
+    if !ok {
+        app.login_throttle.record_failure(ip);
+        app.audit
+            .append(
+                "login_failed",
+                None,
+                None,
+                None,
+                None,
+                serde_json::json!({"username": username}),
+                &format!("ga:{username}"),
+            )
+            .await;
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorBody {
+                code: "ERR_BAD_CREDENTIALS".into(),
+                message: "账号或密码错误".into(),
+                detail: None,
+            }),
+        ));
+    }
+    let operator = format!("ga:{username}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let session_id = new_session_id();
+        let token = new_ga_token(&username, &session_id);
+        let hash = dsh_core::token_hash(&token);
+        let ttl = app.session_ttl;
+        let now = now_ms();
+        let res = app
+            .write(
+                &Command::MultiGaSessionLogin {
+                    username: username.clone(),
+                    token_hash: hash,
+                    issued_at: now,
+                    expires_at: (ttl.as_secs() > 0).then(|| now + ttl.as_millis() as i64),
+                    device_id: "cli".into(),
+                    session_id,
+                },
+                now,
+            )
+            .await;
+        match res {
+            Ok(_) => {
+                app.login_throttle.reset(ip);
+                app.audit
+                    .append(
+                        "login",
+                        None,
+                        None,
+                        None,
+                        None,
+                        serde_json::json!({"username": username}),
+                        &operator,
+                    )
+                    .await;
+                return Ok(Json(LoginResp {
+                    token,
+                    role: Some("global_admin".into()),
+                    project: None,
+                    username: Some(username),
+                }));
+            }
+            Err(ApiError(e)) if e.kind == ErrorKind::LeaderRedirect => {
+                // 非 leader：转发到 leader（透传 username；leader 侧执行同一 GA→PA 分派）
+                let hint = e.leader_hint.unwrap_or_default();
+                if !hint.is_empty() {
+                    let base = if hint.starts_with("http://") || hint.starts_with("https://") {
+                        hint
+                    } else {
+                        format!("http://{hint}")
+                    };
+                    let client = forward_request(&base, "/api/v1/login", headers);
+                    let fwd = LoginReq {
+                        password: req.password.clone(),
+                        username: Some(username.clone()),
+                    };
+                    if let Ok(resp) = client.json(&fwd).send().await {
+                        let status = resp.status();
+                        let body: serde_json::Value =
+                            resp.json().await.unwrap_or(serde_json::json!({}));
+                        if status.is_success() {
+                            app.login_throttle.reset(ip);
+                            return Ok(Json(LoginResp {
+                                token: body
+                                    .get("token")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                role: body
+                                    .get("role")
+                                    .and_then(|r| r.as_str())
+                                    .map(str::to_string),
+                                project: body
+                                    .get("project")
+                                    .and_then(|p| p.as_str())
+                                    .map(str::to_string),
+                                username: body
+                                    .get("username")
+                                    .and_then(|u| u.as_str())
                                     .map(str::to_string),
                             }));
                         }
@@ -3126,6 +3627,30 @@ async fn logout(
                 .await?;
             }
         },
+        // GA 无旧格式单会话键（设计 §5）：token 恒为 ga.{u}.{sid}.{secret}，
+        // 段数不足在 resolve_principal 已 401；此处显式报错而非静默，防 token 形态变化后「登出无效」
+        dsh_core::Principal::GlobalAdmin { ref username } => match sid {
+            Some(sid) => {
+                app.write(
+                    &Command::MultiGaSessionLogout {
+                        username: username.clone(),
+                        session_id: sid,
+                    },
+                    now_ms(),
+                )
+                .await?;
+            }
+            None => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiErrorBody {
+                        code: "ERR_SESSION_EXPIRED".into(),
+                        message: "需要管理员会话".into(),
+                        detail: None,
+                    }),
+                ))
+            }
+        },
     }
     app.audit
         .append(
@@ -3145,6 +3670,7 @@ async fn logout(
 fn principal_op(p: &dsh_core::Principal) -> String {
     match p {
         dsh_core::Principal::Admin => "admin".into(),
+        dsh_core::Principal::GlobalAdmin { username } => format!("ga:{username}"),
         dsh_core::Principal::ProjectAdmin { username, .. } => format!("pa:{username}"),
     }
 }
@@ -3206,6 +3732,30 @@ async fn heartbeat(
                     now,
                 )
                 .await?;
+            }
+        },
+        // GA 无旧格式单会话键：sid 缺失即非法（同 logout）
+        dsh_core::Principal::GlobalAdmin { ref username } => match sid {
+            Some(sid) => {
+                app.write(
+                    &Command::MultiGaSessionHeartbeat {
+                        username: username.clone(),
+                        session_id: sid,
+                        expires_at: expires,
+                    },
+                    now,
+                )
+                .await?;
+            }
+            None => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiErrorBody {
+                        code: "ERR_SESSION_EXPIRED".into(),
+                        message: "需要管理员会话".into(),
+                        detail: None,
+                    }),
+                ))
             }
         },
     }
@@ -3271,7 +3821,7 @@ async fn audit_list(
     let sm = app.sm.read().map_err(lock_err)?;
     // PA 强制下推 project 过滤到状态机（§4 + R2：先截断后过滤会让 PA 视图被全局条目冲空）
     let project_filter = match principal.0 {
-        dsh_core::Principal::Admin => None,
+        dsh_core::Principal::Admin | dsh_core::Principal::GlobalAdmin { .. } => None,
         dsh_core::Principal::ProjectAdmin { project, .. } => Some(project.0),
     };
     let entries = sm
@@ -3727,6 +4277,16 @@ async fn admin_force_logout(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // username 命中 GA 时走 GA 会话命令，否则按 PA 处理（设计 §8：GA 是全新实体，
+    // PA 语义保持不变）；注意 "admin" 是保留名、既非 GA 也非 PA ⇒ 静默 no-op。
+    let is_ga = match username {
+        Some(u) => {
+            let sm = app.sm.read().map_err(lock_err)?;
+            sm.get_global_admin(u).ok().flatten().is_some()
+        }
+        None => false,
+    };
+    let mut scope = "admin";
     match (username, sid) {
         // 精确踢单个管理员会话
         (None, Some(sid)) => {
@@ -3738,30 +4298,65 @@ async fn admin_force_logout(
             )
             .await?;
         }
-        // 精确踢单个 PA 会话
+        // 精确踢单个 GA / PA 会话
         (Some(username), Some(sid)) => {
-            app.write(
-                &Command::MultiPaSessionLogout {
-                    username: username.to_string(),
-                    session_id: sid.to_string(),
-                },
-                now_ms(),
-            )
-            .await?;
+            if is_ga {
+                scope = "ga";
+                app.write(
+                    &Command::MultiGaSessionLogout {
+                        username: username.to_string(),
+                        session_id: sid.to_string(),
+                    },
+                    now_ms(),
+                )
+                .await?;
+            } else {
+                scope = "pa";
+                app.write(
+                    &Command::MultiPaSessionLogout {
+                        username: username.to_string(),
+                        session_id: sid.to_string(),
+                    },
+                    now_ms(),
+                )
+                .await?;
+            }
         }
-        // 踢该 PA 账号全部会话
+        // 踢该 GA / PA 账号全部会话
         (Some(username), None) => {
-            app.write(
-                &Command::MultiPaSessionLogoutAll {
-                    username: username.to_string(),
-                },
-                now_ms(),
-            )
-            .await?;
+            if is_ga {
+                scope = "ga";
+                app.write(
+                    &Command::MultiGaSessionLogoutAll {
+                        username: username.to_string(),
+                    },
+                    now_ms(),
+                )
+                .await?;
+            } else {
+                scope = "pa";
+                app.write(
+                    &Command::MultiPaSessionLogoutAll {
+                        username: username.to_string(),
+                    },
+                    now_ms(),
+                )
+                .await?;
+            }
         }
-        // 缺省：踢全部管理员会话
+        // 缺省：踢全部 super 会话 +（存在 GA 账号时）全部 GA 会话；PA 会话不在此列
         (None, None) => {
             app.write(&Command::MultiSessionLogoutAll, now_ms()).await?;
+            // 仅在确实存在 GA 账号时才写新变体：无 GA 时保持旧日志形状，
+            // 混合版本集群（滚动升级窗口）里全量下线仍可用（兼容边界 §0 / 设计 §11.1）。
+            let has_ga = {
+                let sm = app.sm.read().map_err(lock_err)?;
+                sm.has_global_admins().map_err(ApiError::from)?
+            };
+            if has_ga {
+                app.write(&Command::GlobalAdminSessionsRevokeAll, now_ms())
+                    .await?;
+            }
         }
     }
     app.audit
@@ -3771,7 +4366,7 @@ async fn admin_force_logout(
             None,
             None,
             None,
-            serde_json::json!({ "username": req.username, "session_id": req.session_id }),
+            serde_json::json!({ "username": req.username, "session_id": req.session_id, "scope": scope }),
             "admin",
         )
         .await;
@@ -3888,6 +4483,41 @@ async fn change_my_password(
                 )
                 .await;
         }
+        dsh_core::Principal::GlobalAdmin { username } => {
+            let account = {
+                let sm = app.sm.read().map_err(lock_err)?;
+                sm.get_global_admin(username).ok().flatten()
+            };
+            let ok = account
+                .as_ref()
+                .map(|acct| verify_password(&req.current_password, &acct.password_hash, &acct.salt))
+                .unwrap_or(false);
+            if !ok {
+                return Err(bad_current_password());
+            }
+            let (salt, hash) = salted_password_hash(&req.new_password).map_err(ApiError::from)?;
+            app.write(
+                &Command::GlobalAdminSetPassword {
+                    username: username.clone(),
+                    salt,
+                    password_hash: hash,
+                },
+                now,
+            )
+            .await?;
+            // apply 已级联收回该账号全部会话（改密即重登）；不影响 super/PA 会话
+            app.audit
+                .append(
+                    "set_password_self",
+                    None,
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({ "username": username }),
+                    &operator,
+                )
+                .await;
+        }
     }
     Ok(Json(serde_json::json!({ "changed": true })))
 }
@@ -3956,8 +4586,19 @@ async fn admin_reset_password(
         now_ms(),
     )
     .await?;
-    // 重置即视同改密：全部管理员会话下线（防旧会话留存，与 admin_set_password 一致）
+    // 重置即视同改密：super 会话全部下线（防旧会话留存，与 admin_set_password 一致）
     app.write(&Command::MultiSessionLogoutAll, now_ms()).await?;
+    // 任务 4.6b：恢复通道同时回收全部 GA 会话——否则运维按「轮换 join-token +
+    // reset-password」收口时，GA 旧 token 仍能管理全部项目与共享配置（含 secret）。
+    // 仅在确实存在 GA 账号时写新变体：无 GA 时保持旧日志形状，混合版本集群仍可用。
+    let has_ga = {
+        let sm = app.sm.read().map_err(lock_err)?;
+        sm.has_global_admins().map_err(ApiError::from)?
+    };
+    if has_ga {
+        app.write(&Command::GlobalAdminSessionsRevokeAll, now_ms())
+            .await?;
+    }
     app.audit
         .append(
             "admin_password_reset",
@@ -4464,6 +5105,14 @@ pub fn build_router(app: ApiState) -> Router {
             "/api/v1/admin/retention-status",
             get(admin_retention_status),
         )
+        .route(
+            "/api/v1/admins",
+            get(list_global_admins).post(create_global_admin),
+        )
+        .route(
+            "/api/v1/admins/{u}",
+            delete(delete_global_admin).put(set_global_admin_password),
+        )
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route(
             "/api/v1/projects/{p}/admins",
@@ -4784,6 +5433,138 @@ mod pa_matrix_tests {
         ));
     }
 }
+
+// ---------------- 全局管理员授权矩阵单元测试（设计 §7：默认拒绝、显式放行） ----------------
+
+#[cfg(test)]
+mod ga_matrix_tests {
+    use super::{authorize, ga_allowed, is_super};
+
+    fn ga() -> dsh_core::Principal {
+        dsh_core::Principal::GlobalAdmin {
+            username: "ga1".into(),
+        }
+    }
+
+    #[test]
+    fn super_is_always_allowed() {
+        let p = dsh_core::Principal::Admin;
+        assert!(is_super(&p));
+        assert!(authorize(&p, "POST", "/api/v1/admins"));
+        assert!(authorize(&p, "DELETE", "/api/v1/projects/p1"));
+        assert!(authorize(&p, "POST", "/api/v1/cluster/join"));
+    }
+
+    #[test]
+    fn ga_self_session_and_password() {
+        let p = ga();
+        assert!(!is_super(&p));
+        assert!(authorize(&p, "POST", "/api/v1/logout"));
+        assert!(authorize(&p, "POST", "/api/v1/heartbeat"));
+        assert!(authorize(&p, "POST", "/api/v1/me/password"));
+    }
+
+    #[test]
+    fn ga_reads_all_projects_and_audit() {
+        let p = ga();
+        assert!(authorize(&p, "GET", "/api/v1/projects"));
+        assert!(authorize(&p, "GET", "/api/v1/audit"));
+        assert!(authorize(&p, "GET", "/api/v1/cluster/members"));
+        // 全量项目列表/审计对 PA 之外的任何人都一样；PA 由 handler 过滤
+        assert!(ga_allowed("GET", "/api/v1/audit"));
+    }
+
+    #[test]
+    fn ga_project_paths_allowed_but_owner_only_faces_denied() {
+        let p = ga();
+        // 任意项目：配置面全放行
+        assert!(authorize(&p, "GET", "/api/v1/projects/alpha"));
+        assert!(authorize(&p, "GET", "/api/v1/projects/beta/branches"));
+        assert!(authorize(
+            &p,
+            "PUT",
+            "/api/v1/projects/beta/branches/dev/draft"
+        ));
+        assert!(authorize(
+            &p,
+            "POST",
+            "/api/v1/projects/beta/branches/dev/publish"
+        ));
+        assert!(authorize(
+            &p,
+            "POST",
+            "/api/v1/projects/beta/branches/dev/rollback"
+        ));
+        assert!(authorize(&p, "GET", "/api/v1/projects/beta/diff"));
+        assert!(authorize(&p, "GET", "/api/v1/projects/beta/structure"));
+        assert!(authorize(
+            &p,
+            "PUT",
+            "/api/v1/projects/beta/structure-draft"
+        ));
+        // 项目本体：GET 放行、DELETE 拒绝（method 敏感）
+        assert!(authorize(&p, "GET", "/api/v1/projects/beta"));
+        assert!(!authorize(&p, "DELETE", "/api/v1/projects/beta"));
+        // 账号/令牌/项目创建删除：仅 super
+        assert!(!authorize(&p, "GET", "/api/v1/projects/beta/admins"));
+        assert!(!authorize(&p, "POST", "/api/v1/projects/beta/admins"));
+        assert!(!authorize(&p, "PUT", "/api/v1/projects/beta/admins/u"));
+        assert!(!authorize(&p, "GET", "/api/v1/projects/beta/tokens"));
+        assert!(!authorize(&p, "DELETE", "/api/v1/projects/beta/tokens/t1"));
+        assert!(!authorize(&p, "POST", "/api/v1/projects"));
+    }
+
+    #[test]
+    fn ga_shared_surface_full_and_global_faces_denied() {
+        let p = ga();
+        // 共享面：读 + 写 + 发布 + 删除全放行
+        assert!(authorize(&p, "GET", "/api/v1/shared"));
+        assert!(authorize(&p, "POST", "/api/v1/shared"));
+        assert!(authorize(&p, "GET", "/api/v1/shared-draft"));
+        assert!(authorize(&p, "PUT", "/api/v1/shared-draft"));
+        assert!(authorize(&p, "POST", "/api/v1/shared/publish"));
+        assert!(authorize(&p, "DELETE", "/api/v1/shared/k"));
+        assert!(authorize(&p, "DELETE", "/api/v1/shared-draft/k"));
+        // 全局面：账号/集群写/快照/改密他人一律拒绝
+        assert!(!authorize(&p, "GET", "/api/v1/admins"));
+        assert!(!authorize(&p, "POST", "/api/v1/admins"));
+        assert!(!authorize(&p, "PUT", "/api/v1/admins/ga2"));
+        assert!(!authorize(&p, "DELETE", "/api/v1/admins/ga2"));
+        assert!(!authorize(&p, "POST", "/api/v1/admin/set-password"));
+        assert!(!authorize(&p, "POST", "/api/v1/admin/force-logout"));
+        assert!(!authorize(&p, "POST", "/api/v1/admin/rotate-master-key"));
+        assert!(!authorize(&p, "GET", "/api/v1/admin/snapshot"));
+        assert!(!authorize(&p, "POST", "/api/v1/cluster/promote"));
+        assert!(!authorize(&p, "POST", "/api/v1/cluster/remove"));
+    }
+
+    #[test]
+    fn ga_path_guard_blocks_normalization_tricks() {
+        let p = ga();
+        // 空段 / "." / ".." 守卫：这些写法都绕不过 /admins 黑名单
+        assert!(!authorize(&p, "GET", "/api/v1/projects/p1//admins"));
+        assert!(!authorize(&p, "GET", "/api/v1/projects/p1/../admins"));
+        assert!(!authorize(&p, "GET", "/api/v1/projects/p1/./admins"));
+        assert!(!authorize(&p, "GET", "/api/v1/projects/p1/admins"));
+        assert!(!authorize(&p, "GET", "/api/v1/projects/p1/adminsfoo"));
+        // 非项目路径的全局面变体
+        assert!(!authorize(&p, "GET", "/api/v1/admins/"));
+        assert!(!authorize(&p, "GET", "/api/v1/ADMINS"));
+    }
+
+    #[test]
+    fn pa_branch_unchanged_through_dispatch() {
+        // authorize 的 PA 分支必须与直接调用 pa_allowed 等价（既有 22 条断言不变）
+        let p = dsh_core::Principal::ProjectAdmin {
+            username: "u".into(),
+            project: dsh_core::ProjectId("order-service".into()),
+        };
+        assert!(authorize(&p, "GET", "/api/v1/projects/order-service"));
+        assert!(!authorize(&p, "GET", "/api/v1/projects/other"));
+        assert!(!authorize(&p, "POST", "/api/v1/admins"));
+        assert!(authorize(&p, "GET", "/api/v1/cluster/members"));
+    }
+}
 // ---------------- 安全加固单元测试（S6 节流 / argon2 密码哈希） ----------------
 
 #[cfg(test)]
@@ -5024,6 +5805,7 @@ mod shared_secret_keep_tests {
                 value: Value::String("".into()), // 留空 = 保留密文
             },
             "shared_draft_update",
+            "admin",
         )
         .await
         .unwrap();
@@ -5054,6 +5836,7 @@ mod shared_secret_keep_tests {
                 value: Value::String("".into()),
             },
             "shared_draft_update",
+            "admin",
         )
         .await
         .unwrap_err();
@@ -5100,6 +5883,7 @@ mod shared_secret_keep_tests {
                 value: Value::String("".into()),
             },
             "shared_draft_update",
+            "admin",
         )
         .await
         .unwrap_err();
@@ -5125,6 +5909,7 @@ mod shared_secret_keep_tests {
                 value: Value::String("".into()),
             },
             "shared_draft_update",
+            "admin",
         )
         .await
         .unwrap_err();

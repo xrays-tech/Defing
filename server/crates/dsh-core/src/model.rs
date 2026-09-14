@@ -435,11 +435,11 @@ pub struct SharedItem {
     pub description: Option<String>,
 }
 
-/// 会话主体（区分全局管理员与项目管理员；旧数据无此字段 → Admin）。
+/// 会话主体（三级角色：超级管理员 / 全局管理员 / 项目管理员；旧数据无此字段 → Admin）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind")]
 pub enum Principal {
-    /// 全局管理员。
+    /// 超级管理员（根账号：节点 --admin-password / 状态机 sess 内密码哈希）。
     #[default]
     Admin,
     /// 项目管理员：仅管理 `project` 的配置，不能触碰共享面/全局面。
@@ -447,6 +447,10 @@ pub enum Principal {
         username: String,
         project: ProjectId,
     },
+    /// 全局管理员（设计 dev_docs/design/global-admin.md §3）：
+    /// 可管理全部项目配置与全部共享配置；不能管理账号（GA/PA）、集群写、
+    /// 项目创建删除、项目访问令牌。
+    GlobalAdmin { username: String },
 }
 
 /// 项目管理员账号（设计文档 dev_docs/design/project-admin.md §2）。
@@ -460,6 +464,22 @@ pub struct ProjectAdminAccount {
     /// 每账号随机盐（hex）。
     pub salt: String,
     /// SHA-256(salt || password) hex。
+    pub password_hash: String,
+    /// 创建时间（墙钟 ms，API 层注入）。
+    pub created_at: i64,
+}
+
+/// 全局管理员账号（设计 dev_docs/design/global-admin.md §4）。
+/// 与 ProjectAdminAccount 同构但无 project 字段；salt 为保留字段
+/// （新格式盐内嵌 PHC 故为空串，旧数据为 sha256(salt||pw) 的盐）。
+/// derive 必须齐全：`load`(DeserializeOwned)/`save_pending`(Serialize)/serde_json 往返都依赖它。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GlobalAdminAccount {
+    /// 集群内唯一（与 PA 用户名互斥，不区分大小写），[A-Za-z0-9_-]{2,64}，禁用 admin。
+    pub username: String,
+    /// 保留字段：新格式盐内嵌 PHC 故为空串。
+    pub salt: String,
+    /// argon2id PHC（`$argon2` 前缀）或旧 sha256 hex。
     pub password_hash: String,
     /// 创建时间（墙钟 ms，API 层注入）。
     pub created_at: i64,

@@ -248,6 +248,55 @@ pub enum Command {
     MultiSessionLogoutAll,
     /// 踢某 PA 账号全部会话（multisession：删旧 key + 前缀扫全部）。
     MultiPaSessionLogoutAll { username: String },
+
+    // ---------------- 全局管理员（Global Admin，纯新增，设计 global-admin §6） ----------------
+    // 注意：本组是新变体，旧节点反序列化整条日志 Entry 会硬失败（dsh-raft store.rs）
+    // ⇒ 升级纪律：全集群升级完成后再创建第一个 GA；调用方在无 GA 账号时不得写本组变体
+    //（恢复通道/全量下线由 has_global_admins() 守卫保证）。
+    /// 创建全局管理员账号（用户名 [A-Za-z0-9_-]{2,64} 且 ≠ admin（不区分大小写）；
+    /// 与 PA 用户名互斥，不区分大小写）。
+    GlobalAdminCreate {
+        username: String,
+        salt: String,
+        password_hash: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
+    },
+    /// 删除全局管理员账号（级联删除其全部会话）。
+    GlobalAdminDelete { username: String },
+    /// 修改全局管理员密码（级联删除其全部会话，需重新登录）。
+    GlobalAdminSetPassword {
+        username: String,
+        salt: String,
+        password_hash: String,
+    },
+    /// 多会话 GA 登录：写 sess/ga/{username}/{session_id}（多会话并存，不检查已存在、不 409）。
+    MultiGaSessionLogin {
+        username: String,
+        token_hash: String,
+        issued_at: i64,
+        expires_at: Option<i64>,
+        device_id: String,
+        session_id: String,
+    },
+    /// 多会话 GA 登出：删 sess/ga/{username}/{session_id}（幂等）。
+    MultiGaSessionLogout {
+        username: String,
+        session_id: String,
+    },
+    /// 多会话 GA 心跳：续期 sess/ga/{username}/{session_id}（无该会话 → ERR_SESSION_EXPIRED）。
+    MultiGaSessionHeartbeat {
+        username: String,
+        session_id: String,
+        expires_at: Option<i64>,
+    },
+    /// 踢某 GA 账号全部会话（前缀扫删，幂等）。
+    MultiGaSessionLogoutAll { username: String },
+    /// 踢全部 GA 账号的全部会话（force-logout 全量 / 恢复通道用）。
+    /// 实现按 adm/ga/ 的 **key 后缀**取用户名，不解析值（损坏记录不漏删）。
+    GlobalAdminSessionsRevokeAll,
+
     /// 审计落库（seq 由状态机单调分配并覆写；经 Raft 复制，集群一致）。
     AuditAppend { entry: crate::model::AuditEntry },
     /// 主密钥轮换（集群一致）：新 KEK 经 Raft 复制到全部节点；各节点 apply 时更新本地 keyring 并持久化 ring 文件。

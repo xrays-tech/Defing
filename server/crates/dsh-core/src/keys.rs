@@ -21,6 +21,8 @@ pub const K_AUDIT_SEQ: &str = "audit/seq";
 pub const K_IDX_PNAME: &str = "idx/pname/";
 /// 项目管理员账号前缀：adm/pa/{username} → ProjectAdminAccount。
 pub const K_PA_ACCOUNT: &str = "adm/pa/";
+/// 全局管理员账号前缀：adm/ga/{username} → GlobalAdminAccount（设计 global-admin §4）。
+pub const K_GA_ACCOUNT: &str = "adm/ga/";
 /// 项目访问令牌键：tok/{hash}（扁平；数据面鉴权单次 KV 读）。
 pub const K_DATA_TOKEN: &str = "tok/";
 
@@ -29,6 +31,9 @@ pub fn data_token_key(hash: &str) -> String {
 }
 /// 项目管理员会话前缀：sess/pa/{username} → AdminSession（每账号单会话）。
 pub const K_PA_SESSION: &str = "sess/pa/";
+/// 全局管理员会话前缀：sess/ga/{username}/{session_id} → AdminSession（多会话）。
+/// 注意与 K_SESSION_PREFIX("sess/admin/") 不重叠 ⇒ MultiSessionLogoutAll 不会误伤 GA 会话。
+pub const K_GA_SESSION: &str = "sess/ga/";
 
 pub fn project_key(id: &ProjectId) -> String {
     format!("{K_PROJECT}{}", id.as_str())
@@ -118,6 +123,18 @@ pub fn pa_session_prefix(username: &str) -> String {
 pub fn pa_session_key_with(username: &str, sid: &str) -> String {
     format!("{K_PA_SESSION}{username}/{sid}")
 }
+/// 全局管理员账号键：adm/ga/{username}。
+pub fn global_admin_key(username: &str) -> String {
+    format!("{K_GA_ACCOUNT}{username}")
+}
+/// 全局管理员会话前缀：sess/ga/{username}/（前缀扫删用）。
+pub fn ga_session_prefix(username: &str) -> String {
+    format!("{K_GA_SESSION}{username}/")
+}
+/// 全局管理员会话键：sess/ga/{username}/{session_id}。
+pub fn ga_session_key_with(username: &str, sid: &str) -> String {
+    format!("{K_GA_SESSION}{username}/{sid}")
+}
 pub fn audit_key(seq: u64) -> String {
     format!("{K_AUDIT}{seq:020}")
 }
@@ -150,6 +167,11 @@ mod tests {
             gray_snap_key(&id, &b, 12),
             "p/order-service/b/prod/gray-snap/12"
         );
+        assert_eq!(global_admin_key("alice"), "adm/ga/alice");
+        assert_eq!(ga_session_prefix("alice"), "sess/ga/alice/");
+        assert_eq!(ga_session_key_with("alice", "abc"), "sess/ga/alice/abc");
+        // 键空间隔离：GA 会话不在 MultiSessionLogoutAll 的前缀内
+        assert!(!ga_session_key_with("alice", "abc").starts_with(K_SESSION_PREFIX));
         assert_eq!(data_token_key("ab12"), "tok/ab12");
         assert_eq!(shared_key("timeout"), "sh/timeout");
         assert_eq!(shared_draft_key("timeout"), "sh-draft/timeout");
