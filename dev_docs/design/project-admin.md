@@ -6,16 +6,16 @@
 
 ## 1. 背景与目标
 
-当前 dsh 只有一个全局管理员（`--admin-password` / `set-password`，单会话）。多项目场景下需要「项目管理员」：仅管理**所属项目**配置、可发布，但**不能修改共享配置**（共享项/共享草稿/共享发布/共享引用绑定），也不能触碰全局面（账号、集群、其他项目）。
+当前 dsh 只有一个超级管理员（`--admin-password` / `set-password`，单会话）。多项目场景下需要「项目管理员」：仅管理**所属项目**配置、可发布，但**不能修改共享配置**（共享项/共享草稿/共享发布/共享引用绑定），也不能触碰全局面（账号、集群、其他项目）。
 
 ### 已确认的需求决策（与用户逐条确认）
 
 | 决策点 | 结论 |
 | --- | --- |
-| 账号创建 | 全局管理员通过 API 创建/删除/改密 |
+| 账号创建 | 超级管理员通过 API 创建/删除/改密 |
 | 账号-项目映射 | 一个账号只管一个项目；一个项目可有多个账号 |
-| 登录端点 | 复用 `POST /api/v1/login`，新增可选 `username` 字段；缺省=全局管理员（向后兼容） |
-| 会话策略 | 每账号单会话（互不踢线）；全局管理员保留现状单会话 |
+| 登录端点 | 复用 `POST /api/v1/login`，新增可选 `username` 字段；缺省=超级管理员（向后兼容） |
+| 会话策略 | 每账号单会话（互不踢线）；超级管理员保留现状单会话 |
 | 结构修改 | 项目管理员可修改**所属项目的非共享结构**（结构项定义本身不涉及共享实体） |
 
 ## 2. 账号模型
@@ -34,16 +34,16 @@ ProjectAdminAccount {
 
 - KV：`adm/pa/{username}`（keys.rs 新增前缀）。唯一性由 key 保证；创建时校验项目存在。
 - `list_project_admins(project)` 需全量扫 `adm/pa/` 前缀过滤——**O(账号数)**，账号量小可接受（设计取舍，明示）。
-- 密码哈希加盐 SHA-256（现状全局管理员为无盐比对，不构成劣化）；不引入新依赖。
+- 密码哈希加盐 SHA-256（现状超级管理员为无盐比对，不构成劣化）；不引入新依赖。
 
 ## 3. 会话模型与 token 路由
 
-**多会话按主体分 key**：全局管理员 `sess/admin`（不变）；项目管理员 `sess/pa/{username}`。
+**多会话按主体分 key**：超级管理员 `sess/admin`（不变）；项目管理员 `sess/pa/{username}`。
 
 **token 自带主体路由信息**（解决中间件 O(1) 定位，无缓存一致性问题）：
 
 ```
-全局管理员 token: "adm." + base64url(32B random)
+超级管理员 token: "adm." + base64url(32B random)
 项目管理员 token: "pa." + urlsafe(username) + "." + base64url(32B random)
 ```
 
@@ -58,7 +58,8 @@ AdminSession {
   token_hash, issued_at, expires_at, device_id,     // 不变
   #[serde(default)] principal: Principal,           // 旧数据无此字段 → Admin
 }
-Principal 外部标签形如 {"kind":"admin"} / {"kind":"project_admin","username","project"}
+Principal 外部标签形如 {"kind":"Admin"} / {"kind":"ProjectAdmin","username","project"}
+（更正：枚举未加 #[serde(rename_all)]，故为 PascalCase；见 dev_docs/design/global-admin.md §12）
 ```
 
 **会话生命周期约束（状态机确定性）**：
@@ -92,7 +93,7 @@ PaSessionHeartbeat { username, expires_at: Option<i64> }   // 语义照抄现有
 
 **路径提取安全规则（N2）**：中间件从 `uri().path()` 提取 `/api/v1/projects/{p}/...` 中的 `{p}`（未解码），强制 `valid_name`（`[a-z0-9-]`，state.rs:47）校验；不匹配（含 URL 编码 `%70`/`%2F`、大写、尾斜杠）→ 按「非项目路径」处理 → 对 PA **默认拒绝**。无绕过面。
 
-**全局管理员：全部端点（现状不变）。**
+**超级管理员：全部端点（现状不变）。**
 
 **项目管理员（所属项目 P）：**
 
@@ -111,8 +112,9 @@ PaSessionHeartbeat { username, expires_at: Option<i64> }   // 语义照抄现有
 | 审计 | `GET /audit` | ✅ handler 层强制过滤 `project=P`（principal 来自 extensions，无 query 绕过面；`get_audit` 需扩展 project 参数） |
 | 共享配置-读 | `GET /shared`、`GET /shared-draft` | ✅ 允许（只读；secret 值已掩码；`GET /shared` 的 refs 过滤为仅自己项目，N11） |
 | 共享配置-写 | `POST /shared`、`PUT /shared-draft`、`POST /shared/publish`、`DELETE /shared/{key}`、`DELETE /shared-draft/{key}` | ❌ 拒绝 403 |
-| 共享引用-写 | `POST/DELETE /shared/refs` | ❌ 拒绝（绑定共享 secret → 物化进项目可读，构成权限升级） |
-| 共享引用-读 | `GET /shared/refs` | ✅ 允许（只读）；handler 强制覆写 `project=P`（RefsQuery.project 来自 query，N11，防跨项目元数据读取） |
+（已移除：`/shared/refs` 端点随 shared-ref-branch-scope 改造删除——共享引用改为分支
+`BranchState.shared_bindings`、随 `PUT /projects/{p}/branches/{b}/draft` 保存，故 PA 的「引用共享」
+能力天然由项目草稿端点承载，无需单独行。）
 | 管理语义 reveal | `/v1/projects/P/branches/{b}/config?reveal=true`（不在 /api/v1 下！） | ✅ 允许且仅限 P——**该端点现有手动会话校验（lib.rs:1346-1377）改为按 Principal 校验归属，否则 PA 可解密任意项目 secret（B2 权限提升漏洞）**；审计已有。与中间件共用 `resolve_principal` helper，禁止手抄第三份 token 解析（N15） |
 | 项目面 | `POST /projects`、`DELETE /projects/{p}` | ❌ 拒绝 |
 | 跨项目 | 任何 `/projects/{其他}` 路径 | ❌ 拒绝 |
@@ -122,17 +124,17 @@ PaSessionHeartbeat { username, expires_at: Option<i64> }   // 语义照抄现有
 
 实现：**默认拒绝、显式放行**（全局面端点白名单）。
 
-## 5. API 设计（新增端点，均全局管理员专用）
+## 5. API 设计（新增端点，均超级管理员专用）
 
 ```
 POST   /api/v1/projects/{p}/admins            {"username","password"}     创建
 GET    /api/v1/projects/{p}/admins            → [{"username","created_at"}]（不返回哈希/盐）
 DELETE /api/v1/projects/{p}/admins/{username} 删除（连带删会话）
 PUT    /api/v1/projects/{p}/admins/{username} {"password"}               改密（连带删会话）
-POST   /api/v1/me/password                    {"current_password","new_password"}  自助改密（通用，非全局管理员专用）
+POST   /api/v1/me/password                    {"current_password","new_password"}  自助改密（通用，非超级管理员专用）
 ```
 
-> 自助改密（`/api/v1/me/password`，全局管理员与 PA 通用）：校验当前密码（admin 走状态机哈希/节点配置回退，PA 走账号加盐哈希，错误统一 401 `ERR_BAD_CREDENTIALS`），成功后 admin 路径追加 `MultiSessionLogoutAll`（与 `admin_set_password` 一致），PA 路径由 `ProjectAdminSetPassword` apply 级联收回该账号全部会话。审计 action `set_password_self`，operator 按主体（`admin` / `pa:{username}`）。
+> 自助改密（`/api/v1/me/password`，超级管理员与 PA 通用）：校验当前密码（admin 走状态机哈希/节点配置回退，PA 走账号加盐哈希，错误统一 401 `ERR_BAD_CREDENTIALS`），成功后 admin 路径追加 `MultiSessionLogoutAll`（与 `admin_set_password` 一致），PA 路径由 `ProjectAdminSetPassword` apply 级联收回该账号全部会话。审计 action `set_password_self`，operator 按主体（`admin` / `pa:{username}`）。
 
 错误码新增：`ERR_BAD_CREDENTIALS`(401，login 失败统一用此码，替换现有 `"ERR_FORBIDDEN"`+401 的码位冲突 N4；文案统一不区分账号是否存在，防枚举)、`ERR_FORBIDDEN`(403)、`ERR_ACCOUNT_EXISTS`(409)、`ERR_ACCOUNT_NOT_FOUND`(404)。
 
@@ -141,7 +143,7 @@ POST   /api/v1/me/password                    {"current_password","new_password"
 - **非 leader 节点 login 转发体必须透传 `username`**（改 lib.rs:1483-1489 硬编码的 `LoginReq { password }`，N1）。
 - login 成功响应 `{"token","role":"admin"|"project_admin","project"?}`；PA token 即 `pa.{username}.{secret}` 格式。
 - **过期重登的并发加固（N13）**：API 层 logout+login 序列中，若 login 收到 `SessionInUse`，复查该会话确已过期则重试一轮（有界，仅一次）；并发双 login 最终恰一会话成立。
-- **force-logout 恢复 username 参数（N16）**：`POST /api/v1/admin/force-logout {"username"?}`——缺省踢全局管理员会话；指定 username 踢对应 PA 会话（不动账号本体，比改密/删号的运维破坏性小）。
+- **force-logout 恢复 username 参数（N16）**：`POST /api/v1/admin/force-logout {"username"?}`——缺省踢超级管理员会话；指定 username 踢对应 PA 会话（不动账号本体，比改密/删号的运维破坏性小）。
 
 **级联**：`DELETE /projects/{p}` 的 apply 级联删除该 project 全部 PA 账号及其会话（读 `adm/pa/` 前缀过滤 → 逐个删 `sess/pa/{u}` → 删账号）。apply 单线程持锁执行，顺序无死锁面。
 
@@ -150,7 +152,8 @@ POST   /api/v1/me/password                    {"current_password","new_password"
 - `dsh-observability::AuditLog::append` 加 `operator` 参数（替换硬编码 "admin"，lib.rs:37）；dsh-api 全部调用点传 `principal.operator()`（`"admin"` / `"pa:{username}"`）。
 - PA 登录/登出/心跳、login_failed 均审计。
 - `GET /audit` 对 PA 强制 `project=P` 过滤；`project=None` 条目（login/logout/shared_publish）对 PA 不可见——shared_publish 级联改 PA 项目值但来源审计不可见，**取舍**：级联产生的审计条目落 project 字段（在 cascade 路径补充），否则文档记录（开发时按实现成本取前者优先）。
-- `dsh_session_active` 指标（observability lib.rs:126）改为 admin||PA 聚合或 label 区分，避免语义退化（N7）。
+- （已移除：`dsh_session_active` 指标按 S7 删除——该指标是会话存在性 oracle，现状见
+  dsh-observability/src/lib.rs:109 的移除说明与 :311 的反向断言。）
 
 ## 7. 兼容性
 
@@ -165,12 +168,12 @@ POST   /api/v1/me/password                    {"current_password","new_password"
 **dsh-core/tests/state_machine.rs（状态机层，M1）**
 - PA 创建/重复创建(ACCOUNT_EXISTS)/删除/改密；项目不存在创建失败；禁用名 "admin"
 - 删除项目级联删 PA+会话；删除账号/改密后旧会话 key 消失
-- `PaSessionLogin` per-username 单会话（is_some 判定，不涉时钟）；PA 与全局管理员会话并存互不影响
+- `PaSessionLogin` per-username 单会话（is_some 判定，不涉时钟）；PA 与超级管理员会话并存互不影响
 - `VersionRecord.operator` 记录 `pa:{username}`；旧命令 default → "admin"
 - operator 字段 serde 兼容：无 operator 字段的 JSON 反序列化成功
 
 **dsh-api/tests/http_project_admin.rs（新建 HTTP 集成测试，M2，参照 grpc_data_plane.rs start_server 模式）**
-- 全局管理员创建 PA → PA 登录 → **授权矩阵逐行断言**（含：logout/heartbeat 可用且续期；共享库只读放行（`GET /shared`、`GET /shared-draft` → 200，secret 值掩码、refs 仅自己项目）而写全组 403；`GET /cluster/members`、`GET /admin/retention-status` 403；跨项目 403；账号管理 403；集群端点 403）
+- 超级管理员创建 PA → PA 登录 → **授权矩阵逐行断言**（含：logout/heartbeat 可用且续期；共享库只读放行（`GET /shared`、`GET /shared-draft` → 200，secret 值掩码、refs 仅自己项目）而写全组 403；`GET /cluster/members`、`GET /admin/retention-status` 403；跨项目 403；账号管理 403；集群端点 403）
 - **路径绕过组**：`%70`(编码p)、大写、尾斜杠、`%2F` → 全部 403
 - **token 路由负形测试（N14）**：伪造前缀（PA secret 拼 `adm.`、空 username、`pa.admin.x`）、截断 token → 全部 401
 - **`/v1/.../config?reveal=true`**：PA 只能 reveal 自己项目（B2 回归用例）；PA reveal 其他项目 403
@@ -184,7 +187,7 @@ POST   /api/v1/me/password                    {"current_password","new_password"
 
 **testkit**：加 `seed_project_admin(project, username, password)` 辅助（供集成测试与未来 CLI 复用）。
 
-**回归**：`cargo test --workspace` 全绿（含既有 grpc_data_plane / state_machine / cluster）；docker 重建后 example 全局管理员流程不回归；PA 矩阵手测脚本一遍。
+**回归**：`cargo test --workspace` 全绿（含既有 grpc_data_plane / state_machine / cluster）；docker 重建后 example 超级管理员流程不回归；PA 矩阵手测脚本一遍。
 
 ## 9. 开发计划（阶段与验收，B6 修订）
 

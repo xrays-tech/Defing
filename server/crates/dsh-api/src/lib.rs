@@ -698,7 +698,7 @@ fn ga_allowed(method: &str, path: &str) -> bool {
 /// 仅由 authorize 的 ProjectAdmin 分支调用。
 fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool {
     let dsh_core::Principal::ProjectAdmin { project, .. } = principal else {
-        return true; // 全局管理员
+        return true; // 超级管理员（非 PA）
     };
     let pid = &project.0;
 
@@ -750,7 +750,8 @@ fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool
     false
 }
 
-/// 管理面鉴权中间件（全局管理员 + 项目管理员双主体；除 login/healthz/readyz 外均需 Bearer）。
+/// 管理面鉴权中间件（三级主体：超级管理员 / 全局管理员 / 项目管理员；
+/// 除 login/healthz/readyz 外均需 Bearer）。
 async fn auth_middleware(
     State(app): State<ApiState>,
     mut req: axum::extract::Request,
@@ -2179,7 +2180,7 @@ async fn admin_config(
     }))
 }
 
-// ---------------- 项目管理员账号管理（§5，全局管理员专用；中间件已对 PA 拒绝 /admins 路径）----------------
+// ---------------- 项目管理员账号管理（§5，超级管理员专用；中间件已对 PA/GA 拒绝 /admins 路径）----------------
 
 #[derive(Deserialize)]
 struct ProjectAdminCreateReq {
@@ -2550,7 +2551,7 @@ struct CreateProjectTokenReq {
     name: String,
 }
 
-/// 创建项目访问令牌（仅全局管理员；PA 由 pa_allowed 拒 403，此处防御性再校验）。
+/// 创建项目访问令牌（仅超级管理员；PA/GA 由授权矩阵拒 403，此处防御性再校验）。
 /// 明文 token 复用模块级 new_token()（16B → 32 hex，见路由区定义）。
 async fn create_project_token(
     principal: axum::Extension<dsh_core::Principal>,
@@ -4398,8 +4399,8 @@ fn bad_current_password() -> (StatusCode, Json<ApiErrorBody>) {
     )
 }
 
-/// 自助修改密码（全局管理员 + 项目管理员通用，侧边栏「修改密码」入口；B1：校验当前密码）。
-/// - admin：校验全局管理员密码（状态机哈希优先，回退节点配置 --admin-password，同 login）
+/// 自助修改密码（超级管理员 / 全局管理员 / 项目管理员通用，侧边栏「修改密码」入口；B1：校验当前密码）。
+/// - admin（超级管理员）：校验根账号密码（状态机哈希优先，回退节点配置 --admin-password，同 login）
 ///   → AdminSetPassword + 踢全部管理员会话（改密即重登）；
 /// - PA：校验账号加盐哈希 → ProjectAdminSetPassword（apply 级联收回该账号全部会话）。
 ///
@@ -5379,13 +5380,13 @@ mod pa_matrix_tests {
         // 共享库只读放行（草稿页「引用共享」下拉数据源；secret 值已掩码）
         assert!(pa_allowed(&p, "GET", "/api/v1/shared"));
         assert!(pa_allowed(&p, "GET", "/api/v1/shared-draft"));
-        // 写仍仅全局管理员
+        // 写仍仅超级管理员 / 全局管理员
         assert!(!pa_allowed(&p, "POST", "/api/v1/shared"));
         assert!(!pa_allowed(&p, "PUT", "/api/v1/shared-draft"));
         assert!(!pa_allowed(&p, "POST", "/api/v1/shared/publish"));
         assert!(!pa_allowed(&p, "DELETE", "/api/v1/shared/timeout"));
         assert!(!pa_allowed(&p, "DELETE", "/api/v1/shared-draft/timeout"));
-        // 全局管理员面
+        // 全局面（仅超级管理员）
         assert!(!pa_allowed(&p, "POST", "/api/v1/admin/set-password"));
         assert!(!pa_allowed(&p, "GET", "/api/v1/admin/snapshot"));
         // 本项目内 admins 也拒绝

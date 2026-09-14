@@ -15,7 +15,7 @@ security:
 paths:
   /api/v1/login:
     post:
-      summary: 登录（单一管理员会话 I7；第二个登录返回 409）
+      summary: 登录（多会话并存；username 非空先匹配全局管理员、未命中再匹配项目管理员；缺省 = 超级管理员）
       security: []
       requestBody:
         required: true
@@ -29,7 +29,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/LoginResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '409': { $ref: '#/components/responses/SessionInUse' }
   /api/v1/logout:
     post:
       summary: 登出（使当前会话失效）
@@ -51,7 +50,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
   /api/v1/me/password:
     post:
-      summary: 自助修改自己的密码（全局管理员 / 项目管理员通用；校验当前密码，改后全部旧会话失效需重新登录）
+      summary: 自助修改自己的密码（超级管理员 / 全局管理员 / 项目管理员通用；校验当前密码，改后该主体全部旧会话失效需重新登录）
       security:
         - AdminSession: []
       requestBody:
@@ -786,7 +785,74 @@ paths:
           content:
             application/octet-stream: {}
         '404': { $ref: '#/components/responses/NotFound' }
-  # F10（P3-④ 补全）：项目管理员（PA）账号管理面（admin-only；global admin 管理）
+  # 全局管理员（GA）账号管理面（**仅超级管理员**；GA 可管理全部项目配置与共享配置）
+  /api/v1/admins:
+    get:
+      summary: 全局管理员账号列表（不含 salt/password_hash）
+      security: [AdminSession: []]
+      responses:
+        '200':
+          description: 账号列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/GlobalAdminAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      summary: 创建全局管理员（用户名 [A-Za-z0-9_-]{2,64}、≠ admin（不区分大小写）、与项目管理员互斥（不区分大小写）；密码 ≥6 位）
+      security: [AdminSession: []]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GlobalAdminCreateRequest' }
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GlobalAdminAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /api/v1/admins/{u}:
+    put:
+      summary: 重置全局管理员密码（该账号全部会话即时失效）
+      security: [AdminSession: []]
+      parameters:
+        - { name: u, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetPasswordRequest' }
+      responses:
+        '200':
+          description: 修改成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  changed: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+    delete:
+      summary: 删除全局管理员（级联删除其全部会话）
+      security: [AdminSession: []]
+      parameters:
+        - { name: u, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: 删除成功 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # F10（P3-④ 补全）：项目管理员（PA）账号管理面（admin-only；超级管理员管理）
   /api/v1/projects/{p}/admins:
     get:
       summary: 项目管理员账号列表（该项目的 PA；global admin 会话）
@@ -845,7 +911,7 @@ paths:
       responses:
         '204': { description: 删除成功 }
         '404': { $ref: '#/components/responses/NotFound' }
-  # 项目访问令牌（project-token）：数据面 SDK 机器凭据（admin-only；仅全局管理员可管理）
+  # 项目访问令牌（project-token）：数据面 SDK 机器凭据（admin-only；仅超级管理员可管理）
   /api/v1/projects/{p}/tokens:
     get:
       summary: 项目访问令牌列表（不含明文与 hash；含 revoked 标记）
@@ -968,13 +1034,20 @@ components:
       properties:
         password: { type: string }
         device_id: { type: string }
+        username:
+          type: string
+          description: 账号用户名（缺省/空 = 超级管理员）。非空时先匹配 adm/ga/{username}，未命中再匹配 adm/pa/{username}
     LoginResponse:
       type: object
-      required: [token, expires_at]
+      required: [token]
       properties:
         token: { type: string }
-        expires_at: { type: string, format: date-time }
-        must_change_password: { type: boolean, default: false }
+        role:
+          type: string
+          enum: [admin, global_admin, project_admin]
+          description: 调用方感知身份
+        project: { type: string, description: 项目管理员所属项目 }
+        username: { type: string, description: 全局管理员/项目管理员回填；超级管理员不返回 }
     Project:
       type: object
       required: [id, name]
@@ -1297,7 +1370,25 @@ components:
       type: object
       required: [username, password]
       properties:
-        username: { type: string, description: "[A-Za-z0-9_-]{2,64}，≠ admin" }
+        username: { type: string, description: "[A-Za-z0-9_-]{2,64}，≠ admin（不区分大小写）" }
+        password: { type: string, minLength: 6, description: 新密码（≥6 位） }
+    GlobalAdminAccount:
+      type: object
+      required: [username, created_at]
+      properties:
+        username: { type: string, description: "集群内唯一，[A-Za-z0-9_-]{2,64}，≠ admin（不区分大小写），与项目管理员用户名互斥（不区分大小写）" }
+        created_at: { type: integer, format: int64, description: 墙钟 ms }
+        # 密码哈希/盐不外泄：列表与创建响应均不含 salt/password_hash（服务端自行省略）
+    GlobalAdminCreateRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, description: "[A-Za-z0-9_-]{2,64}，≠ admin（不区分大小写），与项目管理员互斥（不区分大小写）" }
+        password: { type: string, minLength: 6, description: 初始密码（≥6 位） }
+    SetPasswordRequest:
+      type: object
+      required: [password]
+      properties:
         password: { type: string, minLength: 6, description: 新密码（≥6 位） }
     ProjectToken:
       type: object

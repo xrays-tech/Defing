@@ -455,10 +455,10 @@
     },
     "AdminSession": {
       "type": "object",
+      "description": "管理员会话（key = sess/admin/{sid} | sess/ga/{username}/{sid} | sess/pa/{username}/{sid}）",
       "required": [
         "token_hash",
-        "issued_at",
-        "expires_at"
+        "issued_at"
       ],
       "additionalProperties": false,
       "properties": {
@@ -467,19 +467,69 @@
           "description": "会话令牌 SHA-256（不存明文）"
         },
         "issued_at": {
-          "type": "string",
-          "format": "date-time"
+          "type": "integer",
+          "description": "签发时间（墙钟 ms，API 层注入；仅作数据，不参与状态机确定性判定）"
         },
         "expires_at": {
-          "type": "string",
-          "format": "date-time"
+          "type": ["integer", "null"],
+          "description": "过期时间（墙钟 ms，API 层注入）；null = 不自动过期（--session-ttl 0）"
         },
         "device_id": {
           "type": "string"
         },
-        "must_change_password": {
-          "type": "boolean",
-          "default": false
+        "principal": {
+          "description": "会话主体（旧数据缺省 = Admin）",
+          "oneOf": [
+            { "type": "object", "required": ["kind"], "additionalProperties": false, "properties": { "kind": { "const": "Admin" } } },
+            {
+              "type": "object",
+              "required": ["kind", "username", "project"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "ProjectAdmin" },
+                "username": { "type": "string" },
+                "project": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "username"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "GlobalAdmin" },
+                "username": { "type": "string" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "GlobalAdminAccount": {
+      "type": "object",
+      "description": "全局管理员账号（key = adm/ga/{username}）；可管理全部项目配置与共享配置",
+      "required": [
+        "username",
+        "salt",
+        "password_hash",
+        "created_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "username": {
+          "type": "string",
+          "description": "集群内唯一，[A-Za-z0-9_-]{2,64}，≠ admin（不区分大小写），与项目管理员用户名互斥（不区分大小写）"
+        },
+        "salt": {
+          "type": "string",
+          "description": "保留字段：新格式盐内嵌 PHC 故为空串；旧数据为 sha256(salt||password) 的盐"
+        },
+        "password_hash": {
+          "type": "string",
+          "description": "argon2id PHC（$argon2 前缀）或旧 sha256 hex"
+        },
+        "created_at": {
+          "type": "integer",
+          "description": "创建时间（墙钟 ms，API 层注入）"
         }
       }
     },

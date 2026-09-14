@@ -110,7 +110,7 @@
 | `--ops-token <token>` | string | — | 客户端模式**忘记密码恢复**凭据（global，仅 `reset-password` 用）；值 = 节点 `--join-token`；缺省回退环境变量 `DSH_OPS_TOKEN` / `DSH_CLUSTER_TOKEN` |
 
 > **数据面鉴权（project-token）**：数据面 `/v1/*` 与 gRPC 一律要求**项目访问令牌**（`Authorization: Bearer <token>` 或 SSE `?token=`）。
-> 令牌在 Admin UI 项目页「访问令牌」Tab 或 `POST /api/v1/projects/{p}/tokens` 创建（**仅全局管理员**）；
+> 令牌在 Admin UI 项目页「访问令牌」Tab 或 `POST /api/v1/projects/{p}/tokens` 创建（**仅超级管理员**）；
 > 每项目多令牌并存、可独立吊销（轮换零中断）、SHA-256 落盘（明文仅创建响应一次）。
 > `--dev-single` 启动时自动生成全局开发 token 打印（仅 dev 模式）。已移除 `--data-plane-token`。
 
@@ -457,7 +457,7 @@ snap = c.get('my-app', 'dev')
 ```
 
 > 数据面鉴权（project-token）：SDK 调用需带 `authorization: Bearer <token>`（gRPC metadata 同构；
-> HTTP SSE 亦支持 `?token=`）。令牌在 Admin UI 项目页「访问令牌」Tab 创建（仅全局管理员）。
+> HTTP SSE 亦支持 `?token=`）。令牌在 Admin UI 项目页「访问令牌」Tab 创建（仅超级管理员）。
 >
 > **构建脚本取值（curl）**：`GET /v1/projects/{p}/branches/{b}/config?format=yaml|json|toml|env&version=<n>`
 > （`env` = .env 文件格式：`KEY=VALUE`，键大写、无分组前缀，可直接 `> .env` 落盘）
@@ -472,9 +472,11 @@ snap = c.get('my-app', 'dev')
 | 项 | 要求 |
 |---|---|
 | 主密钥 | 必配（`DSH_MASTER_KEY` 或 `--master-key-file`），强随机 32B；勿用仓库演示默认值 |
-| 管理员密码 | `--admin-password` 强密码（≥12 位混合）；勿用默认 |
+| 管理员密码 | `--admin-password` 强密码（≥12 位混合）；勿用默认；这是**超级管理员**（根账号）的凭据 |
+| 全局管理员（GA） | 由超级管理员在 Admin UI「全局管理员」页创建/删除/改密；可管理全部项目与共享配置但**不能管理账号、集群写、访问令牌**；GA 丢密由超级管理员重置 |
+| 集群升级顺序 | **先全集群升级到含 GA 的版本，再创建第一个 GA**：旧节点无法反序列化 `GlobalAdmin*` 命令变体（日志整条解码失败）|
 | 集群令牌 | `--join-token`/`--raft-token` 强随机（≥32 hex），全集群一致，仅内网可达 raft 端口 |
-| 项目访问令牌 | **每个项目都配置访问令牌**（Admin UI/API 创建，仅全局管理员）；SDK 携带 Bearer；泄露即吊销重建 |
+| 项目访问令牌 | **每个项目都配置访问令牌**（Admin UI/API 创建，仅超级管理员）；SDK 携带 Bearer；泄露即吊销重建 |
 | 监听绑定 | 生产绑定内网地址/防火墙限流，8385 raft 端口绝不暴露公网 |
 | 可信代理 | 前置反代时配 `--trusted-proxy`（否则登录节流键可被伪造 XFF 绕过，F4） |
 | 会话 | `--session-ttl` 按需（默认 24h；0=永不过期，谨慎） |

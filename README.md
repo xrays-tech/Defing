@@ -16,7 +16,7 @@ server/target/debug/defing --dev-single --admin-password admin123 --allow-no-mas
 # 数据面:  GET  /v1/projects/{p}/branches/{b}/snapshot  （SDK 拉配置，纯值+版本号）
 #          SSE  /v1/projects/{p}/branches/{b}/watch      （订阅发布事件）
 # 鉴权:    数据面一律需要访问令牌 —— dev-single 启动时打印「开发数据面 token」（全局有效）；
-#          生产/集群模式在 Admin UI 项目页「访问令牌」Tab 创建（仅全局管理员，每项目独立、可吊销）
+#          生产/集群模式在 Admin UI 项目页「访问令牌」Tab 创建（仅超级管理员，每项目独立、可吊销）
 ```
 
 ### 集群（3 节点）
@@ -84,7 +84,7 @@ curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=env" \
 # 指定版本：&version=<n>；分支名按需替换（dev/test/prod/自定义）
 ```
 
-项目访问令牌在 Admin UI 项目页「访问令牌」Tab 创建（仅全局管理员，明文仅创建时展示一次）；
+项目访问令牌在 Admin UI 项目页「访问令牌」Tab 创建（仅超级管理员，明文仅创建时展示一次）；
 该 Tab 同时展示当前项目的可复制 curl 命令。
 > 说明：渲染端点（/config）对数据面 token 授权请求默认解密 secret；SDK 快照（/snapshot、gRPC）保持恒掩码（proto masked 语义），如需明文请走 /config。
 
@@ -95,7 +95,9 @@ curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=env" \
 - **配置模型**：项目→分支→分组→item；结构强一致（仅值按分支）
 - **发布闭环**：草稿 → 版本（不可变）→ 发布 → 通知；回滚；共享配置项（扁平库，含描述字段）与级联——结构页将配置项标记为「引用共享」（声明类型约束），各分支在草稿页按下拉选择引用的共享项（值由共享库物化、只读；共享项更新发布自动级联到绑定它的分支）
 - **安全**：secret 项 AES-256-GCM 信封加密（主密钥 env/文件）、多会话并存（每会话独立管理 + 草稿乐观锁防并发编辑冲突）、审计、CSP、
-  join/raft 集群令牌（--join-token/--raft-token 集群模式强制）、数据面每项目访问令牌（Admin UI/API 管理，SHA-256 落盘）
+  join/raft 集群令牌（--join-token/--raft-token 集群模式强制）、数据面每项目访问令牌（Admin UI/API 管理，SHA-256 落盘）、
+  三级管理员（**超级管理员** / **全局管理员（GA）** / 项目管理员）：GA 由超级管理员创建/删除/改密，可管理**全部项目配置与全部共享配置**，
+  但不能管理账号、集群写与访问令牌；三角色均可自助改密
 - **多格式**：YAML / TOML / JSON 渲染
 - **可观测**：/healthz、/readyz、/metrics（Prometheus）、审计 API
 - **Admin UI**：内嵌 /admin（项目/配置/watch）
