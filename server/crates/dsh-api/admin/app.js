@@ -45,9 +45,9 @@ async function copyText(txt) {
 }
 
 /* ---------------- 状态 ---------------- */
-const LS_TOKEN = 'dsh_admin_token', LS_ROLE = 'dsh_admin_role', LS_PROJ = 'dsh_admin_project', LS_THEME = 'dsh_theme';
+const LS_TOKEN = 'dsh_admin_token', LS_ROLE = 'dsh_admin_role', LS_PROJ = 'dsh_admin_project', LS_THEME = 'dsh_theme', LS_USER = 'dsh_admin_username';
 const S = {
-  token: '', role: '', roleProject: '',
+  token: '', role: '', roleProject: '', username: '',
   view: 'config', pane: 'draft',
   projects: [], project: '', branches: [], branch: '',
   version: 0, structV: 0, draftRev: 0, gray: null,
@@ -104,7 +104,7 @@ async function jtext(url) {
 function sessionExpired() {
   if (!S.token) return;
   S.token = '';
-  localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ);
+  localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ); localStorage.removeItem(LS_USER);
   $('app').classList.add('hidden');
   $('login-view').classList.remove('hidden');
   toast('会话已过期，请重新登录', 'err');
@@ -221,6 +221,7 @@ actions.switchView = function (el) {
   if (v === 'audit') loadAudit();
   if (v === 'cluster') loadCluster();
   if (v === 'admins') loadAdmins();
+  if (v === 'globaladmins') loadGlobalAdmins();
 };
 function setPane(pane) {
   S.pane = pane;
@@ -240,7 +241,7 @@ async function loadTokens() {
     const list = (await j('GET', '/api/v1/projects/' + encodeURIComponent(S.project) + '/tokens')) || [];
     renderTokens(list);
   } catch (e) {
-    if (e.status === 403) tbody.innerHTML = '<tr><td colspan="6" class="muted">仅全局管理员可查看访问令牌</td></tr>';
+    if (e.status === 403) tbody.innerHTML = '<tr><td colspan="6" class="muted">仅超级管理员可查看访问令牌</td></tr>';
     else toast('加载令牌失败：' + e.message, 'err');
   }
 }
@@ -334,7 +335,7 @@ actions.toggleTheme = function () {
 actions.doLogout = function () {
   j('POST', '/api/v1/logout', {}).catch(() => { /* 登出失败也继续本地清理 */ });
   S.token = '';
-  localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ);
+  localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ); localStorage.removeItem(LS_USER);
   location.reload();
 };
 
@@ -345,7 +346,7 @@ async function doLogin() {
   if (!pw) { showErr('login-err', '请输入密码'); return; }
   hideErr('login-err');
   const body = { password: pw };
-  if (user) body.username = user; // 项目管理员登录（全局管理员留空，请求体与旧版一致）
+  if (user) body.username = user; // 账号登录（超级管理员留空，请求体与旧版一致）
   await withBusy($('login-submit'), async () => {
     try {
       const r = await j('POST', '/api/v1/login', body);
@@ -353,6 +354,7 @@ async function doLogin() {
       localStorage.setItem(LS_TOKEN, r.token);
       localStorage.setItem(LS_ROLE, r.role || '');
       localStorage.setItem(LS_PROJ, r.project || '');
+      localStorage.setItem(LS_USER, r.username || '');
       $('login-pw').value = '';
       enterApp();
       toast('登录成功');
@@ -364,8 +366,9 @@ async function doLogin() {
 
 function renderSession() {
   let name = '已登录', sub = '', ch = '·';
-  if (S.role === 'admin') { name = '管理员'; sub = '全局'; ch = 'A'; }
-  else if (S.role === 'project_admin') { name = '项目管理员'; sub = S.roleProject ? '项目 ' + S.roleProject : '项目'; ch = 'P'; }
+  if (S.role === 'admin') { name = '超级管理员'; sub = '全局'; ch = 'A'; }
+  else if (S.role === 'global_admin') { name = '全局管理员'; sub = S.username ? '全局 · ' + S.username : '全局'; ch = 'G'; }
+  else if (S.role === 'project_admin') { name = '项目管理员'; sub = (S.username ? S.username + ' · ' : '') + (S.roleProject ? '项目 ' + S.roleProject : '项目'); ch = 'P'; }
   $('who-name').textContent = name;
   $('who-sub').textContent = sub;
   $('who-avatar').textContent = ch;
@@ -374,11 +377,20 @@ function renderSession() {
 function enterApp() {
   S.role = localStorage.getItem(LS_ROLE) || '';
   S.roleProject = localStorage.getItem(LS_PROJ) || '';
+  S.username = localStorage.getItem(LS_USER) || '';
   renderSession();
-  // 导航按角色过滤：项目管理员仅保留「配置管理」「审计日志」（服务端矩阵：共享/集群/管理员对 PA 一律 403）
+  // 导航按角色过滤（服务端矩阵）：
+  //   超级管理员：全部入口；
+  //   全局管理员：共享配置可见，但不能管理账号（GA/PA）与访问令牌、不能集群写；
+  //   项目管理员：共享配置隐藏（只读端点仍可用），集群只读。
+  const isSuper = S.role === 'admin';
   const isPa = S.role === 'project_admin';
-  for (const id of ['nav-shared', 'nav-admins', 'tab-tokens']) {
+  for (const id of ['nav-admins', 'nav-globaladmins', 'tab-tokens']) {
     const el = $(id);
+    if (el) el.classList.toggle('hidden', !isSuper);
+  }
+  {
+    const el = $('nav-shared');
     if (el) el.classList.toggle('hidden', isPa);
   }
   $('login-view').classList.add('hidden');
@@ -2153,7 +2165,7 @@ async function loadCluster() {
           <td class="mono">${esc(x.http_addr || '—')}</td>
           <td class="mono">${esc(x.grpc_addr || '—')}</td>
           <td>${x.is_voter ? '<span class="badge acc">voter</span>' : '<span class="badge">learner</span>'}${x.is_leader ? ' <span class="badge ok">leader</span>' : ''}</td>
-          <td class="nowrap">${S.role === 'project_admin'
+          <td class="nowrap">${S.role !== 'admin'
             ? '<span class="muted small">只读</span>'
             : (x.is_voter
               ? `<button type="button" class="btn sm ghost danger" data-act="removeNode" data-node="${esc(x.node_id)}" data-http="${esc(x.http_addr || '')}" data-raft="${esc(x.raft_addr || '')}">移除</button>`
@@ -2205,7 +2217,7 @@ actions.removeNode = function (el) {
   });
 };
 
-/* ---------- 管理员（全局管理员：全局改密 + 项目管理员账号管理） ---------- */
+/* ---------- 项目管理员（账号管理：仅超级管理员可见） ---------- */
 async function loadAdmins() {
   const sel = $('adm-project');
   if (!sel) return;
@@ -2285,7 +2297,79 @@ actions.setAdminPw = function (el) {
   });
 };
 
-/* ---------- 自助修改密码（全局管理员 / 项目管理员通用；校验当前密码） ---------- */
+
+/* ---------- 全局管理员（仅超级管理员可管理；GA 可管理全部项目配置与全部共享配置） ---------- */
+async function loadGlobalAdmins() {
+  const tbody = $('ga-body');
+  if (!tbody) return;
+  try {
+    const rows = (await j('GET', '/api/v1/admins')) || [];
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="4"><div class="empty mini"><svg class="ic"><use href="#i-admin"/></svg><h4>暂无全局管理员</h4><p>在上方表单创建；全局管理员可管理全部项目配置与共享配置，但不能管理账号与集群。</p></div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map((a) => `<tr>
+      <td class="mono">${esc(a.username)}</td>
+      <td class="muted small">${fmtTime(a.created_at)}</td>
+      <td><button type="button" class="btn sm ghost" data-act="setGlobalAdminPw" data-u="${esc(a.username)}">改密</button></td>
+      <td><button type="button" class="btn sm ghost danger" data-act="deleteGlobalAdmin" data-u="${esc(a.username)}">删除</button></td>
+    </tr>`).join('');
+  } catch (e) {
+    if (e.expired) return;
+    tbody.innerHTML = `<tr><td colspan="4" class="muted">加载失败：${esc(e.message)}</td></tr>`;
+  }
+}
+
+actions.createGlobalAdmin = async function (el) {
+  const u = $('ga-username').value.trim();
+  const p = $('ga-password').value;
+  if (!u || !p) { showErr('ga-err', '用户名 / 密码必填'); return; }
+  if (p.length < 6) { showErr('ga-err', '密码至少 6 位'); return; }
+  hideErr('ga-err');
+  await withBusy(el, async () => {
+    try {
+      await j('POST', '/api/v1/admins', { username: u, password: p });
+      toast('全局管理员已创建');
+      $('ga-username').value = ''; $('ga-password').value = '';
+      loadGlobalAdmins();
+    } catch (e) { if (!e.expired) showErr('ga-err', e.message); }
+  });
+};
+
+actions.deleteGlobalAdmin = function (el) {
+  const u = el.dataset.u;
+  openModal({
+    title: '删除全局管理员 ' + u,
+    message: '确认删除全局管理员「' + u + '」？其全部会话将一并失效；该账号对全部项目与共享配置的访问随即终止。',
+    okText: '删除', danger: true,
+    onOk: async () => {
+      try {
+        await j('DELETE', `/api/v1/admins/${encodeURIComponent(u)}`);
+        toast('已删除');
+        loadGlobalAdmins();
+      } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+    },
+  });
+};
+
+actions.setGlobalAdminPw = function (el) {
+  const u = el.dataset.u;
+  openModal({
+    title: '修改密码 · ' + u,
+    message: '为全局管理员「' + u + '」设置新密码（至少 6 位），其现有会话将失效。',
+    input: true, label: '新密码', placeholder: '至少 6 位',
+    okText: '修改',
+    onOk: async (pw) => {
+      if (!pw || pw.length < 6) { toast('密码至少 6 位', 'err'); return; }
+      try {
+        await j('PUT', `/api/v1/admins/${encodeURIComponent(u)}`, { password: pw });
+        toast('密码已修改');
+        loadGlobalAdmins();
+      } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+    },
+  });
+};
+/* ---------- 自助修改密码（超级管理员 / 全局管理员 / 项目管理员；需验证当前密码） ---------- */
 actions.openChangePw = function () {
   hideErr('pw-err');
   $('pw-current').value = ''; $('pw-new').value = ''; $('pw-new2').value = '';
@@ -2309,7 +2393,7 @@ actions.submitChangePw = async function (el) {
       $('pw-overlay').classList.add('hidden');
       // 服务端已收回全部旧会话（含当前）：清除本地会话并回登录页（不触发「会话已过期」提示）
       S.token = '';
-      localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ);
+      localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ); localStorage.removeItem(LS_USER);
       $('app').classList.add('hidden');
       $('login-view').classList.remove('hidden');
       toast('密码已修改，请重新登录');

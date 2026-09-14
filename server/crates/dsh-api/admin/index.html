@@ -56,7 +56,7 @@
     <form id="login-form" autocomplete="off" novalidate>
       <div class="field">
         <label for="login-user">用户名</label>
-        <input class="in" id="login-user" placeholder="全局管理员留空" autocomplete="username">
+        <input class="in" id="login-user" placeholder="超级管理员留空；全局管理员 / 项目管理员填写" autocomplete="username">
       </div>
       <div class="field">
         <label for="login-pw">密码</label>
@@ -65,7 +65,7 @@
       <div id="login-err" class="field-err hidden"></div>
       <button type="submit" class="btn primary block" id="login-submit">登 录</button>
     </form>
-    <p class="login-foot">项目管理员请填写用户名；令牌仅保存在本地浏览器。登录后可在左下角「修改密码」修改自己的密码。</p>
+    <p class="login-foot">全局管理员 / 项目管理员请填写用户名，超级管理员留空；令牌仅保存在本地浏览器。登录后可在左下角「修改密码」修改自己的密码。</p>
   </div>
 </div>
 
@@ -81,7 +81,8 @@
       <button type="button" class="nav-item" id="nav-shared" data-act="switchView" data-nav="shared"><svg class="ic"><use href="#i-shared"/></svg><span>共享配置</span></button>
       <button type="button" class="nav-item" data-act="switchView" data-nav="audit"><svg class="ic"><use href="#i-audit"/></svg><span>审计日志</span></button>
       <button type="button" class="nav-item" id="nav-cluster" data-act="switchView" data-nav="cluster"><svg class="ic"><use href="#i-cluster"/></svg><span>集群节点</span></button>
-      <button type="button" class="nav-item" id="nav-admins" data-act="switchView" data-nav="admins"><svg class="ic"><use href="#i-admin"/></svg><span>管理员</span></button>
+      <button type="button" class="nav-item" id="nav-globaladmins" data-act="switchView" data-nav="globaladmins"><svg class="ic"><use href="#i-admin"/></svg><span>全局管理员</span></button>
+      <button type="button" class="nav-item" id="nav-admins" data-act="switchView" data-nav="admins"><svg class="ic"><use href="#i-admin"/></svg><span>项目管理员</span></button>
     </nav>
     <div class="sidebar-foot">
       <div class="session">
@@ -307,7 +308,7 @@
                   <button type="button" class="btn primary" data-act="createToken"><svg class="ic"><use href="#i-plus"/></svg>创建令牌</button>
                 </div>
               </div>
-              <p class="hint" style="margin:0 0 10px">数据面 SDK 凭据（项目级只读）：仅全局管理员可管理；令牌仅创建时展示一次，泄露即吊销重建。</p>
+              <p class="hint" style="margin:0 0 10px">数据面 SDK 凭据（项目级只读）：仅<strong>超级管理员</strong>可管理；令牌仅创建时展示一次，泄露即吊销重建。</p>
               <div class="table-wrap">
                 <table class="table">
                   <thead><tr><th>名称</th><th>ID</th><th>创建人</th><th>创建时间</th><th>状态</th><th></th></tr></thead>
@@ -424,7 +425,7 @@
         <header class="view-head with-actions">
           <div>
             <h1>集群节点</h1>
-            <p class="view-sub">Raft 成员、角色与节点端点（项目管理员可查看端点用于 SDK 连接；管理操作仅全局管理员）</p>
+            <p class="view-sub">Raft 成员、角色与节点端点（全局管理员与项目管理员可查看端点用于 SDK 连接；管理操作仅超级管理员）</p>
           </div>
           <div class="card-actions">
             <button type="button" class="btn ghost" data-act="refreshCluster"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
@@ -433,11 +434,11 @@
         <div id="cluster-out" class="stack"></div>
       </section>
 
-      <!-- ===== 管理员（全局管理员专用） ===== -->
+      <!-- ===== 项目管理员（仅超级管理员） ===== -->
       <section id="view-admins" class="view hidden">
         <header class="view-head">
-          <h1>管理员</h1>
-          <p class="view-sub">项目管理员账号管理（仅全局管理员）；修改自己的密码请使用左下角「修改密码」入口（需验证当前密码）</p>
+          <h1>项目管理员</h1>
+          <p class="view-sub">项目管理员账号管理（仅超级管理员）；修改自己的密码请使用左下角「修改密码」入口（需验证当前密码）</p>
         </header>
         <div class="stack">
           <div class="grid-2">
@@ -468,7 +469,44 @@
             </div>
             <div class="card">
               <div class="card-head"><h3>说明</h3></div>
-              <p class="hint" style="margin:0">项目管理员可自行在左下角「修改密码」修改自己的密码（需验证当前密码，改后其全部会话失效重新登录）；全局管理员改密同样走该入口，改后全部管理员会话失效。</p>
+              <p class="hint" style="margin:0">项目管理员可自行在左下角「修改密码」修改自己的密码（需验证当前密码，改后其全部会话失效重新登录）；<strong>超级管理员</strong>改密同样走该入口，改后其全部会话失效（<strong>不影响全局管理员</strong>）；<strong>全局管理员</strong>改密走该入口，改后该账号全部会话失效。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 全局管理员（仅超级管理员） ===== -->
+      <section id="view-globaladmins" class="view hidden">
+        <header class="view-head">
+          <h1>全局管理员</h1>
+          <p class="view-sub">全局管理员账号管理（仅超级管理员）：可管理全部项目配置与全部共享配置；不能管理账号、集群写与项目访问令牌</p>
+        </header>
+        <div class="stack">
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head"><h3>全局管理员</h3></div>
+              <div class="grid-2" style="gap:0 16px">
+                <div class="field">
+                  <label for="ga-username">用户名（[A-Za-z0-9_-]{2,64}，禁用 admin）</label>
+                  <input class="in mono" id="ga-username" placeholder="如 alice">
+                </div>
+                <div class="field">
+                  <label for="ga-password">初始密码（至少 6 位）</label>
+                  <input class="in" id="ga-password" type="password" autocomplete="new-password">
+                </div>
+              </div>
+              <div id="ga-err" class="field-err hidden"></div>
+              <button type="button" class="btn" data-act="createGlobalAdmin"><svg class="ic"><use href="#i-plus"/></svg>创建全局管理员</button>
+              <div class="table-wrap" style="margin-top:14px">
+                <table class="table">
+                  <thead><tr><th>用户名</th><th>创建时间</th><th></th><th></th></tr></thead>
+                  <tbody id="ga-body"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>说明</h3></div>
+              <p class="hint" style="margin:0">全局管理员可管理<strong>全部项目</strong>的配置与<strong>全部共享配置</strong>；但不能管理账号（本页仅超级管理员可见）、不能执行集群写、不能创建/删除项目、不能管理项目访问令牌。用户名与项目管理员<strong>全局唯一</strong>（不区分大小写，如 <code>Alice</code> 与项目管理员 <code>alice</code> 互斥）。修改自己的密码请用左下角「修改密码」。</p>
             </div>
           </div>
         </div>
@@ -521,7 +559,7 @@
   </div>
 </div>
 
-<!-- ========== 修改密码（自助：全局管理员 / 项目管理员，需验证当前密码） ========== -->
+<!-- ========== 修改密码（自助：超级管理员 / 全局管理员 / 项目管理员，需验证当前密码） ========== -->
 <div id="pw-overlay" class="overlay hidden">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pw-title">
     <div class="modal-head-row">
