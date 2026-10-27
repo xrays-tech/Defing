@@ -1357,6 +1357,10 @@ components:
         is_leader: { type: boolean }
         is_voter: { type: boolean }
         committed_index: { type: integer, format: int64 }
+        # leader 观察的该目标已匹配日志 index（非 leader / 未知 → null）
+        last_applied: { type: integer, format: int64, nullable: true }
+        # lag = last_log_index − last_applied（follower 复制落后；非 leader / 未知 → null）
+        lag: { type: integer, format: int64, nullable: true }
     ProjectAdminAccount:
       type: object
       required: [username, project, created_at]

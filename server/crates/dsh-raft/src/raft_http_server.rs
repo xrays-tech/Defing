@@ -1,6 +1,6 @@
 //! Raft RPC HTTP 服务端（axum，/raft/* 端点）。
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -51,11 +51,20 @@ fn authed(
 }
 
 /// 构建 Raft RPC 路由（挂到 raft_addr 或 http_addr 均可）。
+///
+/// 32MiB body limit（F：follower 永久落后根治）：
+/// openraft 的 `InstallSnapshotRequest.data: Vec<u8>` 经 JSON 序列化数字数组膨胀约 3.1x
+/// （默认 `snapshot_max_chunk_size` = 3MiB raw → ~9.4MB JSON），而 axum 默认 body limit 仅
+/// 2MB —— 快照分块恒 413 "length limit exceeded"，follower 经 snapshot 路径无法追平。
+/// 32MiB 覆盖 3MiB raw JSON 膨胀（且本 config 降低 chunk 到 1MiB → ~3MB，四倍裕头）；
+/// /raft/* 端点已 token 鉴权（RaftServerState.token），因此放宽上限无匿名 DoS 面。
+/// layer 是中间件，applies to all routes registered so far → 三条 RPC 路由均生效。
 pub fn raft_router(state: RaftServerState) -> Router {
     Router::new()
         .route("/raft/append-entries", post(append_entries))
         .route("/raft/vote", post(vote))
         .route("/raft/install-snapshot", post(install_snapshot))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state)
 }
 

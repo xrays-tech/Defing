@@ -228,6 +228,24 @@ pub fn metrics_text(
             out.push_str("# HELP dsh_raft_committed_index 已提交日志索引\n");
             out.push_str("# TYPE dsh_raft_committed_index gauge\n");
             out.push_str(&format!("dsh_raft_committed_index {committed}\n"));
+            // leader 观察的 per-follower 复制落后（index 差）：replication 为 Some() 只在 leader。
+            // 排障入口：非零 lag 长期未下降 → 检查 snapshot RPC（413 / InstallSnapshot timeout）。
+            let last_log_index = m.last_log_index;
+            if let Some(rep) = m.replication {
+                out.push_str(
+                    "# HELP dsh_raft_replication_lag 目标节点复制落后（leader 观察，index 差）\n",
+                );
+                out.push_str("# TYPE dsh_raft_replication_lag gauge\n");
+                for (target, matched_log_id) in rep {
+                    // matched 未知（None）→ lag 不可计算，skip（Prometheus 样本需数值）
+                    let lag = replication_lag(matched_log_id.map(|l| l.index), last_log_index);
+                    if let Some(lag) = lag {
+                        out.push_str(&format!(
+                            "dsh_raft_replication_lag{{target=\"{target}\"}} {lag}\n"
+                        ));
+                    }
+                }
+            }
         }
         None => {
             out.push_str("# HELP dsh_raft_role 节点角色（0=dev-single）\n");
@@ -246,7 +264,18 @@ pub fn is_ready(raft: Option<&RaftHandle>) -> bool {
     }
 }
 
+/// 复制落后计算（纯函数，单测用）：leader 观察的 target 已匹配日志 index 与集群
+/// `last_log_index` 的差。
+/// - `matched_index = None`（非 leader / replication 无该 target / 未匹配）→ lag `None`；
+/// - `last_log_index = None`（未初始化日志）→ 兜 0，lag 为 0 或钳到 0；
+/// - matched 超前（瞬观不一致）→ `saturating_sub` 钳 0。
+pub fn replication_lag(matched_index: Option<u64>, last_log_index: Option<u64>) -> Option<u64> {
+    matched_index.map(|mi| last_log_index.unwrap_or(0).saturating_sub(mi))
+}
+
 /// 集群成员概要（/api/v1/cluster/members 数据源；members 数组对齐 openapi Member schema）。
+/// 每个 member 额外携带 leader 观察的 `last_applied`（该目标已匹配日志 index）与 `lag`
+/// （last_log_index − last_applied）；非 leader 恒 null（replication 只在 leader）。
 pub fn cluster_members_json(raft: Option<&RaftHandle>, node_id: Option<u64>) -> serde_json::Value {
     let raft = match raft {
         Some(r) => r,
@@ -262,17 +291,26 @@ pub fn cluster_members_json(raft: Option<&RaftHandle>, node_id: Option<u64>) -> 
     let m = raft.metrics().borrow().clone();
     let leader = m.current_leader;
     let voter_ids: Vec<u64> = m.membership_config.membership().voter_ids().collect();
+    // openraft: Metrics.replication 为 Some() 只在 leader，BTreeMap<NodeId, Option<LogId>>
+    let replication = m.replication;
+    let last_log_index = m.last_log_index;
     let members: Vec<serde_json::Value> = m
         .membership_config
         .membership()
         .nodes()
         .map(|(id, n)| {
+            let matched_index: Option<u64> = replication
+                .as_ref()
+                .and_then(|rep| rep.get(id).and_then(|x| *x))
+                .map(|l| l.index);
             serde_json::json!({
                 "node_id": id.to_string(),
                 "grpc_addr": n.grpc_addr,
                 "http_addr": n.http_addr,
                 "is_leader": Some(*id) == leader,
                 "is_voter": voter_ids.contains(id),
+                "last_applied": matched_index,
+                "lag": replication_lag(matched_index, last_log_index),
             })
         })
         .collect();
@@ -280,6 +318,7 @@ pub fn cluster_members_json(raft: Option<&RaftHandle>, node_id: Option<u64>) -> 
         "node_id": node_id,
         "current_leader": leader,
         "state": format!("{:?}", m.state),
+        "last_log_index": m.last_log_index,
         "members": members,
     })
 }
@@ -309,6 +348,8 @@ mod tests {
         assert!(text.contains("dsh_http_5xx_total 0"));
         // S7：会话存在性指标已移除（信息泄露 oracle）
         assert!(!text.contains("dsh_session_active"));
+        // replication lag 只在 leader（raft=None → 无样本、无 HELP/TYPE）
+        assert!(!text.contains("dsh_raft_replication_lag"));
     }
 
     #[test]
@@ -325,5 +366,31 @@ mod tests {
     #[test]
     fn ready_dev_single() {
         assert!(is_ready(None));
+    }
+
+    #[test]
+    fn replication_lag_pure() {
+        // matched 未知 → lag 未知（非 leader / 未匹配）
+        assert_eq!(replication_lag(None, Some(10)), None);
+        assert_eq!(replication_lag(None, None), None);
+        // 正常落后：last_log_index 9，target 已匹配 5 → 4
+        assert_eq!(replication_lag(Some(5), Some(9)), Some(4));
+        // 日志未初始化 → 兜 0
+        assert_eq!(replication_lag(Some(0), None), Some(0));
+        // 追平 / matched 超前（瞬观不一致）→ 钳 0
+        assert_eq!(replication_lag(Some(9), Some(9)), Some(0));
+        assert_eq!(replication_lag(Some(11), Some(9)), Some(0));
+    }
+
+    #[test]
+    fn cluster_members_dev_single() {
+        // dev-single（raft=None）：不 panic，members 空，state dev-single
+        let v = cluster_members_json(None, None);
+        assert_eq!(v["state"], "dev-single");
+        assert!(v["members"].is_array());
+        assert_eq!(v["members"].as_array().unwrap().len(), 0);
+        // 顶层字段形状保持（node_id/current_leader 为 null）
+        assert!(v["node_id"].is_null());
+        assert!(v["current_leader"].is_null());
     }
 }

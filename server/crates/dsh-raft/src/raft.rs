@@ -12,6 +12,15 @@ use crate::types::{NodeId, NodeInfo, TypeConfig};
 pub type RaftConfig = Config;
 
 /// 默认测试/联调配置（心跳 100ms、选举 300~600ms）。
+///
+/// 快照传输配套（follower 落后根治，见 raft_http_server.rs `raft_router`）：
+/// - `install_snapshot_timeout=30s`：openraft 默认 200ms 是「发送+落盘单分块」预算，1MiB
+///   分块的 JSON 传输+落盘远超 200ms → `InstallSnapshot RPC timed out`，follower 追
+///   平循环失败。30s 覆盖分块传输与磁盘落盘。
+/// - `snapshot_max_chunk_size=1MiB`：`InstallSnapshotRequest.data: Vec<u8>` 经 JSON 数字
+///   数组膨胀约 3.1x（1MiB raw ≈ 3MB JSON；默认 3MiB raw ≈ 9.4MB JSON）。配合 /raft/*
+///   body limit 32MiB 留有裕头，同时降低单块延迟与内存峰值。
+///   三值（chunk 1MiB ↔ JSON ~3MB ↔ limit 32MiB）配套关系见 dev_docs/deployment-guide.md §6.5。
 pub fn dev_config() -> RaftConfig {
     Config {
         heartbeat_interval: 100,
@@ -19,6 +28,8 @@ pub fn dev_config() -> RaftConfig {
         election_timeout_max: 600,
         max_payload_entries: 64,
         enable_tick: true,
+        install_snapshot_timeout: 30_000,
+        snapshot_max_chunk_size: 1024 * 1024,
         ..Default::default()
     }
 }

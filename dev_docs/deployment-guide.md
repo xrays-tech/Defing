@@ -319,6 +319,22 @@ curl -s -H "$AUTH" -X POST http://127.0.0.1:8384/api/v1/cluster/promote \
 3. **令牌一致性**：`--join-token`/`--raft-token` 集群内所有节点必须相同（F3/S5 强制）；
 4. 详细踩坑见 [dev_docs/defing-cluster.md](defing-cluster.md)。
 
+### 6.5 Follower 永久落后排障（snapshot RPC 与 request body limit）
+
+- **Raft RPC 有大 body（快照分块）**：追落后 follower 经 `InstallSnapshot` 分块，`data` 经 JSON
+  数字数组膨胀约 3.1x（1MiB raw ≈ 3MB JSON；3MiB raw ≈ 9.4MB JSON）。服务端已设 `/raft/*`
+  request body limit = **32MiB**（覆盖 3MiB raw 的 JSON 膨胀）；反向代理/网关（nginx
+  `client_max_body_size`、ingress、ALB 等）配置更小的 request body limit 在 raft RPC 路径后
+  snapshot 恒 HTTP 413 `length limit exceeded`，follower 经 snapshot 路径无法追平。
+- **follower 长期落后，排查顺序**：
+  1. `GET /api/v1/cluster/members` 看 per-member `lag`（= `last_log_index` − `last_applied`；
+     恒 `null` 时查询非 leader 节点——leader 观察的 replication 数据只在 leader）；
+  2. leader `/metrics` 看 `dsh_raft_replication_lag{target="<node_id>"}`；
+  3. 节点日志 grep 413 / `InstallSnapshot RPC timed out`（→ 代理 body limit 或 timeout 配置）。
+- **相关配置**（内置,`dsh-raft` `dev_config()`）:`install_snapshot_timeout = 30s`（默认
+  200ms too short,1MiB 分块传输+落盘超出 200ms budget → 追平循环失败）；
+  `snapshot_max_chunk_size = 1MiB`（→ ~3MB JSON，与 32MiB body limit 配套关系，留有裕头）。
+
 ---
 
 ## 7. 部署方式三：Docker / docker-compose
