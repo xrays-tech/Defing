@@ -2233,12 +2233,26 @@ fn verify_password(password: &str, stored: &str, legacy_salt: &str) -> bool {
     }
 }
 
+/// 账号不存在时执行一次等价 argon2 开销，抹平登录时延（防账号枚举）。
+fn verify_dummy_password(password: &str) {
+    static DUMMY_PHC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let phc =
+        DUMMY_PHC.get_or_init(|| hash_password("dsh-dummy-timing-password").unwrap_or_default());
+    let _ = verify_password(password, phc, "");
+}
+
 /// 生成盐 + 密码哈希（§2）。
 /// 新格式：PHC 字符串（盐内嵌，salt 字段置空）；旧数据仍为 sha256(salt||pw)，
 /// 校验走 verify_password legacy 分支（改密后自动升级到 argon2）。
 fn salted_password_hash(password: &str) -> Result<(String, String), dsh_core::Error> {
     let hash = hash_password(password)?;
     Ok((String::new(), hash))
+}
+
+/// NIT4：密码下限按 **Unicode 字符**而非 UTF-8 字节（CJK 密码 3 汉字 = 9 字节仍短）；
+/// 文案仍「密码至少 6 位」（= 6 位输入字符）。
+fn password_too_short(pw: &str) -> bool {
+    pw.chars().count() < 6
 }
 
 async fn create_project_admin(
@@ -2320,7 +2334,7 @@ async fn create_global_admin(
             }),
         ));
     }
-    if req.password.len() < 6 {
+    if password_too_short(&req.password) {
         return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
     }
     let now = now_ms();
@@ -2415,7 +2429,7 @@ async fn set_global_admin_password(
             }),
         ));
     }
-    if req.password.len() < 6 {
+    if password_too_short(&req.password) {
         return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
     }
     let (salt, hash) = salted_password_hash(&req.password).map_err(ApiError::from)?;
@@ -3062,6 +3076,18 @@ fn new_ga_token(username: &str, session_id: &str) -> String {
     format!("ga.{username}.{session_id}.{}", new_token())
 }
 
+/// 429 响应体（S6 登录与 M5 自助改密复用，文案原样保持与登录一致）。
+fn too_many_attempts() -> (StatusCode, Json<ApiErrorBody>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ApiErrorBody {
+            code: "ERR_TOO_MANY_ATTEMPTS".into(),
+            message: "登录尝试过多，请稍后再试".into(),
+            detail: None,
+        }),
+    )
+}
+
 async fn login(
     PeerAddr(peer): PeerAddr,
     State(app): State<ApiState>,
@@ -3073,14 +3099,7 @@ async fn login(
     // 受害 IP 锁定 DoS）。窗口 600s、窗口内失败 ≥5 即 429；进程内、按节点独立计数。
     let ip = login_throttle_key(&app, &headers, peer);
     if app.login_throttle.blocked(&ip) {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ApiErrorBody {
-                code: "ERR_TOO_MANY_ATTEMPTS".into(),
-                message: "登录尝试过多，请稍后再试".into(),
-                detail: None,
-            }),
-        ));
+        return Err(too_many_attempts());
     }
     // 账号登录分支（设计 global-admin §8）：username 非空 → **先查 GA，未命中回退 PA**
     // （D3：GA/PA 用户名互斥，故最多命中一个；两条既有路径语义都不变）。
@@ -3276,10 +3295,14 @@ async fn pa_login(
         let sm = app.sm.read().map_err(lock_err)?;
         sm.get_project_admin(&username).ok().flatten()
     };
-    let ok = account
-        .as_ref()
-        .map(|acct| verify_password(&req.password, &acct.password_hash, &acct.salt))
-        .unwrap_or(false);
+    // 未命中账号也跑一次等价 argon2（verify_dummy_password），防账号枚举时延侧信道
+    let ok = match account.as_ref() {
+        Some(acct) => verify_password(&req.password, &acct.password_hash, &acct.salt),
+        None => {
+            verify_dummy_password(&req.password);
+            false
+        }
+    };
     if !ok {
         app.login_throttle.record_failure(ip);
         app.audit
@@ -3408,6 +3431,18 @@ async fn pa_login(
                     }
                 }
             }
+            // NIT3：密码校验通过但账号被删在 write/apply 前（竞态）→ 状态机 NotFound 不得泄漏 404；
+            // 与密码错误同 401/ERR_BAD_CREDENTIALS（不记录 login_failed：密码本身正确）
+            Err(ApiError(e)) if e.kind == ErrorKind::NotFound => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiErrorBody {
+                        code: "ERR_BAD_CREDENTIALS".into(),
+                        message: "账号或密码错误".into(),
+                        detail: None,
+                    }),
+                ));
+            }
             Err(e) => return Err(e.into()),
         }
         if tokio::time::Instant::now() >= deadline {
@@ -3439,10 +3474,14 @@ async fn ga_login(
         let sm = app.sm.read().map_err(lock_err)?;
         sm.get_global_admin(&username).ok().flatten()
     };
-    let ok = account
-        .as_ref()
-        .map(|acct| verify_password(&req.password, &acct.password_hash, &acct.salt))
-        .unwrap_or(false);
+    // 未命中账号也跑一次等价 argon2（verify_dummy_password），防账号枚举时延侧信道
+    let ok = match account.as_ref() {
+        Some(acct) => verify_password(&req.password, &acct.password_hash, &acct.salt),
+        None => {
+            verify_dummy_password(&req.password);
+            false
+        }
+    };
     if !ok {
         app.login_throttle.record_failure(ip);
         app.audit
@@ -3568,6 +3607,18 @@ async fn ga_login(
                         ));
                     }
                 }
+            }
+            // NIT3：密码校验通过但账号被删在 write/apply 前（竞态）→ 状态机 NotFound 不得泄漏 404；
+            // 与密码错误同 401/ERR_BAD_CREDENTIALS（不记录 login_failed：密码本身正确）
+            Err(ApiError(e)) if e.kind == ErrorKind::NotFound => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiErrorBody {
+                        code: "ERR_BAD_CREDENTIALS".into(),
+                        message: "账号或密码错误".into(),
+                        detail: None,
+                    }),
+                ));
             }
             Err(e) => return Err(e.into()),
         }
@@ -4354,6 +4405,8 @@ async fn admin_force_logout(
                 let sm = app.sm.read().map_err(lock_err)?;
                 sm.has_global_admins().map_err(ApiError::from)?
             };
+            // 审计 scope 如实反映写入面：GA 会话同时被下时记 admin+ga（M3）
+            scope = if has_ga { "admin+ga" } else { "admin" };
             if has_ga {
                 app.write(&Command::GlobalAdminSessionsRevokeAll, now_ms())
                     .await?;
@@ -4405,16 +4458,23 @@ fn bad_current_password() -> (StatusCode, Json<ApiErrorBody>) {
 /// - PA：校验账号加盐哈希 → ProjectAdminSetPassword（apply 级联收回该账号全部会话）。
 ///
 /// 只能改自己的密码：主体取自会话扩展（中间件注入），不可由请求体伪造。
+/// M5：current_password 错按**主体**节流（key = me:{operator}，与登录同窗口 600s / 上限 5 → 429
+/// ERR_TOO_MANY_ATTEMPTS）—— 已劫会话 token 时不得在线暴力猜当前密码。
 async fn change_my_password(
     State(app): State<ApiState>,
     principal: axum::Extension<dsh_core::Principal>,
     Json(req): Json<ChangeMyPasswordReq>,
 ) -> ApiResult<serde_json::Value> {
-    if req.new_password.len() < 6 {
+    let operator = principal_op(&principal.0);
+    // 按主体节流键（super 为 "me:admin"、GA 为 "me:ga:{u}"、PA 为 "me:pa:{u}"）
+    let throttle_key = format!("me:{operator}");
+    if app.login_throttle.blocked(&throttle_key) {
+        return Err(too_many_attempts());
+    }
+    if password_too_short(&req.new_password) {
         return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
     }
     let now = now_ms();
-    let operator = principal_op(&principal.0);
     match &principal.0 {
         dsh_core::Principal::Admin => {
             let sm_pw_ok = {
@@ -4425,6 +4485,7 @@ async fn change_my_password(
                 }
             };
             if !sm_pw_ok {
+                app.login_throttle.record_failure(&throttle_key);
                 return Err(bad_current_password());
             }
             let hash = hash_password(&req.new_password).map_err(ApiError::from)?;
@@ -4459,6 +4520,7 @@ async fn change_my_password(
                 .map(|acct| verify_password(&req.current_password, &acct.password_hash, &acct.salt))
                 .unwrap_or(false);
             if !ok {
+                app.login_throttle.record_failure(&throttle_key);
                 return Err(bad_current_password());
             }
             let (salt, hash) = salted_password_hash(&req.new_password).map_err(ApiError::from)?;
@@ -4494,6 +4556,7 @@ async fn change_my_password(
                 .map(|acct| verify_password(&req.current_password, &acct.password_hash, &acct.salt))
                 .unwrap_or(false);
             if !ok {
+                app.login_throttle.record_failure(&throttle_key);
                 return Err(bad_current_password());
             }
             let (salt, hash) = salted_password_hash(&req.new_password).map_err(ApiError::from)?;
@@ -4520,6 +4583,8 @@ async fn change_my_password(
                 .await;
         }
     }
+    // M5：改密成功时按主体清空节流计数
+    app.login_throttle.reset(&throttle_key);
     Ok(Json(serde_json::json!({ "changed": true })))
 }
 
@@ -4528,7 +4593,7 @@ async fn admin_set_password(
     State(app): State<ApiState>,
     Json(req): Json<SetPasswordReq>,
 ) -> ApiResult<serde_json::Value> {
-    if req.password.len() < 6 {
+    if password_too_short(&req.password) {
         return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
     }
     let hash = hash_password(&req.password).map_err(ApiError::from)?;
@@ -4576,7 +4641,7 @@ async fn admin_reset_password(
             }),
         ));
     }
-    if req.password.len() < 6 {
+    if password_too_short(&req.password) {
         return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
     }
     let hash = hash_password(&req.password).map_err(ApiError::from)?;
@@ -5572,7 +5637,9 @@ mod ga_matrix_tests {
 mod security_tests {
     use std::time::Duration;
 
-    use super::{hash_password, verify_password, LoginThrottle};
+    use super::{
+        hash_password, password_too_short, verify_dummy_password, verify_password, LoginThrottle,
+    };
 
     #[test]
     fn throttle_blocks_after_max_failures() {
@@ -5630,6 +5697,29 @@ mod security_tests {
     }
 
     #[test]
+    fn password_length_counts_characters_not_bytes() {
+        // ASCII：按字节与按字符同结果（回归）
+        assert!(password_too_short("abcde"), "ASCII 5 字符应短");
+        assert!(!password_too_short("abcdef"), "ASCII 6 字符应 ok");
+        assert!(password_too_short(""), "空密码应短");
+        // CJK：3 汉字 = 9 UTF-8 字节但 3 字符 → 按字符计仍短（NIT4）
+        assert_eq!(
+            "一二三".len(),
+            9,
+            "3 汉字按 UTF-8 9 字节（旧按字节逻辑误判 ok）"
+        );
+        assert!(password_too_short("一二三"), "按字符 3 位应短");
+        assert!(password_too_short("一二三四五"), "按字符 5 位应短");
+        assert!(!password_too_short("一二一二一二"), "按字符 6 位应 ok");
+        // 4 字节 emoji（surrogate-free）同样按字符计
+        assert!(
+            password_too_short("😀😀😀"),
+            "3 emoji 按字节 12 但按字符 3 → 短"
+        );
+        assert!(!password_too_short("😀😀😀😀😀😀"), "6 emoji 按字符 6 → ok");
+    }
+
+    #[test]
     fn legacy_sha256_compat() {
         // 旧数据：sha256(salt || pw)，无 "$argon2" 前缀 → 走 legacy 分支
         let salt = "deadbeef00cafe00";
@@ -5639,6 +5729,19 @@ mod security_tests {
         assert!(!verify_password("wrong", &stored, salt));
         // 盐不匹配（如空盐）→ legacy 分支同样不通过
         assert!(!verify_password("old-pw", &stored, ""));
+    }
+
+    #[test]
+    fn dummy_password_pad_no_panic_and_consistent() {
+        // helper：首次调用初始化 OnceLock（dummy PHC），后续复用；错误/空密码不 panic
+        verify_dummy_password("some-pw");
+        verify_dummy_password("");
+        verify_dummy_password("dsh-dummy-timing-password");
+        // 行为一致：dummy PHC 等价 hash_password("dsh-dummy-timing-password") 语义
+        let phc = hash_password("dsh-dummy-timing-password").expect("argon2 hash");
+        assert!(phc.starts_with("$argon2"));
+        assert!(verify_password("dsh-dummy-timing-password", &phc, ""));
+        assert!(!verify_password("some-pw", &phc, ""));
     }
 
     // ---------------- F4：可信代理 CIDR 与节流键 ----------------

@@ -855,7 +855,7 @@ paths:
   # F10（P3-④ 补全）：项目管理员（PA）账号管理面（admin-only；超级管理员管理）
   /api/v1/projects/{p}/admins:
     get:
-      summary: 项目管理员账号列表（该项目的 PA；global admin 会话）
+      summary: 项目管理员账号列表（该项目的 PA；超级管理员会话）
       security: [AdminSession: []]
       parameters:
         - { $ref: '#/components/parameters/ProjectPath' }
@@ -1033,7 +1033,6 @@ components:
       required: [password]
       properties:
         password: { type: string }
-        device_id: { type: string }
         username:
           type: string
           description: 账号用户名（缺省/空 = 超级管理员）。非空时先匹配 adm/ga/{username}，未命中再匹配 adm/pa/{username}

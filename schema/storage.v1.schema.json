@@ -458,7 +458,8 @@
       "description": "管理员会话（key = sess/admin/{sid} | sess/ga/{username}/{sid} | sess/pa/{username}/{sid}）",
       "required": [
         "token_hash",
-        "issued_at"
+        "issued_at",
+        "device_id"
       ],
       "additionalProperties": false,
       "properties": {
@@ -475,7 +476,8 @@
           "description": "过期时间（墙钟 ms，API 层注入）；null = 不自动过期（--session-ttl 0）"
         },
         "device_id": {
-          "type": "string"
+          "type": "string",
+          "description": "设备标识（写入时 always 落值，MVP 固定 \"cli\"；结构字段非 Option → 旧记录缺失该键反序列化失败，故 required）"
         },
         "principal": {
           "description": "会话主体（旧数据缺省 = Admin）",

@@ -18,6 +18,8 @@ use std::time::Duration;
 use dsh_api::{build_router, ApiState};
 use dsh_core::StateMachine;
 use dsh_raft::*;
+// raft 日志读取（LogStore 经 openraft 的 reader/storage 协议 trait 才有方法）
+use dsh_raft::openraft::storage::{RaftLogReader, RaftLogStorage};
 use dsh_storage::RedbStorage;
 use dsh_watch::WatchHub;
 
@@ -25,10 +27,15 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 
 struct TestNode {
     base: String,
+    // 该节点 raft 日志 store 的 redb 句柄（raw_db 前 StateMachineStore/LogStore 各自 clone）。
+    db: dsh_raft::store::DbHandle,
 }
 
 /// 3 节点真实 raft 集群（seed 建群，全员 voter）+ 每节点完整 HTTP 路由。
-async fn start3() -> Vec<TestNode> {
+/// `join_token` 为真时注入节点 `--join-token`（`ops-secret`），开启恢复通道
+///（admin/reset-password 以 ops token 调用）——仅无 GA 的日志测试需要它；其余测试
+/// 保持 join_token 未配置（cluster/join 无 Bearer 时仍返回 428 leader-redirect，而非 401）。
+async fn start3(join_token: bool) -> Vec<TestNode> {
     let network = NetworkFactory::new();
     let mut rafts: Vec<RaftHandle> = Vec::new();
     let mut seed: BTreeMap<NodeId, NodeInfo> = BTreeMap::new();
@@ -63,7 +70,7 @@ async fn start3() -> Vec<TestNode> {
         .unwrap();
         network.register(id, raft.clone());
         rafts.push(raft.clone());
-        pending.push((id, listener, sm, raft));
+        pending.push((id, listener, sm, raft, db));
     }
     // seed 建群（与 README 推荐路径一致；所有节点传相同 map）
     for raft in &rafts {
@@ -101,8 +108,13 @@ async fn start3() -> Vec<TestNode> {
 
     // 每节点挂 HTTP（监听地址 = NodeInfo.http_addr）
     let mut nodes = Vec::new();
-    for (id, listener, sm, raft) in pending {
-        let state = ApiState::new(
+    let jt: Option<Arc<str>> = if join_token {
+        Some(Arc::from("ops-secret"))
+    } else {
+        None
+    };
+    for (id, listener, sm, raft, db) in pending {
+        let state = ApiState::with_retention(
             sm,
             WatchHub::new(),
             Some(raft),
@@ -110,6 +122,13 @@ async fn start3() -> Vec<TestNode> {
             None,
             Duration::from_secs(86400),
             "admin-pw".into(),
+            None,
+            0,
+            0,
+            // 恢复通道 ops token（仅当 join_token 为真）：reset-password 测试用;
+            // cluster/join 无 Bearer 时仍 428 leader-redirect when未配置.
+            jt.clone(),
+            Arc::new(dsh_api::TrustedProxies::empty()),
             None,
         );
         let app = build_router(state);
@@ -119,6 +138,7 @@ async fn start3() -> Vec<TestNode> {
         });
         nodes.push(TestNode {
             base: format!("http://{addr}"),
+            db,
         });
     }
     nodes
@@ -181,7 +201,7 @@ async fn cluster_view(any_base: &str, token: &str) -> (String, Vec<(String, Stri
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn write_through_follower_is_forwarded() {
-    let nodes = start3().await;
+    let nodes = start3(false).await;
     let any = &nodes[0].base;
     let token = login(any).await;
     let (leader, members) = cluster_view(any, &token).await;
@@ -228,8 +248,8 @@ async fn write_through_follower_is_forwarded() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_428_is_not_forwarded() {
-    // 反例：/api/v1/cluster/join 的 428 保持「客户端跟随」契约，不被中间件转发
-    let nodes = start3().await;
+    // 反例：/api/v1/cluster/join 的 428 保持「客户端跟随」契约,不被中间件转发
+    let nodes = start3(false).await;
     let any = &nodes[0].base;
     let token = login(any).await;
     let (leader, members) = cluster_view(any, &token).await;
@@ -264,7 +284,7 @@ async fn join_428_is_not_forwarded() {
 /// 集群下 members → 200（只读）、promote → 403、建项目 → 403。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ga_login_forwarded_with_username_and_cluster_authz() {
-    let nodes = start3().await;
+    let nodes = start3(false).await;
     let any = &nodes[0].base;
     let sup = login(any).await;
 
@@ -338,4 +358,232 @@ async fn ga_login_forwarded_with_username_and_cluster_authz() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403, "GA 不得创建项目");
+}
+
+/// 读取该节点 raft 日志，标记是否出现三个目标命令（无 GA 混合版本兼容边界断言用）。
+/// 通过节点本地 `LogStore(db.clone())` 读取：leader 的 `client_write` 在提交后同步返回
+/// 200，因此命令必在 leader 自身日志中可见（容忍 follower 复制滞后）。
+/// 返回 `(has_global_admins_revoke_all, has_multi_session_logout_all, has_admin_set_password)`。
+async fn scan_admin_log(db: dsh_raft::store::DbHandle) -> (bool, bool, bool) {
+    let mut store = dsh_raft::LogStore::new(db.clone());
+    let st = store.get_log_state().await.unwrap();
+    let start = st.last_purged_log_id.map(|l| l.index + 1).unwrap_or(1);
+    let last = st.last_log_id.map(|l| l.index).unwrap_or(0);
+    let mut has_revoke = false;
+    let mut has_logout = false;
+    let mut has_setpw = false;
+    if start <= last {
+        let entries = store.try_get_log_entries(start..=last).await.unwrap();
+        for e in entries {
+            if let dsh_raft::openraft::EntryPayload::Normal(cmd) = &e.payload {
+                match cmd {
+                    dsh_core::command::Command::GlobalAdminSessionsRevokeAll => {
+                        has_revoke = true;
+                    }
+                    dsh_core::command::Command::MultiSessionLogoutAll => {
+                        has_logout = true;
+                    }
+                    dsh_core::command::Command::AdminSetPassword { .. } => {
+                        has_setpw = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (has_revoke, has_logout, has_setpw)
+}
+
+/// 混合版本兼容承诺（设计 §11.1 / §0）：无 GA 账号时，`force-logout {}` 与
+/// `reset-password`（ops token）都不得把 `GlobalAdminSessionsRevokeAll` 写入 raft 日志——
+/// 滚动升级窗口内的旧版本节点无法 apply 该新命令，因此全 super 下线必须保持旧日志形状；
+/// 同时 `MultiSessionLogoutAll` / `AdminSetPassword` 仍应正常出现。
+/// 断言基于真实 raft 日志（leader 的 LogStore）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_ga_admin_ops_do_not_write_sessions_revoke_all() {
+    let nodes = start3(true).await;
+    let any = &nodes[0].base;
+    let sup = login(any).await; // 无 GA in cluster
+
+    // 当前 leader's own raft log store (synchronous commit at client_write return)
+    let (leader_id, members) = cluster_view(any, &sup).await;
+    let leader_base = members
+        .iter()
+        .find(|(nid, _)| nid == &leader_id)
+        .map(|(_, base)| base.clone())
+        .expect("leader member http base");
+    let leader_node = nodes
+        .iter()
+        .find(|n| n.base == leader_base)
+        .expect("leader TestNode db handle");
+
+    // 1) force-logout {} (缺省 branch: (None, None)) → 200
+    let resp = reqwest::Client::new()
+        .post(format!("{leader_base}/api/v1/admin/force-logout"))
+        .bearer_auth(&sup)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "force-logout {{}} (no GA) 应 200: {:?}",
+        resp.text().await,
+    );
+
+    let (has_revoke, has_logout, _) = scan_admin_log(leader_node.db.clone()).await;
+    assert!(
+        has_logout,
+        "force-logout {{}} 应写 MultiSessionLogoutAll (旧 log shape)"
+    );
+    assert!(
+        !has_revoke,
+        "无 GA ⇒ force-logout must not write GlobalAdminSessionsRevokeAll (mixed-version compat)",
+    );
+
+    // 2) reset-password (ops token = --join-token "ops-secret") → 200
+    let resp = reqwest::Client::new()
+        .post(format!("{leader_base}/api/v1/admin/reset-password"))
+        .bearer_auth("ops-secret")
+        .json(&serde_json::json!({"password": "newpass123"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "reset-password (ops token, no GA) 应 200: {:?}",
+        resp.text().await,
+    );
+
+    let (has_revoke, _, has_setpw) = scan_admin_log(leader_node.db.clone()).await;
+    assert!(has_setpw, "reset-password 应写 AdminSetPassword");
+    assert!(
+        !has_revoke,
+        "无 GA ⇒ reset-password must not write GlobalAdminSessionsRevokeAll (mixed-version compat)",
+    );
+}
+
+/// M2c：集群下的 GlobalAdminSessionsRevokeAll 转发+两段写覆盖——
+/// 经 follower 创建 GA（POST /admins 的 428→leader 转发 → 201）、经 follower 登录 GA（200）、
+/// 经 follower `force-logout {}`（200，428→leader 转发；leader 上 `MultiSessionLogoutAll`
+/// + `GlobalAdminSessionsRevokeAll` 两段写）；断言 GA 与 super 会话都失效（经 leader 直读），
+/// 且 leader 日志中 both commands 出现。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ga_cluster_force_logout_writes_sessions_revoke_all() {
+    let nodes = start3(false).await;
+    let any = &nodes[0].base;
+    let sup = login(any).await;
+
+    let (leader_id, members) = cluster_view(any, &sup).await;
+    let leader_base = members
+        .iter()
+        .find(|(nid, _)| nid == &leader_id)
+        .map(|(_, base)| base.clone())
+        .expect("leader member http base");
+    let follower = members
+        .iter()
+        .find(|(nid, _)| nid != &leader_id)
+        .map(|(_, base)| base.clone())
+        .expect("follower member");
+    let leader_node = nodes
+        .iter()
+        .find(|n| n.base == leader_base)
+        .expect("leader TestNode db handle");
+
+    // ① 经 follower 创建 GA：写命中 follower → 428 → 中间件透明转发到 leader → 201
+    let resp = reqwest::Client::new()
+        .post(format!("{follower}/api/v1/admins"))
+        .bearer_auth(&sup)
+        .json(&serde_json::json!({
+            "username": "ga-cluster",
+            "password": "pw12345",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "经 follower 创建 GA 应被转发成功: {:?}",
+        resp.text().await,
+    );
+
+    // ② 经 follower 登录 GA → 200， 拿 token。
+    // 与 ga_login_forwarded_with_username_and_cluster_authz 里：follower 的 GA 分派读
+    // 是**本地** sm（read_mode 默认 Stale，login 无线性读门控）；复制未跟上时
+    // 回落 pa_login → 401 ⇒ 有有界重试（避免偶发红）。
+    let mut last = (0u16, serde_json::Value::Null);
+    for _ in 0..40 {
+        let resp = reqwest::Client::new()
+            .post(format!("{follower}/api/v1/login"))
+            .json(&serde_json::json!({
+                "username": "ga-cluster",
+                "password": "pw12345",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let code = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if code == 200 {
+            last = (code, body);
+            break;
+        }
+        last = (code, body);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(last.0, 200, "经 follower 的 GA 登录应成功: {}", last.1);
+    let ga = last.1["token"].as_str().unwrap().to_string();
+
+    // ③ 经 follower force-logout {} → 428 转发 → 200（覆盖 leader 上两段写）
+    let resp = reqwest::Client::new()
+        .post(format!("{follower}/api/v1/admin/force-logout"))
+        .bearer_auth(&sup)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "经 follower force-logout {{}} 应被转发成功: {:?}",
+        resp.text().await,
+    );
+
+    // ④ 两段写失效面：GA token 与 super token 全失效（经 leader 直读，避免复制滞后）
+    let resp = reqwest::Client::new()
+        .get(format!("{leader_base}/api/v1/projects"))
+        .bearer_auth(&ga)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "force-logout {{}} 的 GA token 应失效: {:?}",
+        resp.text().await,
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("{leader_base}/api/v1/projects"))
+        .bearer_auth(&sup)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "force-logout {{}} 的连调用者自己的 super 会话应失效: {:?}",
+        resp.text().await,
+    );
+
+    // ⑤ leader 日志中 both commands 出现（leader 的 own LogStore：client_write 在 commit
+    // 后同步返回 200，命令必在 leader 自身日志中可见）
+    let (has_revoke, has_logout, _) = scan_admin_log(leader_node.db.clone()).await;
+    assert!(
+        has_revoke,
+        "GA 存在时集群下 force-logout 应写 GlobalAdminSessionsRevokeAll"
+    );
+    assert!(has_logout, "force-logout 应写 MultiSessionLogoutAll");
 }

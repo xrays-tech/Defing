@@ -458,6 +458,28 @@ async fn ga_allowed_matrix_with_gray_and_rollback() {
     .await;
     assert_eq!(c, 200, "promote: {b}");
 
+    // branch_detail（GET /projects/{p}/branches/{b}）与 structure-draft 读取的显式 GA 放行断：
+    // 不得只靠 seed_project 的隐调用面，避免 future 的 regression 里 these 两条 paths 里 lock in 200。
+    // dev 分支已 publish（seed）；structure-draft 读取 empty 时 handler 里 200 里（base_version:null）。
+    let (c, b) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p2/branches/dev",
+        Some(&ga),
+        None,
+    )
+    .await;
+    assert_eq!(c, 200, "branch_detail(GA 显 面): {b}");
+    let (c, b) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p2/structure-draft",
+        Some(&ga),
+        None,
+    )
+    .await;
+    assert_eq!(c, 200, "structure-draft(GA 显 面): {b}");
+
     // admin_config（/api/v1 的 config）与数据面渲染端点（掩码 / reveal）
     let (c, b) = req(
         &s.base,
@@ -1079,11 +1101,32 @@ async fn audit_operator_attribution_and_unfiltered_visibility() {
         Some(serde_json::json!({"key": "sk2", "type": "string", "value": {"type": "string", "str_value": "sv"}, "secret": false, "required": false}))).await;
     assert_eq!(c, 200);
 
+    // 继续以 GA token：发布共享草稿 + 删除共享项——两条写审计归因路径此前仅评审-guarded。
+    // 审计读必须发生在这两写之后（保证 shared_publish / shared_delete 条目已落）。
+    let (c, body) = req(
+        &s.base,
+        "POST",
+        "/api/v1/shared/publish",
+        Some(&ga),
+        Some(serde_json::json!({"comment": "audit-sp"})),
+    )
+    .await;
+    assert_eq!(c, 200, "GA 共享 publish: {body}");
+
+    let (c, body) = req(&s.base, "DELETE", "/api/v1/shared/sk2", Some(&ga), None).await;
+    assert_eq!(c, 204, "GA 共享 delete 应 204 (NO_CONTENT): {body}");
+
     let (_, audit) = req(&s.base, "GET", "/api/v1/audit", Some(&ga), None).await;
     let entries = audit.as_array().unwrap();
 
-    // GA 的动作用 ga:ga1 记账
-    for action in ["login", "publish", "shared_draft_update"] {
+    // GA 的动作用 ga:ga1 记账（含共享 publish / delete 归因）
+    for action in [
+        "login",
+        "publish",
+        "shared_draft_update",
+        "shared_publish",
+        "shared_delete",
+    ] {
         assert!(
             entries
                 .iter()
@@ -1167,5 +1210,172 @@ async fn password_floor_and_reserved_name() {
         )
         .await;
         assert_eq!(c, 422, "保留名 {name}: {b}");
+    }
+}
+
+// ---------------------------------------------------------------- M5
+
+/// M5: `change_my_password`(POST /api/v1/me/password) 按**主体**节流
+/// (key = `me:{operator}`: super `me:admin`、GA `me:ga:{u}`、PA `me:pa:{u}`;
+/// 窗口 600s / 上限 5 错误 → 429 `ERR_TOO_MANY_ATTEMPTS`;改密成功 → 清空计数)。
+/// 独立 `start_a` 夹具: 节流是 per-ApiState 计数,与其余测试的夹具互相不受影响。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_password_current_password_throttled_per_subject() {
+    let s = start_a().await;
+    let sup = super_login(&s.base).await;
+    assert_eq!(create_ga(&s.base, &sup, "ga1", GA_PW).await, 201);
+    let (_, b) = ga_login(&s.base, "ga1", GA_PW).await;
+    let ga = b["token"].as_str().unwrap().to_string();
+
+    // ① GA 按主体 key(me:ga:ga1):第 1..5 次错误 current_password → 401
+    for i in 1..=5 {
+        let (c, b) = req(
+            &s.base,
+            "POST",
+            "/api/v1/me/password",
+            Some(&ga),
+            Some(serde_json::json!({
+                "current_password": "wrong-pw",
+                "new_password": "newpw123",
+            })),
+        )
+        .await;
+        assert_eq!(
+            c, 401,
+            "GA 第 {i} 次错误 current_password 应 401(未达上限): {b}"
+        );
+        assert_eq!(
+            b["code"], "ERR_BAD_CREDENTIALS",
+            "GA 第 {i} 次错误 body 应 BAD_CREDENTIALS: {b}",
+        );
+    }
+
+    // ② 第 6 次(**对** current_password)→ 429:窗口内 5 错已锁(节流先于密码校验)
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        Some(&ga),
+        Some(serde_json::json!({
+            "current_password": GA_PW,
+            "new_password": "newpw123",
+        })),
+    )
+    .await;
+    assert_eq!(c, 429, "GA 第 6 次(对密码)应 429(窗口内 5 错已锁): {b}");
+    assert_eq!(
+        b["code"], "ERR_TOO_MANY_ATTEMPTS",
+        "GA 第 6 次 body 应 TOO_MANY_ATTEMPTS: {b}",
+    );
+
+    // ③ 主体隔离:PA key(me:pa:alice)未受 GA 计数 → 401(不是 429)
+    let (c, pb) = req(
+        &s.base,
+        "POST",
+        "/api/v1/login",
+        None,
+        Some(serde_json::json!({"username": "alice", "password": PA_PW})),
+    )
+    .await;
+    assert_eq!(c, 200, "PA alice 登录: {pb}");
+    let pa = pb["token"].as_str().unwrap().to_string();
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        Some(&pa),
+        Some(serde_json::json!({
+            "current_password": "wrong-pw",
+            "new_password": "newpw123",
+        })),
+    )
+    .await;
+    assert_eq!(
+        c, 401,
+        "PA 第 1 次错误应 401(GA 计数不得触 PA key,不是 429): {b}"
+    );
+    assert_eq!(
+        b["code"], "ERR_BAD_CREDENTIALS",
+        "PA 第 1 次错误 body 应 BAD_CREDENTIALS: {b}",
+    );
+
+    // super key(me:admin)同样独立 → 401(不是 429)
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        Some(&sup),
+        Some(serde_json::json!({
+            "current_password": "wrong-pw",
+            "new_password": "newpw123",
+        })),
+    )
+    .await;
+    assert_eq!(
+        c, 401,
+        "super 第 1 次错误应 401(GA 计数不得触 super key,不是 429): {b}",
+    );
+    assert_eq!(
+        b["code"], "ERR_BAD_CREDENTIALS",
+        "super 第 1 次错误 body 应 BAD_CREDENTIALS: {b}",
+    );
+
+    // ④ 改密成功清空计数(独立主体 ga2,不受上面断言影响):
+    //   4 错(未达上限)→ 对改密 200 → 后 2 错仍 401(成功已清空;否则第 2 会 429)
+    assert_eq!(create_ga(&s.base, &sup, "ga2", GA_PW).await, 201, "ga2 建");
+    let (_, b2) = ga_login(&s.base, "ga2", GA_PW).await;
+    let g2 = b2["token"].as_str().unwrap().to_string();
+    for i in 1..=4 {
+        let (c, b) = req(
+            &s.base,
+            "POST",
+            "/api/v1/me/password",
+            Some(&g2),
+            Some(serde_json::json!({
+                "current_password": "wrong-pw",
+                "new_password": "newpw123",
+            })),
+        )
+        .await;
+        assert_eq!(c, 401, "ga2 第 {i} 次错误应 401(4 错未锁): {b}");
+    }
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/me/password",
+        Some(&g2),
+        Some(serde_json::json!({
+            "current_password": GA_PW,
+            "new_password": "pw999999",
+        })),
+    )
+    .await;
+    assert_eq!(c, 200, "ga2 4 错 + 对改密应 200(未达上限): {b}");
+    assert_eq!(b["changed"], true, "ga2 改密 body 应 changed=true: {b}");
+
+    // 改密即重登: ga2 旧会话失效
+    let (c, _) = req(&s.base, "GET", "/api/v1/projects", Some(&g2), None).await;
+    assert_eq!(c, 401, "ga2 改密后旧会话应失效");
+
+    // 重新登录(新口令)+ 第 1..2 次错误 → 2 应 401(成功已清空计数)
+    let (c, b) = ga_login(&s.base, "ga2", "pw999999").await;
+    assert_eq!(c, 200, "ga2 改密后新口令登录: {b}");
+    let g3 = b["token"].as_str().unwrap().to_string();
+    for i in 1..=2 {
+        let (c, b) = req(
+            &s.base,
+            "POST",
+            "/api/v1/me/password",
+            Some(&g3),
+            Some(serde_json::json!({
+                "current_password": "wrong-pw",
+                "new_password": "newpw123",
+            })),
+        )
+        .await;
+        assert_eq!(
+            c, 401,
+            "改密成功后第 {i} 次错误应 401(成功已清空计数,不是 429): {b}",
+        );
     }
 }
