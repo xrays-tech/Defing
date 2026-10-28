@@ -23,5 +23,5 @@ pub use snapshot_stream::{
     check_total, decode_frame, encode_frame, ChunkWriter, Crc32, Frame, FrameDecoder, FrameEmitter,
     SnapshotProtoError, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, MAX_SNAPSHOT_BYTES,
 };
-pub use store::{LogStore, StateMachineStore};
+pub use store::{sweep_snapshot_payloads, LogStore, StateMachineStore};
 pub use types::{NodeId, NodeInfo, TypeConfig};

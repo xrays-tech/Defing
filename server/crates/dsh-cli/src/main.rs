@@ -955,13 +955,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         raft_addr: cli.raft_addr.clone(),
     };
     let network = HttpNetworkFactory::with_token(Some(raft_token.clone()));
+    // 启动断点（不改语义）：把 dev_config() 结果局部 bind + 打印实际生效 Raft 配置（与 main
+    // 同格式，0.10 字段 superset）。stress harness (scripts/stress/leader_storm.py) 对每个
+    // 节点解析这条行后启动并断言值 == dsh-raft raft.rs dev_config() 预期——陈旧 binary /
+    // 配置漂移直接 detect，任何「heartbeat 100ms / install_snapshot_timeout 30s」结论
+    // 对应实际运行配置。cluster_name 打印 openraft Config 默认（dev_config 未覆盖 → "foo"）。
+    let raft_cfg = dsh_raft::dev_config();
+    tracing::info!(
+        "raft config: heartbeat_interval={} election_timeout_min={} election_timeout_max={} max_payload_entries={} enable_pre_vote={} enable_tick={} install_snapshot_timeout={} snapshot_max_chunk_size={} cluster_name={}",
+        raft_cfg.heartbeat_interval,
+        raft_cfg.election_timeout_min,
+        raft_cfg.election_timeout_max,
+        raft_cfg.max_payload_entries,
+        raft_cfg.enable_pre_vote.unwrap_or(false),
+        raft_cfg.enable_tick,
+        raft_cfg.install_snapshot_timeout,
+        raft_cfg.snapshot_max_chunk_size,
+        raft_cfg.cluster_name,
+    );
     let raft = dsh_raft::new_raft_node(
         node_id,
         node_info.clone(),
         log_store,
         sm_store,
         &network,
-        dsh_raft::dev_config(),
+        raft_cfg,
     )
     .await?;
 

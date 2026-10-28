@@ -18,7 +18,10 @@ Usage (thin wrapper scripts/stress-leader-storm.sh):
   leader_storm.py [--profile quick|storm|extreme] [--bin PATH] [--keep]
                   [--nodes N] [--workers W] [--duration S] [--leader-kills N]
                   [--snapshot-writes N] [--value-bytes N] [--seed N]
-                  [--catchup-timeout S]
+                  [--catchup-timeout S] [--chaos-during-snapshot]
+
+--chaos-during-snapshot: churn 并发 — 1-2 leader SIGKILL/SIGSTOP-freeze 事件注入 WHILE the
+catch-up victim is behind; invariant: victim campaigns 0x, lag still → numeric 0.
 
 Default profile = storm.
 """
@@ -36,6 +39,7 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+
 
 # module-level shared state (set in main(); helpers reference one instance)
 from typing import Any  # noqa: E402
@@ -67,13 +71,67 @@ PROFILES = {
 # Concrete failure signatures for the snapshot-body-limit / RPC-timeout bug.
 # A bare "413" substring collides with raft log indices (T2-N4-413 etc), so we match the
 # strings the components actually emit:
-#   - "length limit exceeded"   = axum DefaultBodyLimit 413 on /raft/* (raft_http_server.rs:66)
-#   - "installsnapshot rpc timed out" = openraft InstallSnapshot timeout (raft.rs header note)
+#   - "length limit exceeded"   = axum DefaultBodyLimit 413 on /raft/* (raft_http_server.rs)
+#   - "installsnapshot rpc timed out" = openraft 0.9 InstallSnapshot timeout (0.9-era note)
 # plus hard-crash markers panic/fatal.
-FORBIDDEN = ("panic", "fatal", "length limit exceeded", "installsnapshot rpc timed out")
+# 0.10 additions (streaming/msgpack stack — emitted ONLY on failure by dsh-raft):
+#   - "msgpack decode"/"msgpack encode"  = raft rpc / snapshot frame codec failure
+#     (raft_http_server.rs "raft rpc msgpack decode failed", snapshot_stream.rs proto_err)
+#   - "crc mismatch"       = full-snapshot stream end-crc guard fired (wire corruption)
+#   - "frame too large"    = snapshot_stream FrameDecoder MAX_FRAME_BYTES guard
+#   - "snapshot too large" = snapshot_stream check_total MAX_SNAPSHOT_BYTES budget guard
+#   - "full_snapshot"      = 0.9 JSON InstallSnapshot identifier — must be gone on 0.10
+#     (0.10 route/identifier is full-snapshot with hyphen; underscore form = stale 0.9 code)
+#   - "soft_ttl"           = 0.9-era Config field name — must be gone on 0.10 (0.10 wires
+#     RPCOption budgets in-network, never logs this token)
+FORBIDDEN = (
+    "panic",
+    "fatal",
+    "length limit exceeded",
+    "installsnapshot rpc timed out",
+    "msgpack decode",
+    "msgpack encode",
+    "crc mismatch",
+    "frame too large",
+    "snapshot too large",
+    "full_snapshot",
+    "soft_ttl",
+)
+
+# 0.10 openraft election-start markers (INFO level, raft_core.rs: "trigger election"
+# line 2238, "a quorum would grant the vote; starting a real election"; 0.9-era
+# "election timeout passed" kept for back-compat diagnosis). Used for
+# interrupted-by-election + victim-0-election assertions (NOT a FORBIDDEN token —
+# elections are normal chatter elsewhere).
+ELECTION_MARKERS = (
+    "trigger election",
+    "starting a real election",
+    "election timeout passed",
+)
 
 # login/healthz 免 Bearer; 其余 /api/v1 需 Bearer
 # data-plane /v1/... 需 session 或 project token (admin session 覆盖全项目 → 可读 config)
+
+
+# 启动参数断点: dsh-cli main.rs prints the EFFECTIVE Raft config once per node startup
+# ("raft config: heartbeat_interval=... install_snapshot_timeout=... ..."), and the harness
+# parses + asserts it equals the dsh-raft raft.rs dev_config() expectations below.
+# Any "heartbeat 100ms / InstallSnapshot 30s" conclusion therefore maps to the config that
+# ACTUALLY ran (stale binary / drifted config → exit 2, no silent green run).
+# cluster_name is NOT overridden by dev_config() → openraft Config default "foo".
+# 0.10 superset: dev_config also pins enable_pre_vote=Some(true) + enable_tick=true
+# (P3a-C1 pre_vote before append); booleans compare as lowercase "true" strings.
+EXPECTED_RAFT_CONFIG = {
+    "heartbeat_interval": 100,
+    "election_timeout_min": 300,
+    "election_timeout_max": 600,
+    "max_payload_entries": 64,
+    "install_snapshot_timeout": 30_000,      # ms
+    "snapshot_max_chunk_size": 1024 * 1024,  # 1 MiB raw
+    "cluster_name": "foo",
+    "enable_pre_vote": "true",
+    "enable_tick": "true",
+}
 
 
 def log(msg):
@@ -316,6 +374,69 @@ def wait_healthz(node, timeout):
     return False
 
 
+# ---------------------------------------------------------------- raft config assertion (启动参数断点)
+
+
+def raft_config_from_log(node):
+    """Parse the LAST "raft config:" line in the node log (restart/rejoin re-emits it).
+
+    dsh-cli main.rs logs the effective openraft Config after Raft::new wiring:
+      raft config: heartbeat_interval=100 election_timeout_min=300 ... cluster_name=foo
+    Returns dict[str,str] or None (missing line = pre-断点 binary → stale binary signal).
+    """
+    found = None
+    try:
+        with open(node.log_path, "rb") as f:
+            for line in f.read().decode("utf-8", "replace").splitlines():
+                if "raft config:" in line:
+                    found = line
+    except OSError:
+        return None
+    if found is None:
+        return None
+    kv = {}
+    for part in found.split("raft config:", 1)[1].split():
+        if "=" in part:
+            k, v = part.split("=", 1)
+            kv[k] = v
+    return kv if kv else None
+
+
+def assert_raft_config(nodes):
+    """Every node's log must carry a raft-config line matching dev_config() exactly.
+
+    Mismatch or missing line → caller exits 2 (启动失败 class): never validate semantics
+    under an unknown/unverifiable Raft configuration.
+    """
+    ok = True
+    for n in nodes:
+        got = raft_config_from_log(n)
+        if got is None:
+            log("FAIL: node %d log has no 'raft config:' line "
+                "(binary predates the config 断点 or logged elsewhere — rebuild)" % n.node_id)
+            ok = False
+            continue
+        bad = []
+        for k, exp in EXPECTED_RAFT_CONFIG.items():
+            v = got.get(k)
+            if v is None:
+                bad.append("%s missing" % k)
+            elif str(exp) != v:
+                bad.append("%s=%s != expected %s" % (k, v, exp))
+        if bad:
+            log("FAIL: node %d raft config mismatch: %s (expected %s)"
+                % (n.node_id, ", ".join(bad), EXPECTED_RAFT_CONFIG))
+            ok = False
+        else:
+            log("  raft config断点 ok node %d: hb=%s election=%s..%s payload=%s "
+                "install_snapshot_timeout=%s chunk=%s cluster_name=%s"
+                % (n.node_id, got["heartbeat_interval"],
+                   got["election_timeout_min"], got["election_timeout_max"],
+                   got["max_payload_entries"], got["install_snapshot_timeout"],
+                   got["snapshot_max_chunk_size"], got["cluster_name"]))
+    return ok
+
+
 # ---------------------------------------------------------------- stats (thread-safe)
 
 
@@ -331,6 +452,7 @@ class Stats:
         self.follower_kills = 0
         self.freeze_count = 0
         self.observed_leader_changes = 0
+        self.snapshot_chaos_injections = 0
         self.per_node = {n.node_id: 0 for n in nodes}
 
     def bump(self, attr, node_id=None, n=1):
@@ -374,7 +496,10 @@ def read_config(node, token, project):
     data = r["data"]
     if not isinstance(data, dict):
         return None
-    groups = data.get("groups") or {}
+    # 数据面 render (dsh-render Renderer→plain_tree) 顶层 = group→{key:value}，
+    # 旧 harness 期望 {"groups": ...} 外壳（管理面 shape）→ 顶层 shape 时 val 恒 None
+    # → catch-up gate 永不 settle (harness parse bug, not product). Accept both shapes.
+    groups = data.get("groups") or data
     val = None
     gv = groups.get("g")
     if isinstance(gv, dict):
@@ -705,6 +830,34 @@ class Chaos:
 # ---------------------------------------------------------------- snapshot catch-up phase
 
 
+def _sample_lag_points(points, max_pts=100):
+    """截断/采样 lag 轨迹 for summary+JSON: head 10 + tail 40 exact, middle stride-sampled."""
+    if len(points) <= max_pts:
+        return list(points)
+    head, tail = points[:10], points[-40:]
+    mid = points[10:-40]
+    room = max(1, max_pts - len(head) - len(tail))
+    step = max(1, len(mid) // room)
+    return head + mid[::step][:room] + tail
+
+
+def describe_lag_trend(points):
+    """Classify the lag time series: constant-stuck (活锁) vs slow descent vs divergence."""
+    if not points:
+        return "no numeric lag observations"
+    lags = [p[1] for p in points]
+    first, last = lags[0], lags[-1]
+    span = points[-1][0] - points[0][0]
+    if len(set(lags)) == 1:
+        return ("constant at %d across %.1fs (恒定不动 — 活锁: InstallSnapshot 未推进 matched index)"
+                % (first, span))
+    if last < first:
+        rate = (first - last) / span if span > 0 else float("inf")
+        return ("decreasing %d → %d over %.1fs (缓慢下降 ~%.1f entries/s — 追赶但未 settled)"
+                % (first, last, span, rate))
+    return ("increasing/diverging %d → %d over %.1fs (追-up 落后 grow)" % (first, last, span))
+
+
 def snapshot_phase(args, stats, token, rng):
     """非常规重点: kill a follower (keep down) → bulk writes to exceed snapshot_policy →
     restart follower → it must catch up via InstallSnapshot (not 413 / timed out).
@@ -788,12 +941,70 @@ def snapshot_phase(args, stats, token, rng):
                 break
             time.sleep(0.3)
 
-    # 4. restart the killed follower NOW → large log gap → must catch up via InstallSnapshot
+    # 4. restart the killed follower NOW → large log gap → must catch up via full-snapshot
+    #    (0.10: InstallSnapshot == SendFullSnapshot RPC → /raft/full-snapshot streaming)
+    victim_restart_offset = os.path.getsize(victim.log_path) if os.path.exists(victim.log_path) else 0
     with CLUSTER.lock:
         victim.spawn(CLUSTER.seed_map)
-    log("  restarted victim node %d (catch-up must use InstallSnapshot)" % victim_id)
+    log("  restarted victim node %d (catch-up must use full-snapshot)" % victim_id)
     if not wait_healthz(victim, 25):
         log("  WARN: victim healthz timeout after restart")
+
+    # --chaos-during-snapshot (churn 并发): SIGKILL or SIGSTOP-freeze the CURRENT leader 1-2x
+    # WHILE the victim is still behind. The victim must NEVER campaign (0 elections) and its
+    # lag must still descend to numeric 0 under leadership churn.
+    chaos_schedule = []
+    if args.chaos_during_snapshot:
+        n_ev = rng.choice([1, 2])
+        t_ev = rng.uniform(2.0, 5.0)
+        for _ in range(n_ev):
+            chaos_schedule.append(t_ev)
+            t_ev += rng.uniform(4.0, 9.0)
+        log("  chaos-during-snapshot: %d leader kill/freeze 事件 @ t+%s"
+            % (n_ev, [round(x, 1) for x in chaos_schedule]))
+
+    def current_leader_obj():
+        # majority-vote live leader (Chaos.track_leader_change pattern): chaos kills the pinned
+        # leader mid-catch-up → lag polling must follow the NEW leader.
+        vals = []
+        for n in CLUSTER.live():
+            lid, _ = cluster_leader_id(n)
+            if lid is not None:
+                vals.append(lid)
+        if not vals:
+            return None
+        lid = max(set(vals), key=vals.count)
+        n = CLUSTER.by_id(lid)
+        return n if (n and n.alive()) else None
+
+    def snapshot_chaos_once(kind_note):
+        leader_n = current_leader_obj()
+        if leader_n is None or CLUSTER.live_count() < 4:
+            log("  snapshot chaos skipped (%s): no live leader / live<4" % kind_note)
+            return None
+        kind = rng.choice(["kill", "freeze"])
+        if kind == "kill":
+            with CLUSTER.lock:
+                leader_n.kill()
+            stats.bump("leader_kills")
+            stats.bump("snapshot_chaos_injections")
+            log("  snapshot chaos: leader %d SIGKILL @ catchup+t%.1fs"
+                % (leader_n.node_id, time.time() - catchup_t0))
+            time.sleep(rng.uniform(0.3, 1.0))
+            with CLUSTER.lock:
+                leader_n.spawn(CLUSTER.seed_map)
+            wait_healthz(leader_n, 25)
+        else:
+            with CLUSTER.lock:
+                leader_n.stop_freeze()
+            stats.bump("freeze_count")
+            stats.bump("snapshot_chaos_injections")
+            log("  snapshot chaos: leader %d SIGSTOP @ catchup+t%.1fs"
+                % (leader_n.node_id, time.time() - catchup_t0))
+            time.sleep(rng.uniform(1.0, 3.0))
+            with CLUSTER.lock:
+                leader_n.resume_freeze()
+        return kind
 
     # 5. poll leader members: victim lag → NUMERIC 0, AND snapshot project config == leader's.
     #    config-equal-but-lag-null is NOT catch-up: lag==null means the victim's matched index
@@ -803,9 +1014,18 @@ def snapshot_phase(args, stats, token, rng):
     catchup_seconds = None
     max_lag = None          # only numeric lag observations update it; None is NOT "0"
     lag_values = []         # every numeric victim lag observed (for summary/diagnosis)
+    lag_points = []         # (t_rel_from_catchup_start, lag) time series → lag_trajectory
     lag_none_seen = False   # victim lag reported null at least once
+    chaos_done = []
+    cfg_gate_diag = 0       # first few lag==0-but-gate-fail reasons (diagnosis only)
     while time.time() - catchup_t0 < args.catchup_timeout:
+        # fire scheduled churn injections while lag not settled
+        while chaos_schedule and time.time() - catchup_t0 >= chaos_schedule[0]:
+            if catchup_seconds is None and (max_lag is None or max_lag > 0):
+                chaos_done.append(snapshot_chaos_once("scheduled"))
+            chaos_schedule.pop(0)
         victim_lag = None
+        leader = current_leader_obj() or leader
         md = members(leader.http_base(), None) if leader else None
         if md:
             for m in md.get("members", []):
@@ -816,6 +1036,7 @@ def snapshot_phase(args, stats, token, rng):
                             lag_none_seen = True
                     else:
                         lag_values.append(int(lag))
+                        lag_points.append((round(time.time() - catchup_t0, 2), int(lag)))
                         max_lag = int(lag) if max_lag is None else max(max_lag, int(lag))
                         victim_lag = int(lag)
                     break
@@ -826,23 +1047,49 @@ def snapshot_phase(args, stats, token, rng):
             if lc and vc and lc.get("value") and lc.get("value") == vc.get("value"):
                 catchup_seconds = time.time() - catchup_t0
                 break
+            elif cfg_gate_diag < 3:
+                # why the gate refuses to settle despite lag==0: which side unreadable,
+                # or value mismatch (len+tail) — distinguishes harness/transport vs state.
+                cfg_gate_diag += 1
+                probe = http_get(leader.http_base() if leader else victim.http_base(),
+                                 token,
+                                 "/v1/projects/%s/branches/%s/config?format=json"
+                                 % (projects[0], BRANCH), timeout=10.0)
+                log("  diag cfg-gate: leader=%s lc=%s vc=%s tailL=%r tailV=%r probe=%r/%r/%r"
+                    % ((leader.node_id if leader else None),
+                       (None if lc is None else repr(sorted(lc.keys()))),
+                       (None if vc is None else repr(sorted(vc.keys()))),
+                       (None if not lc or not lc.get("value") else lc["value"][-24:]),
+                       (None if not vc or not vc.get("value") else vc["value"][-24:]),
+                       probe["status"], probe.get("err"), str(probe.get("data"))[:160]))
         time.sleep(0.4)
 
     # 6. interrupted-by-election diagnostic (a failure EXPLANATION, not a FORBIDDEN token —
-    #    "election timeout passed" is normal chatter otherwise). If the victim repeatedly started
-    #    an election while a snapshot was arriving, the transfer was interrupted.
-    interrupted_by_election = False
+    #    campaigning is normal chatter otherwise). If the victim repeatedly started an election
+    #    while a snapshot was arriving, the transfer was interrupted.
+    #    0.10 INFO markers: "trigger election" / "starting a real election" (raft_core/engine);
+    #    0.9 wording "election timeout passed" kept for back-compat. Snapshot arrival marker
+    #    0.10: "install full snapshot" (following_handler) / legacy "installsnapshot".
     try:
         with open(victim.log_path, "rb") as f:
+            f.seek(victim_restart_offset)  # only THIS restart's output
             vblob = f.read().decode("utf-8", "replace").lower()
     except OSError:
         vblob = ""
-    if ("election timeout passed" in vblob) and ("received snapshot" in vblob or "installsnapshot" in vblob):
-        interrupted_by_election = True
+    victim_elections = sum(vblob.count(tok) for tok in ELECTION_MARKERS)
+    if victim_elections > 0:
+        snapshot_elect = ("install full snapshot" in vblob) or ("installsnapshot" in vblob)
+        interrupted_by_election = snapshot_elect
+    else:
+        interrupted_by_election = False
 
     return {"victim_id": victim_id, "catchup_seconds": catchup_seconds,
             "max_lag": max_lag, "lag_none_seen": lag_none_seen, "lag_values": lag_values,
+            "lag_points": lag_points,
+            "lag_trajectory": _sample_lag_points(lag_points),
             "interrupted_by_election": interrupted_by_election,
+            "victim_elections": victim_elections,
+            "snapshot_chaos_injections": len(chaos_done),
             "bulk_seconds": bulk_seconds, "leader_node": leader,
             "projects": projects}, victim
 
@@ -990,9 +1237,10 @@ def validate_final(args, token, writers, snapshot_info, errors):
         cs = snapshot_info.get("catchup_seconds")
         if cs is None:
             errors.append("follower catch-up not reached: victim lag never settled to numeric 0 "
-                          "within %ss (lag_none_seen=%s, max_lag=%s)"
+                          "within %ss (lag_none_seen=%s, max_lag=%s; %s)"
                           % (args.catchup_timeout, snapshot_info.get("lag_none_seen"),
-                             snapshot_info.get("max_lag")))
+                             snapshot_info.get("max_lag"),
+                             describe_lag_trend(snapshot_info.get("lag_points") or [])))
         elif cs >= args.catchup_timeout:
             errors.append("catch_up_seconds %s >= timeout %s" % (cs, args.catchup_timeout))
         if snapshot_info.get("max_lag") is None and snapshot_info.get("lag_none_seen"):
@@ -1001,14 +1249,24 @@ def validate_final(args, token, writers, snapshot_info, errors):
             errors.append("snapshot transfer interrupted by election timeout (victim repeatedly "
                           "campaigned during InstallSnapshot); see node %s log"
                           % snapshot_info.get("victim_id"))
+        # P3 churn 并发 invariant: the catch-up victim (a follower being full-snapped, incl.
+        # under --chaos-during-snapshot leader kills/freezes) must NEVER campaign itself.
+        # victim_elections counts ELECTION_MARKERS in the victim log since its catch-up restart.
+        if snapshot_info.get("victim_elections", 0) > 0:
+            errors.append("victim node %s started %d election(s) during catch-up (expect 0 — "
+                          "catch-up victim must stay follower even while leader churns)"
+                          % (snapshot_info.get("victim_id"),
+                             snapshot_info.get("victim_elections")))
         if snapshot_info["victim_id"] is not None:
             vid = snapshot_info["victim_id"]
             with open(CLUSTER.by_id(vid).log_path, "rb") as f:
                 blob = f.read().decode("utf-8", "replace").lower()
-            for tok in ("length limit exceeded", "installsnapshot rpc timed out"):
+            for tok in ("length limit exceeded", "installsnapshot rpc timed out",
+                        "msgpack decode", "msgpack encode", "crc mismatch",
+                        "frame too large", "snapshot too large"):
                 if tok in blob:
-                    errors.append("victim node %d log shows %r (snapshot catch-up regression)" % (vid, tok))
-
+                    errors.append("victim node %d log shows %r (snapshot catch-up regression)"
+                                  % (vid, tok))
 
 def _cfg_version(cfg):
     return cfg.get("version")
@@ -1030,6 +1288,10 @@ def parse_args():
     p.add_argument("--value-bytes", type=int, default=60000)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--catchup-timeout", type=float, default=60.0)
+    p.add_argument("--chaos-during-snapshot", action="store_true",
+                   default=os.environ.get("CHAOS_DURING_SNAPSHOT", "0") in ("1", "true", "yes"),
+                   help="churn 并发: inject 1-2 leader kill/freeze while the victim is catching "
+                        "up via full-snapshot (victim must stay follower: 0 elections)")
     return p.parse_args()
 
 
@@ -1083,6 +1345,9 @@ def main():
                     log("  boot fail node %d; log tail:" % n.node_id)
                     for line in n.tail(30):
                         log("    " + line)
+            return 2
+        # 启动参数断点: 每个节点 log 的 effective Raft config must equal dev_config()
+        if not assert_raft_config(node_objs):
             return 2
         # login once (login 免 Bearer; auto-forwards to leader)
         tok_data = None
@@ -1205,12 +1470,18 @@ def main():
             "follower_kills": STATS.follower_kills,
             "snapshot_catchup_seconds": (snapshot_info or {}).get("catchup_seconds"),
             "max_lag": (snapshot_info or {}).get("max_lag"),
+            # (t_rel_since_catchup_start, victim lag) sampled; null for quick/no-snapshot
+            "lag_trajectory": (snapshot_info or {}).get("lag_trajectory"),
             "per_node_requests": STATS.per_node,
         }
         # only meaningful when the snapshot catch-up phase actually ran (not quick)
         if snapshot_info is not None:
             summary["victim_lag_none_seen"] = bool(snapshot_info.get("lag_none_seen"))
             summary["snapshot_interrupted_by_election"] = bool(snapshot_info.get("interrupted_by_election"))
+            # P3 churn 并发: victim must campaign 0x even under leader kill/freeze injections
+            summary["chaos_during_snapshot"] = bool(args.chaos_during_snapshot)
+            summary["victim_elections_during_catchup"] = snapshot_info.get("victim_elections")
+            summary["snapshot_chaos_injections"] = snapshot_info.get("snapshot_chaos_injections")
         log("== SUMMARY ==")
         for k, v in summary.items():
             log("  %-24s %s" % (k + ":", v))
@@ -1224,8 +1495,19 @@ def main():
         # one-line JSON
         log("JSON " + json.dumps({"ok": not errors, **summary}, ensure_ascii=False))
 
-        # failure → print victim/leader tails
+        # failure → print lag trajectory tail (distinguish 活锁 constant-stuck vs slow descent)
+        # then victim/leader tails
         if errors:
+            if snapshot_info is not None:
+                pts = snapshot_info.get("lag_points") or []
+                if pts:
+                    log("--- victim %s lag 轨迹: last %d of %d points ---"
+                        % (snapshot_info.get("victim_id"), min(10, len(pts)), len(pts)))
+                    for t, lag in pts[-10:]:
+                        log("  t=%6.2fs lag=%s" % (t, lag))
+                    log("  trend: " + describe_lag_trend(pts))
+                else:
+                    log("--- victim lag: no numeric observations (lag stayed null) ---")
             for n in node_objs:
                 if any(("node %d " % n.node_id) in e for e in errors):
                     log("--- node %d log tail ---" % n.node_id)

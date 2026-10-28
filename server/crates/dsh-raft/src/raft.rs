@@ -14,20 +14,31 @@ pub type RaftConfig = Config;
 
 /// 默认测试/联调配置（心跳 100ms、选举 300~600ms）。
 ///
-/// 快照传输配套（follower 落后根治，见 raft_http_server.rs `raft_router`）：
-/// - `install_snapshot_timeout=30s`：openraft 默认 200ms 是「发送+落盘单分块」预算，1MiB
-///   分块的 JSON 传输+落盘远超 200ms → `InstallSnapshot RPC timed out`，follower 追
-///   平循环失败。30s 覆盖分块传输与磁盘落盘。
-/// - `snapshot_max_chunk_size=1MiB`：`InstallSnapshotRequest.data: Vec<u8>` 经 JSON 数字
-///   数组膨胀约 3.1x（1MiB raw ≈ 3MB JSON；默认 3MiB raw ≈ 9.4MB JSON）。配合 /raft/*
-///   body limit 32MiB 留有裕头，同时降低单块延迟与内存峰值。
-///   三值（chunk 1MiB ↔ JSON ~3MB ↔ limit 32MiB）配套关系见 dev_docs/deployment-guide.md §6.5。
+/// AppendEntries 批量预算（P3a-C1，release 档 measurements，compat report §13）:
+/// - msgpack wire ≈ stored-JSON bytes 1.00x（0.10 binary RPC，P2b1）；64 entries × 60 KiB
+///   值 = 3.67 MiB wire、redb append+fsync ≈5ms（release）→ `max_payload_entries=64` 保持
+///   (entry count 是 practical bound at current entry sizes；I/O never dominates);
+/// - store 层 `MAX_BATCH_BYTES=6MiB`（`limited_get_log_entries` byte cap）chops
+///   pathological fat-entry batches（e.g. 1 MiB-value entries → ~6 per RPC）;
+/// - `enable_pre_vote=Some(true)`:leader 先 pre_vote RPC（0.10 default 关闭），fewer
+///   wasted appends/network roundtrips when leadership moves。
+///
+/// 快照传输配套（follower 落后根治，P2b2 streaming，see raft_http_server.rs `raft_router`）:
+/// - `install_snapshot_timeout=30s`：覆盖 streamed msgpack frames 分块传输 + 磁盘落盘
+///   （openraft 默认 200ms single-chunk budget 远低于 follower catch-up 需要）；
+/// - `snapshot_max_chunk_size=1MiB`：网络层 clamps frame payload ≤1MiB（snapshot_stream
+///   MAX_CHUNK_BYTES）；body 是 msgpack frames（旧 0.9 JSON 数字数组 ~3.1x 膨胀已 resolved
+///   by streaming；/raft/* 32MiB body limit now only guards frame framing —
+///   dev_docs/deployment-guide.md §6.5 updated accordingly）。
 pub fn dev_config() -> RaftConfig {
     Config {
         heartbeat_interval: 100,
         election_timeout_min: 300,
         election_timeout_max: 600,
         max_payload_entries: 64,
+        // (P3a-C1) pre_vote before append — openraft 0.10 default (None→false) wastes
+        // appends to stale leaders; 60 KiB fat entries make the roundtrips expensive.
+        enable_pre_vote: Some(true),
         enable_tick: true,
         install_snapshot_timeout: 30_000,
         snapshot_max_chunk_size: 1024 * 1024,

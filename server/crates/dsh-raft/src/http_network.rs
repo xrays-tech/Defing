@@ -5,16 +5,22 @@
 //! dev_docs/research/openraft-010-compat.md（option.soft_ttl/snapshot_chunk_size 消费网络实现方）。
 //! P2b1: append_entries/vote/pre_vote 使用 MessagePack（Content-Type: application/msgpack,
 //! rmp_serde 边界 encode/decode, per-request timeout = RPCOption::soft_ttl()）;
+//! 编码为 **named** 结构（`to_vec_named`，structs→map）：positional 数组编码与 model.rs
+//! `skip_serializing_if` Option 字段（AuditEntry.version/request_id 等）desync 解码（P3a-C2
+//! 实 0.9 数据 reproduced: "wrong msgpack marker FixMap(3)"）。
 //! factory 三段独立连接池 new_client/new_heartbeat_client/new_snapshot_client
 //!（HTTP/1.1 无 multiplex，pool 隔离避免 replication/snapshot head-of-line blocking）。
 //! P2b2: full_snapshot 经流式 msgpack 帧（snapshot_stream.rs：Header/Chunk/End）.
-//! 说明：错误以 Network 变体返回（retry/backoff 由 openraft）。
+//! 说明：错误分类（P3a-D）——reqwest connect/DNS 失败（peer down / no route）→
+//! `RPCError::Unreachable` / `StreamingError::Unreachable`（openraft 退off 更长,lease 探针
+//! 可判 node down）;其余（send 中 stream 错、client timeout、HTTP 非 2xx、编/解码）→
+//! `Network`(retry immediately),backoff 策略由 openraft。
 
 use std::future::Future;
 use std::io;
 use std::time::Duration;
 
-use openraft::error::{NetworkError, RPCError, ReplicationClosed, StreamingError};
+use openraft::error::{NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::network::RaftNetworkFactory;
 use openraft::network::RaftNetworkV2;
@@ -36,6 +42,29 @@ use crate::types::{NodeId, NodeInfo, TypeConfig};
 // 0.10：Raft 的 SM 泛型默认 () no longer satisfies RaftStateMachine —— 显式 StateMachineStore
 pub type RaftHandle = openraft::Raft<TypeConfig, StateMachineStore>;
 
+/// (P3a-D) classify a reqwest send/recv failure for the RPC error taxonomy:
+/// connect/DNS failures (peer genuinely down / unroutable) → `Unreachable`, so openraft
+/// backs off longer and lease probes can mark the node down. Everything else (client
+/// timeout on an established connection, mid-body errors) stays `Network` — retry-immediately
+/// semantics, the node answered or is merely slow, not down.
+fn map_send_err(e: reqwest::Error) -> RPCError<TypeConfig> {
+    if e.is_connect() {
+        RPCError::Unreachable(Unreachable::new(&e))
+    } else {
+        RPCError::Network(NetworkError::new(&e))
+    }
+}
+
+/// Same taxonomy for the streaming snapshot RPC (`StreamingError::Unreachable` exists and
+/// converts to `ReplicationError::RPCError(RPCError::Unreachable)` upstream).
+fn map_stream_err(e: reqwest::Error) -> StreamingError<TypeConfig> {
+    if e.is_connect() {
+        StreamingError::Unreachable(Unreachable::new(&e))
+    } else {
+        StreamingError::Network(NetworkError::new(&e))
+    }
+}
+
 /// HTTP 网络客户端（发送给指定目标）。
 pub struct HttpNetwork {
     base: String,
@@ -53,8 +82,9 @@ impl HttpNetwork {
     // P2b1 binary RPC (append/vote/pre_vote): MessagePack request/response
     // (`application/msgpack` + rmp_serde); per-request timeout = RPCOption::soft_ttl()
     // (openraft budget: soft_ttl < hard_ttl — the network layer fails before openraft
-    // shuts down the in-flight RPC; send/decode failures map to Network,
-    // retry/backoff is openraft's job)
+    // shuts down the in-flight RPC). P3a-D taxonomy: reqwest connect errors map to
+    // Unreachable (peer down), other send/decode errors map to Network;
+    // retry/backoff is openraft's job.
     #[allow(clippy::result_large_err)]
     async fn post_msgpack<T: Serialize, R: DeserializeOwned>(
         &self,
@@ -63,7 +93,8 @@ impl HttpNetwork {
         option: RPCOption,
     ) -> Result<R, RPCError<TypeConfig>> {
         let url = format!("{}{path}", self.base);
-        let payload = rmp_serde::to_vec(body).map_err(|e| RPCError::Network(NetworkError::new(&e)));
+        let payload =
+            rmp_serde::to_vec_named(body).map_err(|e| RPCError::Network(NetworkError::new(&e)));
         let payload = payload?;
         let mut req = self
             .client
@@ -74,19 +105,12 @@ impl HttpNetwork {
         if let Some(token) = &self.token {
             req = req.bearer_auth(token);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let resp = req.send().await.map_err(map_send_err)?;
         if !resp.status().is_success() {
             let e = io::Error::other(format!("raft rpc {} -> {}", path, resp.status()));
             return Err(RPCError::Network(NetworkError::new(&e)));
         }
-        let raw = resp
-            .bytes()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)));
-        let raw = raw?;
+        let raw = resp.bytes().await.map_err(map_send_err)?;
         let out: R = rmp_serde::from_slice(raw.as_ref())
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         Ok(out)
@@ -167,7 +191,7 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
         let resp = match raced {
             Ok(r) => match r {
                 Ok(r) => Ok(r),
-                Err(e) => Err(StreamingError::Network(NetworkError::new(&e))),
+                Err(e) => Err(map_stream_err(e)),
             },
             Err(closed) => {
                 return Err(StreamingError::Closed(closed));
@@ -180,7 +204,7 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
         }
         let raw = match resp.bytes().await {
             Ok(b) => Ok(b),
-            Err(e) => Err(StreamingError::Network(NetworkError::new(&e))),
+            Err(e) => Err(map_stream_err(e)),
         };
         let raw = raw?;
         let ack = match rmp_serde::from_slice(raw.as_ref()) {

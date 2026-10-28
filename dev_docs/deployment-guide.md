@@ -321,19 +321,23 @@ curl -s -H "$AUTH" -X POST http://127.0.0.1:8384/api/v1/cluster/promote \
 
 ### 6.5 Follower 永久落后排障（snapshot RPC 与 request body limit）
 
-- **Raft RPC 有大 body（快照分块）**：追落后 follower 经 `InstallSnapshot` 分块，`data` 经 JSON
-  数字数组膨胀约 3.1x（1MiB raw ≈ 3MB JSON；3MiB raw ≈ 9.4MB JSON）。服务端已设 `/raft/*`
-  request body limit = **32MiB**（覆盖 3MiB raw 的 JSON 膨胀）；反向代理/网关（nginx
-  `client_max_body_size`、ingress、ALB 等）配置更小的 request body limit 在 raft RPC 路径后
-  snapshot 恒 HTTP 413 `length limit exceeded`，follower 经 snapshot 路径无法追平。
+- **Raft RPC snapshot 分块流（P2b2:0.10 streaming msgpack frames）**：追落后 follower 经
+  `InstallSnapshot` 流帧（`Header`/`Chunk`/`End`,wire = `[u32 BE len][frame]`),chunk payload
+  ≤ `snapshot_max_chunk_size` = 1MiB（msgpack binary,no JSON numeric-array inflation — old
+  0.9's ~3.1x resolved by streaming).服务端已设 `/raft/*` request body limit = **32MiB**（frame
+  level large margin）;反向代理/网关（nginx `client_max_body_size`、ingress、ALB 等）配置更
+  小的 per-frame request body limit（需 ≥ ~2MiB）in raft RPC 路径后 snapshot POST 恒 HTTP 413
+  `length limit exceeded`,follower 经 snapshot 路径无法追平。
 - **follower 长期落后，排查顺序**：
   1. `GET /api/v1/cluster/members` 看 per-member `lag`（= `last_log_index` − `last_applied`；
      恒 `null` 时查询非 leader 节点——leader 观察的 replication 数据只在 leader）；
   2. leader `/metrics` 看 `dsh_raft_replication_lag{target="<node_id>"}`；
   3. 节点日志 grep 413 / `InstallSnapshot RPC timed out`（→ 代理 body limit 或 timeout 配置）。
 - **相关配置**（内置,`dsh-raft` `dev_config()`）:`install_snapshot_timeout = 30s`（默认
-  200ms too short,1MiB 分块传输+落盘超出 200ms budget → 追平循环失败）；
-  `snapshot_max_chunk_size = 1MiB`（→ ~3MB JSON，与 32MiB body limit 配套关系，留有裕头）。
+  200ms too short — streamed chunk transfer + disk fsync exceed a single-chunk 200ms budget →
+  追平循环失败）；`snapshot_max_chunk_size = 1MiB`（msgpack frame payload ≤1MiB,与 frame-level
+  body limit 裕头；P3a-C1 also caps log-reader batches at `MAX_BATCH_BYTES` = 6MiB stored
+  bytes — that bounds AppendEntries RPC size, not snapshot frames).
 
 ---
 

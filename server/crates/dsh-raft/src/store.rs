@@ -42,6 +42,15 @@ pub type DbHandle = std::sync::Arc<redb::Database>;
 /// write_last_applied 故障注入 sentinel：关闭默认（usize 上限，u64 域）。
 const NO_FAULT: u64 = 18446744073370008100;
 
+/// (P3a-C1) AppendEntries 网络层批量预算（`limited_get_log_entries` 短读上限，stored bytes）。
+/// Release measurements (compat §13): msgpack wire ≈ stored-JSON bytes (mp/json=1.00);
+/// 64 fat entries (60 KiB values) = 3.85 MB stored / 3.67 MiB wire, redb append+fsync 5.3 ms
+/// — so `max_payload_entries=64` stays the practical bound at current entry sizes and this
+/// 6 MiB byte cap only chops pathological batches (e.g. 1 MiB-value entries: 64 RPC entries
+/// would be 64 MiB wire → cap keeps ~6 per RPC). Contract honored: non-empty range ⇒
+/// non-empty batch (first oversized entry returned alone — openraft stream_state.rs:249).
+pub const MAX_BATCH_BYTES: u64 = 6 << 20;
+
 // ---------------- meta 键（raft-meta 表） ----------------
 
 const META_VOTE: &[u8] = b"vote";
@@ -80,11 +89,80 @@ fn snap_file_name(meta: &SnapshotMetaOf<TypeConfig>) -> String {
 }
 
 /// Create `{data_dir}/snapshots/` (idempotent; used at store construction and before each write).
-/// Stale `.part` cleanup is per-name (see write_payload_file: pre-clear + failure cleanup) —
-/// this toolchain's std::fs offers no usable directory enumeration for a global sweep.
+/// Per-name `.part` pre-clear/failure cleanup lives in write_payload_file; the process-wide
+/// startup sweep is `sweep_snapshot_payloads` (P3a-A, run at StateMachineStore construction).
 fn prepare_snap_dir(dir: PathBuf) -> Result<(), ErrOf> {
     fs::create_dir_all(dir).map_err(io_write)?;
     Ok(())
+}
+
+/// (P3a-A) startup sweep of `{data_dir}/snapshots/`:
+/// - every `*.part` (crashed write residue from any name) is removed;
+/// - every canonical `*.snap` the registry's `file` key does not reference is removed
+///   (install/legacy-migration renames replace the previous payload; old files are garbage);
+/// - foreign names (not `*.part` / `*.snap`) are left untouched (operator debug drops).
+///   Registry read/parse failure aborts the sweep (never mass-delete on a corrupt read).
+///   Returns `(parts_removed, orphans_removed)`.
+pub fn sweep_snapshot_payloads(db: &DbHandle, dir: PathBuf) -> Result<(u64, u64), ErrOf> {
+    if !fs::exists(&dir).unwrap_or(false) {
+        return Ok((0, 0));
+    }
+    // canonical referenced path: the single `file` registry key (JSON-encoded PathBuf).
+    // `file` absent (no snapshot, or legacy inline `data` not yet migrated) = no keep.
+    let ref_raw = {
+        let txn = db.begin_read().map_err(io_read)?;
+        let table = txn.open_table(TBL_SNAPSHOTS).map_err(io_read)?;
+        table
+            .get(SNAP_FILE_KEY)
+            .map_err(io_read)?
+            .map(|guard| guard.value().to_vec())
+    };
+    let keep: PathBuf = match ref_raw {
+        Some(raw) => de(&raw)?,
+        None => PathBuf::new(),
+    };
+    let mut parts: u64 = 0;
+    let mut orphans: u64 = 0;
+    let listing = fs::read_dir(&dir).map_err(io_read)?;
+    for entry in listing {
+        match entry {
+            Ok(item) => {
+                let path = item.path();
+                let name = path.display().to_string();
+                if name.ends_with(".part") {
+                    match fs::remove_file(&path) {
+                        Ok(()) => {
+                            parts += 1;
+                        }
+                        Err(e) => tracing::warn!("sweep remove {}: {e}", name),
+                    }
+                } else if name.ends_with(".snap") {
+                    if name == keep.display().to_string() {
+                        continue;
+                    }
+                    match fs::remove_file(&path) {
+                        Ok(()) => {
+                            orphans += 1;
+                        }
+                        Err(e) => tracing::warn!("sweep remove {}: {e}", name),
+                    }
+                }
+            }
+            Err(e) => {
+                // enumeration IO error: stop sweep (partial sweep done so far is fine,
+                // remaining residue is transient—next boot retries)
+                tracing::warn!("sweep snapshots dir: {e}");
+                break;
+            }
+        }
+    }
+    if parts > 0 || orphans > 0 {
+        tracing::info!(
+            "snapshots dir sweep: parts={parts} orphans={orphans} ({})",
+            dir.display()
+        );
+    }
+    Ok((parts, orphans))
 }
 
 /// Atomic payload file write: bytes → `{name}.part`, then rename → `{name}`.
@@ -346,6 +424,37 @@ fn read_entries(db: &DbHandle, start: u64, end: u64) -> Result<Vec<EntryOf>, Err
     Ok(out)
 }
 
+/// Byte-capped `read_entries` for `limited_get_log_entries` (P3a-C1).
+/// Accumulates **stored row bytes** (JSON-encoded entries; msgpack wire ≈1.00× per compat
+/// §9.5/§13, so capping stored bytes bounds the wire batch with margin). Short reads are fine
+/// (openraft replication continues from the last returned index); an empty result for a
+/// non-empty range is not — the first oversized entry is returned alone.
+fn read_entries_limited(
+    db: &DbHandle,
+    start: u64,
+    end: u64,
+    cap: u64,
+) -> Result<Vec<EntryOf>, ErrOf> {
+    let txn = db.begin_read().map_err(io_read)?;
+    let table = txn.open_table(TBL_RAFT_LOG).map_err(io_read)?;
+    let start_key = log_key(start);
+    let mut out = Vec::new();
+    let mut acc = 0u64;
+    for row in table.range(start_key.as_slice()..).map_err(io_read)? {
+        let (k, v) = row.map_err(io_read)?;
+        if log_index_from_key(k.value()) > end {
+            break;
+        }
+        let size = v.value().len() as u64;
+        if !out.is_empty() && acc + size > cap {
+            break;
+        }
+        out.push(de(v.value())?);
+        acc += size;
+    }
+    Ok(out)
+}
+
 /// 最后一条日志（升序表尾部）。空表返回 None。
 fn last_log_entry(db: &DbHandle) -> Result<Option<EntryOf>, ErrOf> {
     let txn = db.begin_read().map_err(io_read)?;
@@ -425,6 +534,21 @@ impl RaftLogReader<TypeConfig> for LogReader {
         read_entries(&self.db, start, end)
     }
 
+    // (P3a-C1) 0.10 replication 路径（stream_state.rs limited read）: end-exclusive;
+    // short reads OK (replication resumes at last returned index + 1), but a non-empty
+    // range must never yield an empty batch — first oversized entry ships alone.
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<EntryOf>, ErrOf> {
+        if start >= end {
+            Ok(Vec::new())
+        } else {
+            read_entries_limited(&self.db, start, end - 1, MAX_BATCH_BYTES)
+        }
+    }
+
     // 0.10：read_vote 在 RaftLogReader（0.9 的 LogStorage 位置 gone）
     async fn read_vote(&mut self) -> Result<Option<VoteOf<TypeConfig>>, ErrOf> {
         meta_get(&self.db, META_VOTE)?
@@ -449,6 +573,18 @@ impl RaftLogReader<TypeConfig> for LogStore {
             std::ops::Bound::Unbounded => u64::MAX,
         };
         read_entries(&self.db, start, end)
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<EntryOf>, ErrOf> {
+        if start >= end {
+            Ok(Vec::new())
+        } else {
+            read_entries_limited(&self.db, start, end - 1, MAX_BATCH_BYTES)
+        }
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<TypeConfig>>, ErrOf> {
@@ -581,9 +717,15 @@ impl StateMachineStore {
         let (tx, _rx) = tokio::sync::broadcast::channel(1024);
         // P2a: prepare `{data_dir}/snapshots/`（best-effort warn，实际写入路径再 ensure_dir）
         let snap_dir = data_dir.join(SNAP_SUBDIR);
-        if let Err(e) = prepare_snap_dir(snap_dir) {
+        if let Err(e) = prepare_snap_dir(snap_dir.clone()) {
             tracing::warn!("prepare snapshots dir failed: {e}");
         }
+        // P3a-A: startup sweep — 删除 `.part` 残留与未 referenced canonical payload files
+        // (registry 仍 points at its `file` key; corrupt registry read aborts the sweep).
+        match sweep_snapshot_payloads(&db, snap_dir) {
+            Ok(_) => {}
+            Err(e) => tracing::warn!("snapshots dir startup sweep skipped: {e}"),
+        };
         Self {
             sm,
             db,
@@ -1016,6 +1158,97 @@ mod tests {
             .into_iter()
             .map(|e| e.log_id.index)
             .collect()
+    }
+
+    // (P3a-C1) 60 KiB-value entry（P0 §9.5 budget repro size）
+    fn fat(index: u64) -> EntryOf {
+        EntryOf {
+            log_id: LogId {
+                leader_id: LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index,
+            },
+            payload: EntryPayload::Normal(dsh_core::command::Command::DraftUpdate {
+                project: dsh_core::model::ProjectId("c1-cap".to_string()),
+                branch: dsh_core::model::BranchName("dev".to_string()),
+                updates: [dsh_core::command::DraftUpdateItem {
+                    group: "g".to_string(),
+                    key: "k".to_string(),
+                    value: dsh_core::model::Value::String("x".repeat(60_000)),
+                }]
+                .to_vec(),
+                deletes: [].to_vec(),
+                shared_bindings: [].to_vec(),
+                operator: "admin".to_string(),
+                ts: index as i64,
+                expected_draft_rev: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn limited_get_log_entries_byte_cap_contract() {
+        let dir = tmpdir("c1cap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let mut store = LogStore::new(storage.raw_db());
+        store
+            .blocking_append([fat(1), fat(2), fat(3)])
+            .await
+            .unwrap();
+
+        // default cap (6 MiB) over the whole range: full batch; trait end-exclusive contract
+        let all = store.limited_get_log_entries(1, 4).await.unwrap();
+        assert_eq!(
+            all.into_iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<u64>>(),
+            vec![1, 2, 3]
+        );
+        let one = store.limited_get_log_entries(2, 3).await.unwrap();
+        assert_eq!(
+            one.into_iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<u64>>(),
+            vec![2]
+        );
+        assert!(store
+            .limited_get_log_entries(3, 3)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // cap 1 KiB (< single 60 KiB row): first entry alone — never an empty batch
+        let small = read_entries_limited(&store.db, 1, 3, 1024).unwrap();
+        assert_eq!(
+            small
+                .into_iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<u64>>(),
+            vec![1]
+        );
+
+        // cap 122 KiB: two fat rows (≈120.3 KiB) fit, third chopped
+        let mid = read_entries_limited(&store.db, 1, 3, 122_000).unwrap();
+        assert_eq!(
+            mid.into_iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<u64>>(),
+            vec![1, 2]
+        );
+
+        // cap 1 byte: still returns the first entry
+        let tiny = read_entries_limited(&store.db, 2, 2, 1).unwrap();
+        assert_eq!(
+            tiny.into_iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<u64>>(),
+            vec![2]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -126,7 +126,7 @@ fn is_msgpack(headers: &HeaderMap) -> bool {
 // msgpack body -> (bytes body, content-type header); (Vec<u8>, HeaderMap) is
 // an axum IntoResponse (Vec<u8> body + HeaderMap parts).
 fn msgpack_resp<T: Serialize>(v: &T) -> Result<(HeaderMap, Vec<u8>), (StatusCode, String)> {
-    let packed = rmp_serde::to_vec(v).map_err(|e| {
+    let packed = rmp_serde::to_vec_named(v).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("msgpack encode: {e}"),
@@ -153,8 +153,14 @@ async fn append_entries(
             "expected Content-Type: application/msgpack".to_string(),
         ));
     }
-    let decoded = rmp_serde::from_slice(body.as_ref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("msgpack decode: {e}")));
+    let decoded = rmp_serde::from_slice(body.as_ref()).map_err(|e| {
+        tracing::warn!(
+            "raft rpc msgpack decode failed (path=/raft/append-entries, body={} bytes): {}",
+            body.len(),
+            e
+        );
+        (StatusCode::BAD_REQUEST, format!("msgpack decode: {e}"))
+    });
     let rpc: AppendEntriesRequest<TypeConfig> = decoded?;
     let resp = s
         .raft

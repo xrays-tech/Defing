@@ -3,7 +3,7 @@
 //! - 三个 pool 的 builder 配置 pairwise 不同（reqwest Client Debug renders a
 //!   client-level total timeout as `reqwest::config::TotalTimeout`);
 //! - data pool 无 client-level total timeout（per-request RPCOption::soft_ttl 是
-//!   authoritative in post_msgpack）; heartbeat(3s)/snapshot(60s) pools carry one.
+//!   authoritative in post_msgpack）; heartbeat(3s)/snapshot(300s) pools carry one.
 use dsh_raft::openraft::network::RaftNetworkFactory;
 
 use dsh_raft::types::NodeInfo;

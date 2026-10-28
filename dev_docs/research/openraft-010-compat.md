@@ -338,3 +338,61 @@ Gate in worktree `/tmp/opencode/defing-openraft-010/server` (`CARGO_TARGET_DIR=/
   ack the joint config), so the race test uses learner join/remove ops that commit on the real node.
 - **Not done**: P3 153 MB voter-storm / chaos harness and stress numbers; P2 gate evidence is
   focused tests + full workspace verification, not a 153 MB stress run.
+
+## 13. P3a 状态 (2026-10-28: A/C1/D implemented; C2 verified on real 0.9 storm data)
+
+### 13.1 C1 — AppendEntries 字节预算（store-level cap）
+- openraft 0.10 replication 读取是 `RaftLogReader::limited_get_log_entries(start,end)`
+  (end-exclusive; default = `try_get_log_entries(start..end)`)。Short read legal — replication
+  resumes at last returned index+1. Non-empty range MUST yield non-empty batch.
+- 实测（release, budget-exp crate, ext4 FS with fsync 2.6-3.7ms）：
+  - n=16 fat entries → msgpack 961347B, append+fsync 2.6-3.7ms
+  - n=32 → 1922691B, ~4.1-5.6ms
+  - n=64 → 3845379B, ~8-11ms
+  - stored bytes ≈ msgpack bytes (1.00 ratio) → stored-bytes budget bounds the wire batch.
+- Decision: `max_payload_entries=64` KEPT; new hard cap `MAX_BATCH_BYTES = 6<<20` (6 MiB)
+  in `store.read_entries_limited` (both `limited_get_log_entries` override + raw helper).
+  First oversized entry ships alone (never an empty batch).
+- Config: `dev_config.enable_pre_vote = Some(true)` documented; raft.rs honors
+  `openraft::leader_config::Leader.pre_vote`.
+
+### 13.2 A — startup snapshot payload sweep
+- `store.sweep_snapshot_payloads(db, dir)` at `StateMachineStore` ctor (after prepare_snap_dir):
+  removes `*.part` residue; removes unreferenced canonical `*.snap` (registry `file` key =
+  single JSON-encoded PathBuf); keeps foreign files; corrupt/unparseable registry read
+  ABORTS sweep (nothing deleted). Returns `(parts_removed, orphans_removed)`.
+- Verified by tests: `tests/snapshot_sweep.rs` (3 cases incl. corrupt-registry abort + ctor hook).
+
+### 13.3 D — reqwest error taxonomy
+- `http_network.map_send_err` / `map_stream_err`: `e.is_connect()` (DNS/refused/no-route) →
+  `RPCError::Unreachable` / `StreamingError::Unreachable`; everything else (incl. client
+  timeout on an established connection, mid-body, non-2xx) → `Network` (retry-immediately).
+  Backoff remains openraft's decision.
+
+### 13.4 C2 — boot 0.9 real storm data on the 0.10 spike（FRESH copies, c2run2/n1..n5）
+- 5-node cluster from `cp -a run/` (single `dsh.redb` each, 0.9 layout incl. inline snapshot
+  blob in raft metadata; node ids 1..5 on the stored 0.9 HTTP/Raft addresses).
+- CLI now REQUIRES `--join-token` AND `--raft-token` (identical per cluster) for cluster mode.
+- Results (fresh boot, fixed binary):
+  - `migrated legacy inline snapshot blob to file` — ALL 5 nodes (P2a lazy migration path).
+  - far-behind node 1: `Done install complete snapshot` (streamed full-snapshot install).
+  - **0 msgpack decode failures** — see 13.5 below; replication converged all nodes
+    (`last_log_index=14051`, lag≤1 across members).
+  - write chain on leader 5 (login → DraftUpdate snp-5/dev → Publish, version 377) replicated
+    and read back from follower node 1.
+  - restart boot (c2run/ copies, prior mutated run): sweep kept exactly the 1 referenced
+    145MB payload per node, 0 orphans — A + P2a interaction healthy.
+
+### 13.5 P3a C2 bug found — msgpack positional desync（FIXED: `to_vec_named`）
+- Symptom on 0.9 storm logs: `raft rpc msgpack decode failed … wrong msgpack marker FixMap(3)`
+  on `/raft/append-entries` (server 400 → openraft NetworkError retry loop).
+- Root cause: rmp_serde default `to_vec` encodes structs **positionally (array)**; model.rs
+  `AuditEntry` (and friends) use `#[serde(skip_serializing_if = "Option::is_none")]` on
+  `version/request_id/...` — skipped fields TRUNCATE the positional array → decoder desyncs
+  mid-struct (lands on the `detail`/`result` map marker). 0.9 JSON (self-describing) never
+  exposed it.
+- Fix: BOTH wire ends use `rmp_serde::to_vec_named` (struct→map, field names):
+  `http_network.post_msgpack` + `raft_http_server.msgpack_resp`. `from_slice` decodes
+  map-structs natively; snapshot frame codec (no Option-bearing structs) unchanged.
+  Wire grows by field names only; C1 6 MiB cap unaffected.
+- Verified: fresh-copy C2 boot shows 0 decode failures + full replication (13.4).
