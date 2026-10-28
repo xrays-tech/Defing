@@ -611,12 +611,37 @@ impl StateMachine {
     }
 
     /// 清空并恢复全部状态（快照安装用）。
+    ///
+    /// P3c：改走 `Store::write_batch`（单事务 + 一次 fsync）——旧实现逐 key `delete`/`put`
+    /// 各开一个事务，400MB 快照（约 4 万对 KV）在 btrfs 上要 ~4 万次 fsync，实测 install 84s
+    /// 基本全耗在这里。按字节预算分块提交：块内单事务，块间可重试（与旧实现的部分恢复语义一致），
+    /// 同时避免单事务把整份 payload 的脏页驻留内存。
     pub fn restore_all(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error> {
-        for (k, _) in self.get_prefix_merged(b"")? {
-            self.store.delete(&k)?;
+        const CHUNK_BYTES: usize = 64 * 1024 * 1024;
+        let existing: Vec<Vec<u8>> = self
+            .get_prefix_merged(b"")?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        if pairs.is_empty() {
+            if !existing.is_empty() {
+                self.store.write_batch(&[], &existing)?;
+            }
+            return Ok(());
         }
-        for (k, v) in pairs {
-            self.store.put(k, v)?;
+        let mut start = 0usize;
+        let mut first = true;
+        while start < pairs.len() {
+            let mut end = start;
+            let mut bytes = 0usize;
+            while end < pairs.len() && (bytes < CHUNK_BYTES || end == start) {
+                bytes += pairs[end].0.len() + pairs[end].1.len();
+                end += 1;
+            }
+            let deletes: &[Vec<u8>] = if first { &existing } else { &[] };
+            self.store.write_batch(&pairs[start..end], deletes)?;
+            first = false;
+            start = end;
         }
         Ok(())
     }

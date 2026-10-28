@@ -193,6 +193,35 @@ fn read_payload_file(path: PathBuf) -> Result<Vec<u8>, ErrOf> {
     fs::read(path).map_err(io_read)
 }
 
+/// P3c：流式解析 payload 文件成 `(key, value)` 列表 —— 只驻留解析结果一份；
+/// 与 `read_payload_file` 的「整份读 + 再解析」相比，省掉一份 4xx MB 的全量拷贝。
+fn read_payload_pairs(path: &std::path::Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf> {
+    let f = fs::File::open(path).map_err(io_read)?;
+    serde_json::from_reader(std::io::BufReader::new(f)).map_err(io_read)
+}
+
+/// P3c：把收到的 payload 落成本节点 canonical snapshot 文件。
+/// - 输入已在 `{data_dir}/snapshots`（HTTP full-snapshot handler materialize 到本节点目录）
+///   → `rename` 直接采纳，省掉一次整份重写；
+/// - 输入在别的目录/设备（进程内 network、测试的 sender 目录）→ 复制，不动输入文件。
+fn adopt_payload_file(
+    dir: PathBuf,
+    name: String,
+    src: &std::path::Path,
+) -> Result<PathBuf, ErrOf> {
+    fs::create_dir_all(&dir).map_err(io_write)?;
+    let final_path = dir.join(&name);
+    let same_dir = match (src.parent(), fs::canonicalize(&dir)) {
+        (Some(p), Ok(d)) => fs::canonicalize(p).map(|sp| sp == d).unwrap_or(false),
+        _ => false,
+    };
+    if same_dir && fs::rename(src, &final_path).is_ok() {
+        return Ok(final_path);
+    }
+    let bytes = fs::read(src).map_err(io_read)?;
+    write_payload_file(dir, name, &bytes)
+}
+
 /// Registry read: return the current snapshot as (meta, payload file path).
 ///
 /// - `file` key present → payload is that file (missing/unreadable file = stale registry:
@@ -1043,11 +1072,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         meta: &SnapshotMetaOf<TypeConfig>,
         snapshot: Self::SnapshotData,
     ) -> Result<(), ErrOf> {
-        // P2a: read + validate the incoming payload file BEFORE touching state
-        //（failure = no half state; 输入文件 not modified by us）
-        let data = read_payload_file(snapshot)?;
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
-            serde_json::from_slice(&data).map_err(|e| io_read(e.to_string()))?;
+        // P2a: parse + validate the incoming payload file BEFORE touching state
+        //（failure = no half state）.
+        // P3c: `from_reader` 流式解析 —— 旧实现 `fs::read` 整份 + `from_slice` 再解析，
+        // 404MB 快照会同时驻留「整份 Vec<u8>」+「pairs」两份全量数据（实测峰值 RSS ≈ 2x payload）。
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = read_payload_pairs(&snapshot)?;
         {
             let sm = self.sm.write().map_err(|e| io_write(e.to_string()))?;
             sm.restore_all(&pairs).map_err(storage_err)?;
@@ -1056,11 +1085,15 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             self.write_last_applied(last_log_id)?;
         }
         self.write_membership(&meta.last_membership)?;
-        // 落盘（重启后仍可用）: materialize an owned copy under this node's snapshots dir ——
-        // the input file may live in the sender's data dir（进程内 network）or the HTTP
-        // server's materialized temp（handler deletes it after install returns）.
-        let path =
-            write_payload_file(self.data_dir.join(SNAP_SUBDIR), snap_file_name(meta), &data)?;
+        // 落盘（重启后仍可用）: canonical copy under this node's snapshots dir ——
+        // the input file may live in the sender's data dir（进程内 network/测试）or the HTTP
+        // server's materialized payload（同目录，handler deletes it after install returns）.
+        // P3c: 同目录时 rename 采纳，省掉一次整份 4xx MB 重写。
+        let path = adopt_payload_file(
+            self.data_dir.join(SNAP_SUBDIR),
+            snap_file_name(meta),
+            &snapshot,
+        )?;
         let old = persist_snapshot_registry(&self.db, meta, path.clone())?;
         delete_old_snapshot_file(old);
         *self.current_snapshot.lock().await = Some((meta.clone(), path));
