@@ -5,6 +5,7 @@ pub mod http_network;
 pub mod network;
 pub mod raft;
 pub mod raft_http_server;
+pub mod snapshot_stream;
 pub mod store;
 pub mod types;
 
@@ -18,5 +19,9 @@ pub use raft::{
     WriteOutcome,
 };
 pub use raft_http_server::{raft_router, RaftServerState};
+pub use snapshot_stream::{
+    check_total, decode_frame, encode_frame, ChunkWriter, Crc32, Frame, FrameDecoder, FrameEmitter,
+    SnapshotProtoError, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, MAX_SNAPSHOT_BYTES,
+};
 pub use store::{LogStore, StateMachineStore};
 pub use types::{NodeId, NodeInfo, TypeConfig};

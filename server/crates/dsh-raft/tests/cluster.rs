@@ -9,6 +9,8 @@ use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::model::{BranchName, ItemDef, PublishPolicy, Value, ValueType};
 use dsh_core::StateMachine;
 use dsh_raft::*;
+// 0.10：metrics() -> rt WatchReceiver (borrow() gone -> borrow_watched())
+use dsh_raft::openraft::rt::WatchReceiver;
 use dsh_storage::RedbStorage;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -31,7 +33,7 @@ async fn make_node(id: NodeId, tag: &str, network: &NetworkFactory) -> NodeCtx {
     let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
     let db = storage.raw_db();
     let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
-    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
+    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone(), dir.clone()));
     let log_store = LogStore::new(db.clone());
     let node = NodeInfo {
         grpc_addr: format!("127.0.0.1:{}", 8000 + id as u32),
@@ -54,6 +56,23 @@ async fn make_node(id: NodeId, tag: &str, network: &NetworkFactory) -> NodeCtx {
         sm,
         sm_store,
         dir,
+    }
+}
+
+// 0.10: membership RPC 串行化——prior 未 committed (initialize/add_learner) -> next membership
+// RPC 返回 APIError(ChangeMembershipError(InProgress{committed: None, ...}))) (0.9 fire-and-forget 静允许)
+async fn wait_membership_committed(raft: RaftHandle) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let m = raft.metrics().borrow_watched().clone();
+        // 0.10: RaftMetrics.committed 已 deprecated -> cluster_committed（quorum-acked）
+        if m.cluster_committed.is_some() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return; // timeout 后让 next membership op 真失败 (红/绿保)
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -96,6 +115,8 @@ async fn three_node_bootstrap_join_failover() {
         raft_addr: "127.0.0.1:7002".into(),
     };
     let leader = network.get(&1).expect("node1 in peers");
+    // 0.10: initialize membership 先 committed (InProgress 串行化)
+    wait_membership_committed(leader.clone()).await;
     leader.add_learner(2, node2.clone(), false).await.unwrap();
     leader
         .change_membership(vec![1u64, 2], false)
@@ -335,6 +356,8 @@ async fn session_is_cluster_wide_single() {
         raft_addr: "127.0.0.1:7002".into(),
     };
     let leader = network.get(&1).expect("node1 in peers");
+    // 0.10: initialize membership 先 committed (InProgress 串行化)
+    wait_membership_committed(leader.clone()).await;
     leader.add_learner(2, node2.clone(), false).await.unwrap();
     leader
         .change_membership(vec![1u64, 2], false)
@@ -423,6 +446,8 @@ async fn cluster_watch_events_reach_subscribers() {
         raft_addr: "127.0.0.1:7002".into(),
     };
     let leader = network.get(&1).expect("node1 in peers");
+    // 0.10: initialize membership 先 committed (InProgress 串行化)
+    wait_membership_committed(leader.clone()).await;
     leader.add_learner(2, node2.clone(), false).await.unwrap();
     leader
         .change_membership(vec![1u64, 2], false)

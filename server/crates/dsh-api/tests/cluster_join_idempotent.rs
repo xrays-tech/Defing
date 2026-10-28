@@ -36,7 +36,7 @@ async fn start() -> TestServer {
     let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
     let db = storage.raw_db();
     let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
-    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
+    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone(), dir.clone()));
     let log_store = LogStore::new(db.clone());
     let network = NetworkFactory::new();
     let node = NodeInfo {

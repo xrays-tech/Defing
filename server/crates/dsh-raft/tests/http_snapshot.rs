@@ -25,8 +25,9 @@ use std::time::Duration;
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::model::{BranchName, GroupDef, ItemDef, PublishPolicy, Value, ValueType};
 use dsh_core::StateMachine;
+use dsh_raft::openraft::rt::WatchReceiver;
 use dsh_raft::openraft::storage::RaftLogReader;
-use dsh_raft::openraft::LogId;
+use dsh_raft::openraft::type_config::alias::LogIdOf;
 use dsh_raft::openraft::RaftMetrics;
 use dsh_raft::*;
 use dsh_storage::RedbStorage;
@@ -68,7 +69,7 @@ async fn start_node(id: NodeId, tag: &str, network: &HttpNetworkFactory) -> Node
     let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
     let db = storage.raw_db();
     let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
-    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
+    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone(), dir.clone()));
     let info = NodeInfo {
         grpc_addr: "127.0.0.1:0".into(),
         http_addr: format!("http://{addr}"),
@@ -86,7 +87,11 @@ async fn start_node(id: NodeId, tag: &str, network: &HttpNetworkFactory) -> Node
     .await
     .unwrap();
 
-    let state = RaftServerState::with_token(raft.clone(), Some(Arc::from(TOKEN)));
+    let state = RaftServerState::with_token(
+        raft.clone(),
+        Some(Arc::from(TOKEN)),
+        dir.clone().join(store::SNAP_SUBDIR),
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, raft_router(state)).await;
     });
@@ -100,19 +105,21 @@ async fn start_node(id: NodeId, tag: &str, network: &HttpNetworkFactory) -> Node
     }
 }
 
-fn metrics_of(raft: &RaftHandle) -> RaftMetrics<NodeId, NodeInfo> {
-    raft.metrics().borrow().clone()
+// 0.10：RaftMetrics 泛型 <C>（0.9 <NID, N>）; metrics() -> WatchReceiver trait .borrow() gone
+fn metrics_of(raft: &RaftHandle) -> RaftMetrics<TypeConfig> {
+    raft.metrics().borrow_watched().clone()
 }
 
-fn idx(v: Option<LogId<NodeId>>) -> u64 {
+// 0.10：LogId<NID>（0.9）gone —— LogId<CLID,NID>; TypeConfig 侧 alias LogIdOf（LeaderId<u64,u64>）
+fn idx(v: Option<LogIdOf<TypeConfig>>) -> u64 {
     v.map(|l| l.index).unwrap_or(0)
 }
 
-async fn poll_metrics<F: Fn(RaftMetrics<NodeId, NodeInfo>) -> bool>(
+async fn poll_metrics<F: Fn(RaftMetrics<TypeConfig>) -> bool>(
     raft: &RaftHandle,
     timeout: Duration,
     ok: F,
-) -> RaftMetrics<NodeId, NodeInfo> {
+) -> RaftMetrics<TypeConfig> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let m = metrics_of(raft);

@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use dsh_core::command::Command;
 use dsh_core::model::PublishEvent;
 use dsh_core::StateMachine;
+use dsh_raft::openraft::rt::WatchReceiver;
 use dsh_raft::RaftHandle;
 
 /// 进程内 HTTP 计数（G5/D32：API middleware 自增；节点本地视图，非状态机数据）。
@@ -206,7 +207,7 @@ pub fn metrics_text(
 
     match raft {
         Some(raft) => {
-            let m = raft.metrics().borrow().clone();
+            let m = raft.metrics().borrow_watched().clone();
             // openraft ServerState: Leader=2 / Follower=1 / Learner=0 / Candidate=3
             let role = match &m.state {
                 dsh_raft::openraft::ServerState::Leader => 2,
@@ -259,7 +260,7 @@ pub fn metrics_text(
 /// 集群就绪：raft 有日志（已初始化）即就绪；dev-single 恒就绪。
 pub fn is_ready(raft: Option<&RaftHandle>) -> bool {
     match raft {
-        Some(raft) => raft.metrics().borrow().last_log_index.is_some(),
+        Some(raft) => raft.metrics().borrow_watched().last_log_index.is_some(),
         None => true,
     }
 }
@@ -288,7 +289,7 @@ pub fn cluster_members_json(raft: Option<&RaftHandle>, node_id: Option<u64>) -> 
             })
         }
     };
-    let m = raft.metrics().borrow().clone();
+    let m = raft.metrics().borrow_watched().clone();
     let leader = m.current_leader;
     let voter_ids: Vec<u64> = m.membership_config.membership().voter_ids().collect();
     // openraft: Metrics.replication 为 Some() 只在 leader，BTreeMap<NodeId, Option<LogId>>

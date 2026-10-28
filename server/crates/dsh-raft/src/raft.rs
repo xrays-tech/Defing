@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use openraft::rt::WatchReceiver;
 use openraft::Config;
 use openraft::Raft;
 
@@ -45,6 +46,9 @@ pub async fn new_raft_node<N>(
 ) -> Result<RaftHandle, Box<dyn std::error::Error + Send + Sync>>
 where
     N: openraft::network::RaftNetworkFactory<TypeConfig> + Clone + Send + Sync + 'static,
+    // 0.10：SnapshotData 已 moved 从 RaftTypeConfig 到 NetSnapshot——Raft::new 要求
+    // N::Network:SnapshotData == SM:SnapshotData（P2a: PathBuf，file-backed）
+    N::Network: openraft::network::NetSnapshot<TypeConfig, SnapshotData = std::path::PathBuf>,
 {
     let raft = Raft::new(
         id,
@@ -174,10 +178,11 @@ pub async fn try_client_write(
 /// 从本节点 raft metrics 解析当前 leader 的 HTTP 管理面地址
 /// （ForwardToLeader 缺 node 信息时兜底：learner 常不知道 leader 的 NodeInfo）。
 pub fn leader_http_addr(raft: &RaftHandle) -> Option<String> {
-    let m = raft.metrics().borrow().clone();
+    // 0.10：metrics() -> WatchReceiver（openraft:rt:WatchReceiver trait）—— 0.9 `.borrow()` gone
+    //  -> borrow_watched()；StoredMembership.get_node direct（no .membership().get_node()）
+    let m = raft.metrics().borrow_watched().clone();
     let leader_id = m.current_leader?;
     m.membership_config
-        .membership()
         .get_node(&leader_id)
         .map(|n| n.http_addr.clone())
 }

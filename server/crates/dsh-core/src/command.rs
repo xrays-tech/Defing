@@ -372,3 +372,61 @@ pub enum Command {
         token_id: String,
     },
 }
+
+// openraft 0.10：`D: AppData`（= Debug + Display + Send + Sync + 'static）——
+// openraft 0.10 AppData requires Display. Display MUST print ONLY the variant name:
+// openraft debug-logs render `EntryPayload normal:{app_data}`, and F7b forbids
+// plaintext KEK (also hashes/tokens/passwords) in logs. Debug stays full for
+// tests/dev dumps only.
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::ProjectCreate { .. } => "ProjectCreate",
+            Self::ProjectDelete { .. } => "ProjectDelete",
+            Self::BranchCreate { .. } => "BranchCreate",
+            Self::BranchDelete { .. } => "BranchDelete",
+            Self::StructureDraftSet { .. } => "StructureDraftSet",
+            Self::PublishStructure { .. } => "PublishStructure",
+            Self::DraftUpdate { .. } => "DraftUpdate",
+            Self::Publish { .. } => "Publish",
+            Self::Rollback { .. } => "Rollback",
+            Self::SharedDraftUpdate { .. } => "SharedDraftUpdate",
+            Self::SharedPublish { .. } => "SharedPublish",
+            Self::SharedDelete { .. } => "SharedDelete",
+            Self::SessionLogin { .. } => "SessionLogin",
+            Self::SessionLogout { .. } => "SessionLogout",
+            Self::SessionHeartbeat { .. } => "SessionHeartbeat",
+            Self::ProjectAdminCreate { .. } => "ProjectAdminCreate",
+            Self::ProjectAdminDelete { .. } => "ProjectAdminDelete",
+            Self::ProjectAdminSetPassword { .. } => "ProjectAdminSetPassword",
+            Self::PaSessionLogin { .. } => "PaSessionLogin",
+            Self::PaSessionLogout { .. } => "PaSessionLogout",
+            Self::PaSessionHeartbeat { .. } => "PaSessionHeartbeat",
+            Self::AdminSetPassword { .. } => "AdminSetPassword",
+            Self::MultiSessionLogin { .. } => "MultiSessionLogin",
+            Self::MultiSessionLogout { .. } => "MultiSessionLogout",
+            Self::MultiSessionHeartbeat { .. } => "MultiSessionHeartbeat",
+            Self::MultiPaSessionLogin { .. } => "MultiPaSessionLogin",
+            Self::MultiPaSessionLogout { .. } => "MultiPaSessionLogout",
+            Self::MultiPaSessionHeartbeat { .. } => "MultiPaSessionHeartbeat",
+            Self::MultiSessionLogoutAll { .. } => "MultiSessionLogoutAll",
+            Self::MultiPaSessionLogoutAll { .. } => "MultiPaSessionLogoutAll",
+            Self::GlobalAdminCreate { .. } => "GlobalAdminCreate",
+            Self::GlobalAdminDelete { .. } => "GlobalAdminDelete",
+            Self::GlobalAdminSetPassword { .. } => "GlobalAdminSetPassword",
+            Self::MultiGaSessionLogin { .. } => "MultiGaSessionLogin",
+            Self::MultiGaSessionLogout { .. } => "MultiGaSessionLogout",
+            Self::MultiGaSessionHeartbeat { .. } => "MultiGaSessionHeartbeat",
+            Self::MultiGaSessionLogoutAll { .. } => "MultiGaSessionLogoutAll",
+            Self::GlobalAdminSessionsRevokeAll { .. } => "GlobalAdminSessionsRevokeAll",
+            Self::AuditAppend { .. } => "AuditAppend",
+            Self::RotateMasterKey { .. } => "RotateMasterKey",
+            Self::GrayPublish { .. } => "GrayPublish",
+            Self::GrayPromote { .. } => "GrayPromote",
+            Self::GrayAbort { .. } => "GrayAbort",
+            Self::ProjectTokenCreate { .. } => "ProjectTokenCreate",
+            Self::ProjectTokenRevoke { .. } => "ProjectTokenRevoke",
+        };
+        write!(f, "{name}")
+    }
+}

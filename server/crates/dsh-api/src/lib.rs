@@ -5,6 +5,10 @@
 
 pub mod grpc;
 
+/// P2b3: membership-change retry wrapper (InProgress 经 经, see module doc).
+pub mod membership_retry;
+use membership_retry::{membership_write, MembershipOp};
+
 /// 构建元数据（部署版本标记）：由 build.rs 注入 git 短哈希与构建时间（UNIX 秒）。
 /// 暴露于 /healthz、/readyz 与 Admin UI 页脚；docker 构建可用
 /// `--build-arg DEFING_GIT_COMMIT=$(git rev-parse --short HEAD)` 覆盖。
@@ -28,6 +32,8 @@ use dsh_crypto::Cipher;
 use dsh_observability::{cluster_members_json, is_ready, metrics_text, AuditLog};
 use dsh_publish::PublishService;
 use dsh_raft::{NodeInfo as RaftNodeInfo, RaftHandle};
+// 0.10：metrics() -> WatchReceiver（rt trait，borrow() gone -> borrow_watched()）
+use dsh_raft::openraft::rt::WatchReceiver;
 use dsh_render::{Format, Renderer};
 use dsh_watch::{watch_sse, WatchHub};
 use futures::stream::Stream;
@@ -155,7 +161,12 @@ impl ApiState {
         let Some(raft) = &self.raft else {
             return Ok(()); // dev-single：无 raft，恒满足
         };
-        match raft.ensure_linearizable().await {
+        // 0.10：ensure_linearizable(impl Into<LinearizerOption>)（0.9 no-arg ReadIndex）——
+        // ReadIndex policy 保 strict read-index 语义（leader lease reuse 为 perf 0.10 新 option）
+        match raft
+            .ensure_linearizable(dsh_raft::openraft::ReadPolicy::ReadIndex)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => {
                 // 修订（openraft 0.9 无 follower 侧 ReadIndex）：follower 返回
@@ -2852,15 +2863,16 @@ async fn version_history(
 }
 
 /// G1/D37：从 ensure_linearizable 错误中提取 leader http_addr（ForwardToLeader 时）。
+// 0.10：CheckIsLeaderError 已 deprecated alias（→ LinearizableReadError<C>）; RaftError<C,E> 泛型单 C
 fn leader_http_hint(
     e: &dsh_raft::openraft::error::RaftError<
-        u64,
-        dsh_raft::openraft::error::CheckIsLeaderError<u64, dsh_raft::NodeInfo>,
+        dsh_raft::TypeConfig,
+        dsh_raft::openraft::error::LinearizableReadError<dsh_raft::TypeConfig>,
     >,
 ) -> Option<String> {
     match e {
         dsh_raft::openraft::error::RaftError::APIError(check) => {
-            if let dsh_raft::openraft::error::CheckIsLeaderError::ForwardToLeader(f) = check {
+            if let dsh_raft::openraft::error::LinearizableReadError::ForwardToLeader(f) = check {
                 return f.leader_node.as_ref().map(|n| n.http_addr.clone());
             }
             None
@@ -3841,7 +3853,7 @@ async fn readyz(State(app): State<ApiState>) -> Result<Json<serde_json::Value>, 
     let state = app
         .raft
         .as_ref()
-        .map(|r| format!("{:?}", r.metrics().borrow().state))
+        .map(|r| format!("{:?}", r.metrics().borrow_watched().state))
         .unwrap_or_else(|| "dev-single".into());
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -3951,14 +3963,16 @@ async fn cluster_join(
     //   - 已存在但是 learner → 视为幂等成功：说明此前 join 已注册但响应丢失 / 节点崩溃于
     //     追赶中；openraft add_learner 对已存在节点是幂等 re-add（可刷新 NodeInfo），
     //     客户端 resume 后经 Raft 复制追赶即可。
-    let (existing, is_voter) = {
-        let metrics = raft.metrics().borrow().clone();
-        let membership = metrics.membership_config.membership();
-        (
-            membership.nodes().map(|(id, _)| *id).collect::<Vec<u64>>(),
-            membership.voter_ids().any(|id| id == req.node_id),
-        )
-    };
+    // 0.10：membership_config: Arc<StoredMembership<C>>——clone Arc 再 membership()；
+    // 非-tail 语句（tail-expr 迭代临时 在 block 变 析后，opaque voter_ids() dtor 析 safe）
+    let metrics = raft.metrics().borrow_watched().clone();
+    let stored = metrics.membership_config.clone();
+    let existing = stored
+        .membership()
+        .nodes()
+        .map(|(id, _)| *id)
+        .collect::<Vec<u64>>();
+    let is_voter = stored.membership().voter_ids().any(|id| id == req.node_id);
     let already_member = existing.contains(&req.node_id);
     if already_member && is_voter {
         return Err(ApiError(dsh_core::Error::conflict(format!(
@@ -3984,28 +3998,34 @@ async fn cluster_join(
         http_addr: req.http_addr,
         raft_addr: req.raft_addr,
     };
-    raft.add_learner(req.node_id, node, false)
-        .await
-        .map_err(|e| {
-            // 本节点非 leader：返回 428 + leader_hint（与写路径同约定），让 join 客户端
-            // 跟随真实 leader 重试——--join 指向 follower 时不必 30s 空转（F14 场景扩展）。
-            if let Some(fwd) = e.forward_to_leader::<RaftNodeInfo>() {
-                let hint = fwd
-                    .leader_node
-                    .as_ref()
-                    .map(|n| n.http_addr.clone())
-                    .or_else(|| dsh_raft::leader_http_addr(raft))
-                    .unwrap_or_default();
-                return ApiError(
-                    dsh_core::Error::new(
-                        dsh_core::ErrorKind::LeaderRedirect,
-                        "not leader, follow leader_hint",
-                    )
-                    .with_leader_hint(hint),
-                );
-            }
-            ApiError(dsh_core::Error::internal(e.to_string()))
-        })?;
+    membership_write(
+        raft,
+        MembershipOp::AddLearner {
+            id: req.node_id,
+            node,
+        },
+    )
+    .await
+    .map_err(|e| {
+        // 本节点非 leader：返回 428 + leader_hint（与写路径同约定），让 join 客户端
+        // 跟随真实 leader 重试——--join 指向 follower 时不必 30s 空转（F14 场景扩展）。
+        if let Some(fwd) = e.forward_to_leader() {
+            let hint = fwd
+                .leader_node
+                .as_ref()
+                .map(|n| n.http_addr.clone())
+                .or_else(|| dsh_raft::leader_http_addr(raft))
+                .unwrap_or_default();
+            return ApiError(
+                dsh_core::Error::new(
+                    dsh_core::ErrorKind::LeaderRedirect,
+                    "not leader, follow leader_hint",
+                )
+                .with_leader_hint(hint),
+            );
+        }
+        ApiError(dsh_core::Error::internal(e.to_string()))
+    })?;
     app.audit
         .append(
             "cluster_join",
@@ -4031,14 +4051,19 @@ async fn cluster_promote(
         .raft
         .as_ref()
         .ok_or_else(|| ApiError(dsh_core::Error::not_found("cluster mode")))?;
-    let metrics = raft.metrics().borrow().clone();
+    let metrics = raft.metrics().borrow_watched().clone();
     let mut voters: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
     if !voters.contains(&req.node_id) {
         voters.push(req.node_id);
     }
-    raft.change_membership(voters.clone(), false)
-        .await
-        .map_err(|e| ApiError(dsh_core::Error::internal(e.to_string())))?;
+    membership_write(
+        raft,
+        MembershipOp::ReplaceVoters {
+            voters: voters.clone(),
+        },
+    )
+    .await
+    .map_err(|e| ApiError(dsh_core::Error::internal(e.to_string())))?;
     app.audit
         .append(
             "cluster_promote",
@@ -4066,7 +4091,7 @@ async fn cluster_remove(
         .raft
         .as_ref()
         .ok_or_else(|| ApiError(dsh_core::Error::not_found("cluster mode")))?;
-    let metrics = raft.metrics().borrow().clone();
+    let metrics = raft.metrics().borrow_watched().clone();
     let m = metrics.membership_config.membership();
     let mut set = BTreeSet::new();
     set.insert(req.node_id);
@@ -4082,12 +4107,13 @@ async fn cluster_remove(
     } else {
         ChangeMembers::RemoveNodes(set)
     };
-    raft.change_membership(changes, false)
+    membership_write(raft, MembershipOp::Change { members: changes })
         .await
         .map_err(|e| ApiError(dsh_core::Error::internal(e.to_string())))?;
+    // 0.10：watch receiver borrow() gone -> borrow_watched()（Ref 临时，statement-scoped）
     let voters: Vec<u64> = raft
         .metrics()
-        .borrow()
+        .borrow_watched()
         .membership_config
         .membership()
         .voter_ids()

@@ -110,6 +110,15 @@ impl RedbStorage {
         Arc::clone(&self.db)
     }
 
+    /// 数据目录（`open` 的 dir 的 arg，即 `{dir}/dsh.redb` 的 parent）。
+    /// P2 快照文件目录 = `{data_dir}/snapshots`（file-backed SnapshotData）。
+    pub fn base_dir(self) -> PathBuf {
+        match self.db_path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => PathBuf::new(),
+        }
+    }
+
     /// 创建备份：copy `{data_dir}/dsh.redb` → `{dest_dir}/dsh.redb`，返回备份文件路径。
     ///
     /// 实现方式：持有未提交的写事务贯穿整个 copy 窗口——redb 单写者语义下其他

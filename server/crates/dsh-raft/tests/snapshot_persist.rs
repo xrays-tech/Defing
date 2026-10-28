@@ -39,13 +39,16 @@ async fn snapshot_persists_across_restart() {
                 1,
             )
             .unwrap();
-        let mut sm_store = StateMachineStore::new(sm.clone(), db.clone());
+        let mut sm_store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
         let mut builder = sm_store.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.expect("build snapshot");
+        // P2a: SnapshotData 即 PathBuf——payload 落盘 file,not inline Vec
         assert!(
-            !snap.snapshot.into_inner().is_empty(),
-            "snapshot data should be non-empty"
+            std::fs::exists(&snap.snapshot).unwrap_or(false),
+            "snapshot payload file must exist"
         );
+        let payload = store::read_snapshot_payload(snap.snapshot).expect("payload file readable");
+        assert!(!payload.is_empty(), "snapshot payload bytes non-empty");
         drop(builder);
         drop(sm_store);
         drop(sm);
@@ -57,13 +60,13 @@ async fn snapshot_persists_across_restart() {
         let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
         let db = storage.raw_db();
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
-        let mut s = StateMachineStore::new(sm.clone(), db);
+        let mut s = StateMachineStore::new(sm.clone(), db, dir.clone());
         let snap = s
             .get_current_snapshot()
             .await
             .expect("get_current_snapshot should not error");
         let snap = snap.expect("snapshot should persist across restart (B5)");
-        let data = snap.snapshot.into_inner();
+        let data = store::read_snapshot_payload(snap.snapshot).expect("payload file readable");
         let pairs: Vec<(Vec<u8>, Vec<u8>)> =
             serde_json::from_slice(&data).expect("snapshot data decodable");
         assert!(!pairs.is_empty(), "restored snapshot should carry state");

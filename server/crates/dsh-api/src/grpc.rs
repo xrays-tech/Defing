@@ -11,6 +11,8 @@ use dsh_core::model::{
 };
 use futures::Stream;
 use tonic::{Request, Response, Status};
+// 0.10：Raft.metrics() -> rt WatchReceiver（borrow() gone -> borrow_watched()）
+use dsh_raft::openraft::rt::WatchReceiver;
 
 use crate::ApiState;
 
@@ -393,7 +395,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
             .raft
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("not in cluster mode"))?;
-        let m = raft.metrics().borrow().clone();
+        let m = raft.metrics().borrow_watched().clone();
         let leader = m.current_leader;
         let voter_ids: Vec<u64> = m.membership_config.membership().voter_ids().collect();
         let committed = m.last_log_index.unwrap_or(0) as i64;

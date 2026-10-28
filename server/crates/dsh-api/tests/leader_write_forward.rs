@@ -50,7 +50,7 @@ async fn start3(join_token: bool) -> Vec<TestNode> {
         let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
         let db = storage.raw_db();
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
-        let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
+        let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone(), dir.clone()));
         let log_store = LogStore::new(db.clone());
         let info = NodeInfo {
             grpc_addr: format!("127.0.0.1:{}", 18000 + id),

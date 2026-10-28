@@ -8,6 +8,9 @@ use clap::{Parser, Subcommand};
 use dsh_api::ApiState;
 use dsh_core::{InMemoryStore, StateMachine};
 use dsh_crypto::{load_master_key, Cipher};
+// 0.10：Raft.metrics() -> openraft rt WatchReceiver trait（changed()/borrow_watched(),
+// borrow() gone）
+use dsh_raft::openraft::rt::WatchReceiver;
 use dsh_raft::{
     HttpNetworkFactory, LogStore, NodeInfo as RaftNodeInfo, RaftServerState, StateMachineStore,
 };
@@ -915,6 +918,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let storage = RedbStorage::open(&data_dir)?;
     let db = storage.raw_db();
+    // P2a file-backed SnapshotData:本节点 data 目录（RedbStorage::base_dir anchor），
+    // snapshot payload 文件落 `{data_dir}/snapshots/`（StateMachineStore 与 raft router 共用）
+    let data_base = storage.clone().base_dir();
     let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
     // 集群模式挂主密钥轮换钩子：Raft apply 到 RotateMasterKey 时更新本节点 keyring 并持久化 ring 文件
     // （dev-single 不挂——它走 handler 的本地轮换逻辑，先持久化后切换）。
@@ -922,6 +928,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sm.clone(),
         db.clone(),
         cluster_rotation_hook(cli.master_key_file.as_deref(), cipher.clone()),
+        data_base.clone(),
     ));
     // A2：seed 与集群现实比对用——保留一份 store 引用（sm_store 随后被 new_raft_node 移走）。
     // 直接读持久化成员表而非 raft.metrics()：metrics 在 Raft::new 后可能尚未发布（watch 异步），
@@ -1025,7 +1032,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::spawn(async move {
             let mut rx = metrics;
             while rx.changed().await.is_ok() {
-                let m = rx.borrow().clone();
+                let m = rx.borrow_watched().clone();
                 let _ = leader_tx.send(m.current_leader == Some(node_id));
             }
         });
@@ -1067,7 +1074,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut warned = false;
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             loop {
-                let m = raft_warn.metrics().borrow().clone();
+                let m = raft_warn.metrics().borrow_watched().clone();
                 if m.current_leader.is_some() {
                     warned = false;
                 } else {
@@ -1084,8 +1091,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Raft RPC 服务（raft_addr）
-    let raft_state =
-        RaftServerState::with_token(raft.clone(), Some(Arc::from(raft_token.as_str())));
+    let raft_state = RaftServerState::with_token(
+        raft.clone(),
+        Some(Arc::from(raft_token.as_str())),
+        data_base.clone().join(dsh_raft::store::SNAP_SUBDIR),
+    );
     let raft_router = dsh_raft::raft_router(raft_state);
     let raft_addr = cli.raft_addr.clone();
     tokio::spawn(async move {

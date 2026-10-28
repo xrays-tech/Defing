@@ -18,7 +18,7 @@ async fn learner_forward_hint() {
     let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
     let db = storage.raw_db();
     let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
-    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
+    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone(), dir.clone()));
     let log_store = LogStore::new(db.clone());
     let n1 = NodeInfo {
         grpc_addr: "127.0.0.1:8001".into(),
@@ -37,7 +37,11 @@ async fn learner_forward_hint() {
     let storage2 = RedbStorage::open(&dir2.display().to_string()).unwrap();
     let db2 = storage2.raw_db();
     let sm2 = Arc::new(RwLock::new(StateMachine::new(Box::new(storage2))));
-    let sm_store2 = Arc::new(StateMachineStore::new(sm2.clone(), db2.clone()));
+    let sm_store2 = Arc::new(StateMachineStore::new(
+        sm2.clone(),
+        db2.clone(),
+        dir2.clone(),
+    ));
     let log_store2 = LogStore::new(db2.clone());
     let n2 = NodeInfo {
         grpc_addr: "127.0.0.1:8002".into(),

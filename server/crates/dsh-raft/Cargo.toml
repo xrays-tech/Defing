@@ -8,7 +8,17 @@ description = "Defing config service - openraft integration (module 03)"
 [dependencies]
 dsh-core = { path = "../dsh-core" }
 dsh-storage = { path = "../dsh-storage" }
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+# Phase 0 spike: pinned 0.10 alpha (0.10 已无 storage-v2 feature; serde 为主)
+openraft = { version = "=0.10.0-alpha.37", features = ["serde"] }
+# P0 实验依赖（AppendEntries 预算测量）+ P2b1 MessagePack RPC wire
+rmp-serde = "1"
+# axum Bytes body extractor 的 (P2b1 msgpack 服务端端点)
+bytes = "1"
+# 0.10 apply() 是 futures Stream 消费
+futures-util = "0.3"
+# P2b2: streaming snapshot frames (client reqwest Body::wrap_stream pump)
+tokio-util = { version = "0.7", features = ["io"] }
+pin-project = "1"
 # 表类型/事务操作需直接 use redb（Database/WriteTransaction/ReadableTable 等）
 redb = "4.1"
 serde = { workspace = true }

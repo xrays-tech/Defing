@@ -1,33 +1,46 @@
 //! Raft 日志/状态机/快照存储（模块 03 §5）。
 //! - LogStore：raft-log / raft-meta 表（经 RedbStorage::raw_db）
-#![allow(clippy::result_large_err, clippy::type_complexity)] // openraft StorageError/RPCError 的 Err 变体较大（上游类型）
+#![allow(clippy::result_large_err, clippy::type_complexity)] // openraft IOFlushed/Responder 的 Err 变体较大（上游类型）
 
-use std::io::Cursor;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use dsh_core::error::Error as DshError;
 use dsh_core::model::PublishEvent;
 use dsh_core::StateMachine;
 use dsh_storage::{TBL_RAFT_LOG, TBL_RAFT_META, TBL_SNAPSHOTS};
+use futures_util::Stream;
+use futures_util::StreamExt;
+use openraft::impls::leader_id_adv::LeaderId;
+use openraft::storage::EntryResponder;
 use openraft::storage::{
-    LogState, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine,
+    ApplyResponder, IOFlushed, LogState, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder,
+    RaftStateMachine,
 };
-use openraft::{
-    Entry, EntryPayload, ErrorSubject, ErrorVerb, LeaderId, LogId, OptionalSend, Snapshot,
-    SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
+use openraft::type_config::alias::{
+    EntryOf as EntryAlias, LogIdOf as LogIdAlias, SnapshotMetaOf, SnapshotOf, StoredMembershipOf,
+    VoteOf,
 };
+use openraft::{EntryPayload, LogId, OptionalSend, Snapshot, SnapshotMeta, StoredMembership};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{NodeId, NodeInfo, TypeConfig};
 
-type ErrOf = StorageError<NodeId>;
+// 0.10：storage Err is std::io::Error（0.9 StorageError<C> enum 已 gone）
+type ErrOf = io::Error;
 
-pub type EntryOf = Entry<TypeConfig>;
-pub type LogIdOf = LogId<NodeId>;
+pub type EntryOf = EntryAlias<TypeConfig>;
+pub type LogIdOf = LogIdAlias<TypeConfig>;
 
 // 公共存储句柄：共享 redb（dsh_storage::RedbStorage::raw_db）
 pub type DbHandle = std::sync::Arc<redb::Database>;
+
+/// write_last_applied 故障注入 sentinel：关闭默认（usize 上限，u64 域）。
+const NO_FAULT: u64 = 18446744073370008100;
 
 // ---------------- meta 键（raft-meta 表） ----------------
 
@@ -36,55 +49,234 @@ const META_LAST_PURGED: &[u8] = b"last_purged";
 const META_LAST_APPLIED: &[u8] = b"last_applied";
 const META_MEMBERSHIP: &[u8] = b"membership";
 
-// ---------------- 快照持久化（snapshots 表；B5） ----------------
+// ---------------- snapshot persistence (snapshots table registry; B5; P2a file-backed) ----------------
+//
+// P2a（dev_docs/research/openraft-010-compat.md §12）: SnapshotData = PathBuf.
+// Payload bytes live in `{data_dir}/snapshots/` files (anchor RedbStorage::base_dir());
+// redb `snapshots` table only keeps a registry: `meta` (SnapshotMeta JSON) + `file`
+// (current payload file path). Old 0.9/P1 inline key `data` (JSON pairs blob) is migrated
+// on first read: materialize to file, write `file`, remove `data`.
+// File writes go through `{name}.part` + atomic rename; every failure path removes its `.part`.
 
 const SNAP_META_KEY: &[u8] = b"meta";
-const SNAP_DATA_KEY: &[u8] = b"data";
+const SNAP_FILE_KEY: &[u8] = b"file";
+const SNAP_DATA_KEY: &[u8] = b"data"; // legacy inline payload (0.9/P1), migrated on first read
 
-fn persist_snapshot(
-    db: &DbHandle,
-    meta: &SnapshotMeta<NodeId, NodeInfo>,
-    data: &[u8],
-) -> Result<(), ErrOf> {
-    let meta_raw = ser(meta)?;
-    // meta+data 同一事务原子提交（Durability 默认 Immediate：commit 返回即已 fsync）
-    let txn = db
-        .begin_write()
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
-    {
-        let mut table = txn
-            .open_table(TBL_SNAPSHOTS)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
-        table
-            .insert(SNAP_META_KEY, meta_raw.as_slice())
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
-        table
-            .insert(SNAP_DATA_KEY, data)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+/// `{data_dir}/snapshots/` subdir name (pairs with RedbStorage::base_dir()).
+pub const SNAP_SUBDIR: &str = "snapshots";
+
+/// Per-process monotonic suffix for snapshot payload file names (unique across rebuilds).
+static SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn snap_file_name(meta: &SnapshotMetaOf<TypeConfig>) -> String {
+    let seq = SNAP_SEQ.fetch_add(1, Ordering::Relaxed);
+    match meta.last_log_id {
+        Some(id) => format!(
+            "snap-t{}-n{}-i{}-{}.snap",
+            id.leader_id.term, id.leader_id.node_id, id.index, seq
+        ),
+        None => format!("snap-initial-{}.snap", seq),
     }
-    txn.commit()
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))
 }
 
-fn load_persisted_snapshot(
-    db: &DbHandle,
-) -> Result<Option<(SnapshotMeta<NodeId, NodeInfo>, Vec<u8>)>, ErrOf> {
-    let txn = db
-        .begin_read()
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-    let table = txn
-        .open_table(TBL_SNAPSHOTS)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-    let meta_raw = table
-        .get(SNAP_META_KEY)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-    let data = table
-        .get(SNAP_DATA_KEY)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-    match (meta_raw, data) {
-        (Some(m), Some(d)) => Ok(Some((de(m.value())?, d.value().to_vec()))),
-        _ => Ok(None),
+/// Create `{data_dir}/snapshots/` (idempotent; used at store construction and before each write).
+/// Stale `.part` cleanup is per-name (see write_payload_file: pre-clear + failure cleanup) —
+/// this toolchain's std::fs offers no usable directory enumeration for a global sweep.
+fn prepare_snap_dir(dir: PathBuf) -> Result<(), ErrOf> {
+    fs::create_dir_all(dir).map_err(io_write)?;
+    Ok(())
+}
+
+/// Atomic payload file write: bytes → `{name}.part`, then rename → `{name}`.
+/// Any failure path removes the `.part` (never leaves a half-written file).
+fn write_payload_file(dir: PathBuf, name: String, bytes: &[u8]) -> Result<PathBuf, ErrOf> {
+    fs::create_dir_all(&dir).map_err(io_write)?;
+    let part_path = dir.join(format!("{}.part", name));
+    let final_path = dir.join(name);
+    // Clear a stale temp for this name before starting (crashed earlier write of same name).
+    let _ = fs::remove_file(&part_path);
+    let done = match fs::write(&part_path, bytes) {
+        Err(e) => Err(io_write(e)),
+        Ok(()) => match fs::rename(&part_path, &final_path) {
+            Err(e) => Err(io_write(e)),
+            Ok(()) => Ok(()),
+        },
+    };
+    if done.is_err() {
+        // failed write/rename: the (possibly half-written) temp must not linger
+        let _ = fs::remove_file(&part_path);
     }
+    done?;
+    Ok(final_path)
+}
+
+/// Read a payload file (install-side validation happens in the caller before any state change).
+fn read_payload_file(path: PathBuf) -> Result<Vec<u8>, ErrOf> {
+    fs::read(path).map_err(io_read)
+}
+
+/// Registry read: return the current snapshot as (meta, payload file path).
+///
+/// - `file` key present → payload is that file (missing/unreadable file = stale registry:
+///   warn, treat as no snapshot — the leader re-sends on the next replication round).
+/// - legacy 0.9/P1 layout (`meta` + inline `data`, no `file`) → one-shot migration:
+///   validate the inline JSON parses, materialize it to a file, then in one write txn
+///   insert `file` and remove `data` (registry switch is atomic; payload file written first).
+fn load_snapshot_registry(
+    db: &DbHandle,
+    dir: PathBuf,
+) -> Result<Option<(SnapshotMetaOf<TypeConfig>, PathBuf)>, ErrOf> {
+    let (meta_raw, file_raw, data_raw) = {
+        let txn = db.begin_read().map_err(io_read)?;
+        let table = txn.open_table(TBL_SNAPSHOTS).map_err(io_read)?;
+        (
+            table
+                .get(SNAP_META_KEY)
+                .map_err(io_read)?
+                .map(|g| g.value().to_vec()),
+            table
+                .get(SNAP_FILE_KEY)
+                .map_err(io_read)?
+                .map(|g| g.value().to_vec()),
+            table
+                .get(SNAP_DATA_KEY)
+                .map_err(io_read)?
+                .map(|g| g.value().to_vec()),
+        )
+    };
+    let meta: SnapshotMetaOf<TypeConfig> = match meta_raw {
+        Some(raw) => de(&raw)?,
+        None => return Ok(None),
+    };
+    if let Some(raw) = file_raw {
+        // `file` value = JSON-encoded PathBuf (serde_json handles PathBuf natively)
+        let path: PathBuf = de(&raw)?;
+        if fs::exists(&path).unwrap_or(false) {
+            return Ok(Some((meta, path)));
+        }
+        tracing::warn!(
+            "snapshot registry points at missing file {}; treat as none",
+            path.display()
+        );
+        return Ok(None);
+    }
+    // legacy inline blob (0.9 redb `data` key): materialize once
+    if data_raw.is_none() {
+        return Ok(None);
+    }
+    let raw_data = data_raw.unwrap();
+    let parsed: Result<Vec<(Vec<u8>, Vec<u8>)>, _> = serde_json::from_slice(&raw_data);
+    if parsed.is_err() {
+        tracing::warn!("legacy snapshot data key unparsable; leaving it for inspection");
+        return Ok(None);
+    }
+    let path = write_payload_file(dir, snap_file_name(&meta), &raw_data)?;
+    let file_val = ser(&path)?;
+    let txn = db.begin_write().map_err(io_write)?;
+    {
+        let mut table = txn.open_table(TBL_SNAPSHOTS).map_err(io_write)?;
+        table
+            .insert(SNAP_FILE_KEY, file_val.as_slice())
+            .map_err(io_write)?;
+        table.remove(SNAP_DATA_KEY).map_err(io_write)?;
+    }
+    if let Err(e) = txn.commit() {
+        // registry switch failed → the materialized file is an orphan: drop it, no half-state
+        let _ = fs::remove_file(&path);
+        return Err(io_write(e));
+    }
+    tracing::info!(
+        "migrated legacy inline snapshot blob to file {}",
+        path.display()
+    );
+    Ok(Some((meta, path)))
+}
+
+/// Persist the registry: meta + current file path; also removes any legacy inline `data`
+/// key (same txn). Returns the previous file path (if any) for caller-side cleanup after commit.
+fn persist_snapshot_registry(
+    db: &DbHandle,
+    meta: &SnapshotMetaOf<TypeConfig>,
+    path: PathBuf,
+) -> Result<Option<PathBuf>, ErrOf> {
+    let meta_raw = ser(meta)?;
+    let file_val = ser(&path)?;
+    let old: Option<PathBuf> = {
+        let txn = db.begin_read().map_err(io_read)?;
+        let table = txn.open_table(TBL_SNAPSHOTS).map_err(io_read)?;
+        match table.get(SNAP_FILE_KEY).map_err(io_read)? {
+            Some(guard) => Some(de(guard.value())?),
+            None => None,
+        }
+    };
+    let txn = db.begin_write().map_err(io_write)?;
+    {
+        let mut table = txn.open_table(TBL_SNAPSHOTS).map_err(io_write)?;
+        table
+            .insert(SNAP_META_KEY, meta_raw.as_slice())
+            .map_err(io_write)?;
+        table
+            .insert(SNAP_FILE_KEY, file_val.as_slice())
+            .map_err(io_write)?;
+        table.remove(SNAP_DATA_KEY).map_err(io_write)?;
+    }
+    txn.commit().map_err(io_write)?;
+    Ok(old)
+}
+
+/// Delete the superseded payload file after a newer registry has committed.
+/// Best-effort: IO failure only warns (registry no longer references the file).
+fn delete_old_snapshot_file(old: Option<PathBuf>) {
+    if let Some(p) = &old {
+        if let Err(e) = fs::remove_file(p) {
+            tracing::warn!("old snapshot file remove failed: {e}");
+        }
+    }
+}
+
+/// P2a public file helpers (network bridge + HTTP server-side materialization):
+/// - write_snapshot_payload: received wire bytes → canonical file in this node's snapshots dir
+///   (`.part` + rename, cleanup on failure);
+/// - read_snapshot_payload: payload file → Vec for the JSON single-RPC bridge
+///   (P1 transport kept; P2b will replace both sides with streaming binary frames).
+pub fn write_snapshot_payload(
+    snap_dir: PathBuf,
+    meta: &SnapshotMetaOf<TypeConfig>,
+    bytes: &[u8],
+) -> Result<PathBuf, ErrOf> {
+    write_payload_file(snap_dir, snap_file_name(meta), bytes)
+}
+
+/// P2b3 streaming materialization helpers. The payload file name must be minted
+/// EXACTLY ONCE per snapshot (SNAP_SEQ advances per call), then both the `.part`
+/// and final paths derive from that single name:
+/// - open `.part` when the Header frame arrives (ChunkWriter.create),
+/// - finalize_payload_part: flush done -> rename `.part` -> canonical,
+/// - abort_payload_part: any protocol/IO failure path removes `.part` (best-effort).
+pub fn snapshot_file_name(meta: &SnapshotMetaOf<TypeConfig>) -> String {
+    snap_file_name(meta)
+}
+
+pub fn payload_part_path(dir: PathBuf, name: String) -> PathBuf {
+    dir.join(format!("{}.part", name))
+}
+
+pub fn finalize_payload_part(dir: PathBuf, name: String) -> Result<PathBuf, ErrOf> {
+    let part_path = payload_part_path(dir.clone(), name.clone());
+    let final_path = dir.join(name);
+    match fs::rename(&part_path, &final_path) {
+        Ok(()) => Ok(final_path),
+        Err(e) => Err(io_write(e)),
+    }
+}
+
+pub fn abort_payload_part(dir: PathBuf, name: String) {
+    let part_path = payload_part_path(dir, name);
+    let _ = fs::remove_file(&part_path);
+}
+
+pub fn read_snapshot_payload(path: PathBuf) -> Result<Vec<u8>, ErrOf> {
+    read_payload_file(path)
 }
 
 fn log_key(index: u64) -> [u8; 8] {
@@ -98,42 +290,32 @@ fn log_index_from_key(key: &[u8]) -> u64 {
 }
 
 fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>, ErrOf> {
-    serde_json::to_vec(v).map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string()))
+    serde_json::to_vec(v).map_err(|e| io_write(e.to_string()))
 }
 
 fn de<T: for<'de> Deserialize<'de>>(raw: &[u8]) -> Result<T, ErrOf> {
-    serde_json::from_slice(raw)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e.to_string()))
+    serde_json::from_slice(raw).map_err(|e| io_read(e.to_string()))
 }
 
-fn io_err<NID: openraft::NodeId>(
-    subject: ErrorSubject<NID>,
-    verb: ErrorVerb,
-    msg: impl std::fmt::Display,
-) -> StorageError<NID> {
-    let e = std::io::Error::other(msg.to_string());
-    StorageError::IO {
-        source: StorageIOError::new(subject, verb, openraft::AnyError::new(&e)),
-    }
+// 0.10：storage Err is std::io::Error（0.9 StorageIOError{subject,verb,AnyError} 已 gone）
+fn io_write(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("write: {msg}"))
+}
+
+fn io_read(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("read: {msg}"))
 }
 
 fn storage_err(e: DshError) -> ErrOf {
-    io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string())
+    io_write(e.to_string())
 }
 
 // ---------------- raft-meta 表读写（LogStore / StateMachineStore 共用） ----------------
 
 fn meta_get(db: &DbHandle, key: &[u8]) -> Result<Option<Vec<u8>>, ErrOf> {
-    let txn = db
-        .begin_read()
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-    let table = txn
-        .open_table(TBL_RAFT_META)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-    match table
-        .get(key)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?
-    {
+    let txn = db.begin_read().map_err(io_read)?;
+    let table = txn.open_table(TBL_RAFT_META).map_err(io_read)?;
+    match table.get(key).map_err(io_read)? {
         Some(guard) => Ok(Some(guard.value().to_vec())),
         None => Ok(None),
     }
@@ -141,35 +323,21 @@ fn meta_get(db: &DbHandle, key: &[u8]) -> Result<Option<Vec<u8>>, ErrOf> {
 
 /// 写 raft-meta 单键（单事务提交；Durability 默认 Immediate，commit 即 fsync）。
 fn meta_put(db: &DbHandle, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
-    let txn = db
-        .begin_write()
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
-    let mut table = txn
-        .open_table(TBL_RAFT_META)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
-    table
-        .insert(key, value)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+    let txn = db.begin_write().map_err(io_write)?;
+    let mut table = txn.open_table(TBL_RAFT_META).map_err(io_write)?;
+    table.insert(key, value).map_err(io_write)?;
     drop(table); // 表句柄先于 commit 释放（commit 消费事务）
-    txn.commit()
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))
+    txn.commit().map_err(io_write)
 }
 
 /// 共享的日志读取逻辑（LogReader 与 LogStore 复用）：[start, end] 闭区间。
 fn read_entries(db: &DbHandle, start: u64, end: u64) -> Result<Vec<EntryOf>, ErrOf> {
-    let txn = db
-        .begin_read()
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
-    let table = txn
-        .open_table(TBL_RAFT_LOG)
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    let txn = db.begin_read().map_err(io_read)?;
+    let table = txn.open_table(TBL_RAFT_LOG).map_err(io_read)?;
     let start_key = log_key(start);
     let mut out = Vec::new();
-    for row in table
-        .range(start_key.as_slice()..)
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?
-    {
-        let (k, v) = row.map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    for row in table.range(start_key.as_slice()..).map_err(io_read)? {
+        let (k, v) = row.map_err(io_read)?;
         if log_index_from_key(k.value()) > end {
             break;
         }
@@ -180,16 +348,10 @@ fn read_entries(db: &DbHandle, start: u64, end: u64) -> Result<Vec<EntryOf>, Err
 
 /// 最后一条日志（升序表尾部）。空表返回 None。
 fn last_log_entry(db: &DbHandle) -> Result<Option<EntryOf>, ErrOf> {
-    let txn = db
-        .begin_read()
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
-    let table = txn
-        .open_table(TBL_RAFT_LOG)
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    let txn = db.begin_read().map_err(io_read)?;
+    let table = txn.open_table(TBL_RAFT_LOG).map_err(io_read)?;
     // 先绑定局部再匹配：避免尾表达式的 AccessGuard 临时值活得比 table 久
-    let last = table
-        .last()
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    let last = table.last().map_err(io_read)?;
     match last {
         Some((_, v)) => Ok(Some(de(v.value())?)),
         None => Ok(None),
@@ -203,15 +365,10 @@ fn collect_log_indexes<'k, R>(txn: &redb::WriteTransaction, range: R) -> Result<
 where
     R: std::ops::RangeBounds<&'k [u8]> + 'k,
 {
-    let table = txn
-        .open_table(TBL_RAFT_LOG)
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+    let table = txn.open_table(TBL_RAFT_LOG).map_err(io_write)?;
     let mut out = Vec::new();
-    for row in table
-        .range(range)
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?
-    {
-        let (k, _) = row.map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+    for row in table.range(range).map_err(io_write)? {
+        let (k, _) = row.map_err(io_write)?;
         out.push(log_index_from_key(k.value()));
     }
     Ok(out)
@@ -219,13 +376,9 @@ where
 
 /// 在写事务内逐条删除日志（调用前须已 drop 收集阶段的表句柄，见 collect_log_indexes）。
 fn remove_log_indexes(txn: &redb::WriteTransaction, indexes: Vec<u64>) -> Result<(), ErrOf> {
-    let mut table = txn
-        .open_table(TBL_RAFT_LOG)
-        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+    let mut table = txn.open_table(TBL_RAFT_LOG).map_err(io_write)?;
     for idx in indexes {
-        table
-            .remove(log_key(idx).as_slice())
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        table.remove(log_key(idx).as_slice()).map_err(io_write)?;
     }
     Ok(())
 }
@@ -271,6 +424,13 @@ impl RaftLogReader<TypeConfig> for LogReader {
         };
         read_entries(&self.db, start, end)
     }
+
+    // 0.10：read_vote 在 RaftLogReader（0.9 的 LogStorage 位置 gone）
+    async fn read_vote(&mut self) -> Result<Option<VoteOf<TypeConfig>>, ErrOf> {
+        meta_get(&self.db, META_VOTE)?
+            .map(|raw| de(&raw))
+            .transpose()
+    }
 }
 
 impl RaftLogReader<TypeConfig> for LogStore {
@@ -290,6 +450,12 @@ impl RaftLogReader<TypeConfig> for LogStore {
         };
         read_entries(&self.db, start, end)
     }
+
+    async fn read_vote(&mut self) -> Result<Option<VoteOf<TypeConfig>>, ErrOf> {
+        meta_get(&self.db, META_VOTE)?
+            .map(|raw| de(&raw))
+            .transpose()
+    }
 }
 
 impl RaftLogStorage<TypeConfig> for LogStore {
@@ -300,7 +466,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             .map(|raw| de::<u64>(&raw))
             .transpose()?
             .map(|idx| LogId {
-                leader_id: LeaderId::new(0, NodeId::MAX),
+                leader_id: LeaderId {
+                    term: 0,
+                    node_id: NodeId::MAX,
+                },
                 index: idx,
             });
         let last_log = last_log_entry(&self.db)?.map(|e| e.log_id);
@@ -314,80 +483,62 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         LogReader::new(self.db.clone())
     }
 
-    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), ErrOf> {
+    async fn save_vote(&mut self, vote: &VoteOf<TypeConfig>) -> Result<(), ErrOf> {
         let raw = ser(vote)?;
         meta_put(&self.db, META_VOTE, &raw)
     }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, ErrOf> {
-        meta_get(&self.db, META_VOTE)?
-            .map(|raw| de(&raw))
-            .transpose()
-    }
+    // 0.10：read_vote 在 RaftLogReader（not on RaftLogStorage）——see LogReader impl above
 
-    async fn append<I>(
-        &mut self,
-        entries: I,
-        callback: openraft::storage::LogFlushed<TypeConfig>,
-    ) -> Result<(), ErrOf>
+    async fn append<I>(&mut self, entries: I, callback: IOFlushed<TypeConfig>) -> Result<(), ErrOf>
     where
         I: IntoIterator<Item = EntryOf> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
         // 单写事务批量 insert 后一次 commit：等价原 WriteBatch+flush_wal(true)
         // （WriteTransaction 默认 Durability::Immediate，commit 返回即已 fsync）
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        let txn = self.db.begin_write().map_err(io_write)?;
         {
-            let mut table = txn
-                .open_table(TBL_RAFT_LOG)
-                .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+            let mut table = txn.open_table(TBL_RAFT_LOG).map_err(io_write)?;
             for e in entries {
                 let raw = ser(&e)?;
                 table
                     .insert(log_key(e.log_id.index).as_slice(), raw.as_slice())
-                    .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+                    .map_err(io_write)?;
             }
         }
-        txn.commit()
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
-        callback.log_io_completed(Ok(()));
+        txn.commit().map_err(io_write)?;
+        // 0.10：IOFlushed callback（0.9 LogFlushed 已 renamed; log_io_completed → io_completed）
+        callback.io_completed(Ok(()));
         Ok(())
     }
 
-    async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), ErrOf> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
-        let from = log_key(log_id.index);
+    // 0.10：truncate(log_id) 改名 truncate_after(last_log_id)（删除 index > last_log_id.index）
+    async fn truncate_after(&mut self, last_log_id: Option<LogIdOf>) -> Result<(), ErrOf> {
+        let txn = self.db.begin_write().map_err(io_write)?;
+        let from_index = match last_log_id {
+            None => 0,
+            Some(id) => id.index + 1,
+        };
+        let from = log_key(from_index);
         let indexes = collect_log_indexes(&txn, from.as_slice()..)?;
         remove_log_indexes(&txn, indexes)?;
-        txn.commit()
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))
+        txn.commit().map_err(io_write)
     }
 
-    async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), ErrOf> {
+    async fn purge(&mut self, log_id: LogIdOf) -> Result<(), ErrOf> {
         // BE 定宽 key：..=idx 的字典序范围恰为索引 <= idx 的全部日志
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        let txn = self.db.begin_write().map_err(io_write)?;
         let upto = log_key(log_id.index);
         let indexes = collect_log_indexes(&txn, ..=upto.as_slice())?;
         remove_log_indexes(&txn, indexes)?;
         // 日志清理与 last_purged 同一事务原子提交（redb 多表事务原生支持）
-        let mut meta_table = txn
-            .open_table(TBL_RAFT_META)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+        let mut meta_table = txn.open_table(TBL_RAFT_META).map_err(io_write)?;
         meta_table
             .insert(META_LAST_PURGED, ser(&log_id.index)?.as_slice())
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+            .map_err(io_write)?;
         drop(meta_table); // 表句柄先于 commit 释放（commit 消费事务）
-        txn.commit()
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))
+        txn.commit().map_err(io_write)
     }
 }
 
@@ -399,19 +550,25 @@ pub struct StateMachineStore {
     /// 状态机（共享：apply 与读共用锁）
     pub sm: Arc<RwLock<StateMachine>>,
     db: DbHandle,
-    /// 内存中的当前快照（M1：不跨重启持久化）
-    current_snapshot: Arc<tokio::sync::Mutex<Option<(SnapshotMeta<NodeId, NodeInfo>, Vec<u8>)>>>,
+    /// 本节点 data 目录（RedbStorage::base_dir 传入）；P2a 快照文件在 `{data_dir}/snapshots/`
+    data_dir: PathBuf,
+    /// 内存中的当前快照（meta + payload 文件 PathBuf；P2a: PathBuf 拷贝即 cheap，no blob clone）
+    current_snapshot: Arc<tokio::sync::Mutex<Option<(SnapshotMetaOf<TypeConfig>, PathBuf)>>>,
     /// 发布事件广播（集群 watch：apply 时向本地订阅者推送）
     events: tokio::sync::broadcast::Sender<PublishEvent>,
     /// 主密钥轮换钩子：apply 到 `Command::RotateMasterKey` 成功时调用（更新本地 Cipher keyring + 持久化 ring 文件）。
     /// 入参为整个命令（F7b：新命令 kek_enc 自加密、旧日志 kek 明文），解密由钩子实现方负责。
     /// 状态机本身不落数据（确定性），此钩子是集群一致的密钥轮换副作用出口。
     rotation_hook: Option<Arc<dyn Fn(&dsh_core::command::Command) + Send + Sync>>,
+    /// P1 测试注入：第 N（≥1）`write_last_applied` 调用返回 IO error（0/SENTINEL = off）。
+    /// Relaxed atomic 读/增量 per entry（negligible vs redb 事务），仅测试路径非默认。
+    fail_last_applied_at: Arc<AtomicU64>,
+    last_applied_calls: Arc<AtomicU64>,
 }
 
 impl StateMachineStore {
-    pub fn new(sm: Arc<RwLock<StateMachine>>, db: DbHandle) -> Self {
-        Self::new_with_rotation(sm, db, None)
+    pub fn new(sm: Arc<RwLock<StateMachine>>, db: DbHandle, data_dir: PathBuf) -> Self {
+        Self::new_with_rotation(sm, db, None, data_dir)
     }
 
     /// 构造状态机存储并挂载主密钥轮换钩子（集群模式由 dsh-cli 传入；dev-single 走 handler 本地逻辑，不挂）。
@@ -419,15 +576,31 @@ impl StateMachineStore {
         sm: Arc<RwLock<StateMachine>>,
         db: DbHandle,
         hook: Option<Arc<dyn Fn(&dsh_core::command::Command) + Send + Sync>>,
+        data_dir: PathBuf,
     ) -> Self {
         let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+        // P2a: prepare `{data_dir}/snapshots/`（best-effort warn，实际写入路径再 ensure_dir）
+        let snap_dir = data_dir.join(SNAP_SUBDIR);
+        if let Err(e) = prepare_snap_dir(snap_dir) {
+            tracing::warn!("prepare snapshots dir failed: {e}");
+        }
         Self {
             sm,
             db,
+            data_dir,
             current_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
             events: tx,
             rotation_hook: hook,
+            fail_last_applied_at: Arc::new(AtomicU64::new(NO_FAULT)),
+            last_applied_calls: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// P1 测试注入开关（doc-hidden）：第 `n`（≥1）write_last_applied 调用 IO-fail；`0`/`NO_FAULT` 关闭。
+    #[doc(hidden)]
+    pub fn set_fail_last_applied(&self, n: u64) {
+        self.fail_last_applied_at.store(n, Ordering::Relaxed);
+        self.last_applied_calls.store(0, Ordering::Relaxed);
     }
 
     /// 订阅发布事件（集群 watch 用）。
@@ -469,16 +642,9 @@ impl StateMachineStore {
     }
 
     fn raft_meta_is_empty(&self) -> Result<bool, ErrOf> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-        let table = txn
-            .open_table(TBL_RAFT_META)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-        table
-            .is_empty()
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))
+        let txn = self.db.begin_read().map_err(io_read)?;
+        let table = txn.open_table(TBL_RAFT_META).map_err(io_read)?;
+        table.is_empty().map_err(io_read)
     }
 
     fn read_last_applied(&self) -> Result<Option<LogIdOf>, ErrOf> {
@@ -488,19 +654,102 @@ impl StateMachineStore {
     }
 
     fn write_last_applied(&self, id: &LogIdOf) -> Result<(), ErrOf> {
+        // P1 注入：第 N 调用 fail（测试错误路径：responder 必须已 respond 前 apply 返回 Err）
+        let call = self.last_applied_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let fail_at = self.fail_last_applied_at.load(Ordering::Relaxed);
+        if fail_at != 0 && call >= fail_at {
+            return Err(io_write("injected write_last_applied IO failure"));
+        }
         // 每条独立事务（设计 §8.7：重启重放边界语义优先，不合并为批末单写）
         meta_put(&self.db, META_LAST_APPLIED, &ser(id)?)
     }
 
-    fn read_membership(&self) -> Result<StoredMembership<NodeId, NodeInfo>, ErrOf> {
+    fn read_membership(&self) -> Result<StoredMembershipOf<TypeConfig>, ErrOf> {
         match meta_get(&self.db, META_MEMBERSHIP)? {
             Some(raw) => de(&raw),
             None => Ok(StoredMembership::default()),
         }
     }
 
-    fn write_membership(&self, m: &StoredMembership<NodeId, NodeInfo>) -> Result<(), ErrOf> {
+    fn write_membership(&self, m: &StoredMembershipOf<TypeConfig>) -> Result<(), ErrOf> {
         meta_put(&self.db, META_MEMBERSHIP, &ser(m)?)
+    }
+    #[doc(hidden)]
+    /// apply 一个条目：状态机变更 + per-entry last_applied 落盘（§8.7 独立事务）。
+    /// 返回 (client 响应, 事件, hard)；hard!=None 即 IO/锁错误——调用方已 respond 该 entry（P1:
+    /// responder 契约），stop consuming the stream, flush, then return Err.
+    fn apply_entry(
+        &self,
+        entry: EntryOf,
+    ) -> (
+        Result<crate::types::WriteAck, DshError>,
+        Vec<PublishEvent>,
+        Option<ErrOf>,
+    ) {
+        let log_id = entry.log_id;
+        match self
+            .sm
+            .write()
+            .map_err(|e| io_write(format!("state lock unavailable: {e}")))
+        {
+            Err(e) => (
+                Err(DshError::internal(format!("state lock unavailable: {e}"))),
+                Vec::new(),
+                Some(e),
+            ),
+            Ok(mut sm) => {
+                let mut events: Vec<PublishEvent> = Vec::new();
+                let mut resp: Result<crate::types::WriteAck, DshError> =
+                    Ok(crate::types::WriteAck::default());
+                let mut hard: Option<ErrOf> = None;
+                match entry.payload {
+                    EntryPayload::Membership(m) => {
+                        let stored = StoredMembership::new(Some(log_id), m.clone());
+                        if let Err(e) = self.write_membership(&stored) {
+                            resp = Err(DshError::internal(format!(
+                                "membership persist failed: {e}"
+                            )));
+                            hard = Some(e);
+                        }
+                    }
+                    EntryPayload::Blank => {}
+                    EntryPayload::Normal(cmd) => {
+                        // deterministic time from log index (D16)
+                        let now_ms = log_id.index as i64;
+                        match sm.apply(&cmd, now_ms) {
+                            Ok(applied) => {
+                                if matches!(cmd, dsh_core::command::Command::RotateMasterKey { .. })
+                                {
+                                    if let Some(h) = &self.rotation_hook {
+                                        h(&cmd);
+                                    }
+                                }
+                                events.extend(applied.iter().cloned());
+                                resp = Ok(crate::types::WriteAck {
+                                    version: events.first().map(|e| e.version).unwrap_or(0),
+                                    events: applied,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "apply command failed (logged but state unchanged): {e}"
+                                );
+                                resp = Err(e);
+                            }
+                        }
+                    }
+                }
+                if hard.is_none() {
+                    if let Err(e) = self.write_last_applied(&log_id) {
+                        resp = Err(DshError::internal(format!(
+                            "last_applied persist failed: {e}"
+                        )));
+                        hard = Some(e);
+                    }
+                }
+                (resp, events, hard)
+            }
+        }
     }
 }
 
@@ -509,119 +758,125 @@ pub struct SnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, ErrOf> {
+    // 0.10：SnapshotData 在 state machine/network/builder（not in declare_raft_types）；P2a: PathBuf
+    type SnapshotData = PathBuf;
+
+    async fn build_snapshot(&mut self) -> Result<SnapshotOf<TypeConfig, PathBuf>, ErrOf> {
         let pairs = {
-            let sm =
-                self.inner.sm.read().map_err(|e| {
-                    io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e.to_string())
-                })?;
+            let sm = self.inner.sm.read().map_err(|e| io_read(e.to_string()))?;
             sm.dump_all().map_err(storage_err)?
         };
         let last_applied = self.inner.read_last_applied()?;
         let membership = self.inner.read_membership()?;
-        let data = serde_json::to_vec(&pairs)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string()))?;
-        let snapshot_id = format!(
-            "{}-{}",
-            last_applied
-                .as_ref()
-                .map(|l| l.index.to_string())
-                .unwrap_or_default(),
-            data.len()
-        );
+        let data = serde_json::to_vec(&pairs).map_err(|e| io_write(e.to_string()))?;
+        // 0.10：SnapshotMeta.snapshot_id 已 gone（wire 兼容 slot 保留 but always empty，see compat doc）
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
-            snapshot_id,
         };
+        // P2a: payload 落盘文件（`{name}.part` + rename，失败清理）——Snapshot 只 ever carries PathBuf
+        let path = write_payload_file(
+            self.inner.data_dir.join(SNAP_SUBDIR),
+            snap_file_name(&meta),
+            &data,
+        )?;
+        // registry 落盘（meta + file key；同事务 removes legacy inline data key）；旧文件清理 after commit
+        let old = persist_snapshot_registry(&self.inner.db, &meta, path.clone())?;
+        delete_old_snapshot_file(old);
         let snapshot = Snapshot {
             meta: meta.clone(),
-            snapshot: Box::new(Cursor::new(data.clone())),
+            snapshot: path.clone(),
         };
-        // 落盘（重启后 get_current_snapshot 可从盘恢复，无需重新从 leader 拉全量）
-        persist_snapshot(&self.inner.db, &meta, &data)?;
-        *self.inner.current_snapshot.lock().await = Some((meta, data));
+        *self.inner.current_snapshot.lock().await = Some((meta, path));
         Ok(snapshot)
     }
 }
 
 impl RaftStateMachine<TypeConfig> for StateMachineStore {
     type SnapshotBuilder = SnapshotBuilder;
+    type SnapshotData = PathBuf;
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogIdOf>, StoredMembership<NodeId, NodeInfo>), ErrOf> {
+    ) -> Result<(Option<LogIdOf>, StoredMembershipOf<TypeConfig>), ErrOf> {
         let last_applied = self.read_last_applied()?;
         let membership = self.read_membership()?;
         Ok((last_applied, membership))
     }
 
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<Vec<Result<crate::types::WriteAck, DshError>>, ErrOf>
+    // 0.10：apply<I: IntoIterator> 已 gone —— 消费 Stream<EntryResponder>，响应经 responder.send(C::R)
+    //（C::R = Result<WriteAck, dsh_core::Error>，见 types.rs declare_raft_types）。
+    // 写锁 per-entry（RwLock write guard 跨 await 条目读取会破坏 OptionalSend 要求）。
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), ErrOf>
     where
-        I: IntoIterator<Item = EntryOf> + OptionalSend,
-        I::IntoIter: OptionalSend,
+        Strm: Stream<Item = Result<EntryResponder<TypeConfig>, ErrOf>> + Unpin + OptionalSend,
     {
-        // perf 方案③：写锁作用域化——events 收集后解锁再广播（锁外 send），
+        // perf 方案③：写锁作用域化（per-entry）——events 收集后 unlock 再广播（锁外 send），
         // 缩短写锁持有时间（fsync 已由方案①收敛；send 移到锁外不阻塞读）。
-        let mut responses = Vec::new();
         let mut pending_events: Vec<PublishEvent> = Vec::new();
-        {
-            let mut sm = self
-                .sm
-                .write()
-                .map_err(|e| io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e.to_string()))?;
-            for entry in entries {
-                let log_id = entry.log_id;
-                if let EntryPayload::Membership(m) = &entry.payload {
-                    let stored = StoredMembership::new(Some(log_id), m.clone());
-                    self.write_membership(&stored)?;
+        let mut pending_responses: Vec<(
+            ApplyResponder<TypeConfig>,
+            Result<crate::types::WriteAck, DshError>,
+        )> = Vec::new();
+        let mut fatal: Option<ErrOf> = None;
+        loop {
+            let next = entries.next().await;
+            if next.is_none() {
+                break;
+            }
+            match next.unwrap() {
+                Err(e) => {
+                    // 0.10 log reader stream 的 Err（IO/read failure）：stop，collected flushed below
+                    fatal = Some(e);
+                    break;
                 }
-                let mut resp = Ok(crate::types::WriteAck::default());
-                if let EntryPayload::Normal(cmd) = &entry.payload {
-                    // 确定性时间：用日志序号（避免墙钟导致跨节点状态发散，D16）
-                    let now_ms = log_id.index as i64;
-                    match sm.apply(cmd, now_ms) {
-                        Ok(events) => {
-                            // 主密钥轮换副作用（更新本地 keyring + 持久化 ring 文件）：
-                            // 状态机 apply 成功后才触发（钩子幂等，重放/多节点安全）。
-                            // F7b：新命令 kek 为空、kek_enc 为当前 KEK 自加密的新 KEK（日志无明文）；
-                            // 钩子负责解密（旧日志 kek 明文 → 直接使用）。
-                            // 注：钩子含 ring 文件写 IO，仍留写锁内（低频仅轮换，可接受）。
-                            if matches!(cmd, dsh_core::command::Command::RotateMasterKey { .. }) {
-                                if let Some(h) = &self.rotation_hook {
-                                    h(cmd);
-                                }
-                            }
-                            // F6：事件随响应返回；广播延迟到锁外统一 send（perf 方案③）
-                            pending_events.extend(events.iter().cloned());
-                            resp = Ok(crate::types::WriteAck {
-                                version: events.first().map(|e| e.version).unwrap_or(0),
-                                events,
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "apply command failed (logged but state unchanged): {e}"
-                            );
-                            // 错误随 Raft 客户端响应返回（不再吞掉）
-                            resp = Err(e);
+                Ok((entry, responder)) => {
+                    let (resp, events, hard) = self.apply_entry(entry);
+                    pending_events.extend(events);
+                    if let Some(r) = responder {
+                        // 0.10：ApplyResponder<C>::send(self, C::R)——collect 后锁释放再 send（perf ③
+                        // 思路：响应与事件广播均在锁外；P1: the failing entry gets Err resp here）
+                        pending_responses.push((r, resp));
+                    }
+                    if let Some(h) = hard {
+                        fatal = Some(h);
+                        break;
+                    }
+                }
+            }
+        }
+        if fatal.is_some() {
+            // P1 drain：openraft 已 created remaining responders（client may await）——abort-respond
+            // with Err, so their client_write returns; otherwise never returns（upstream contract）。
+            loop {
+                let more = entries.next().await;
+                if more.is_none() {
+                    break;
+                }
+                match more.unwrap() {
+                    Err(e) => tracing::warn!("apply abort drain stream error: {e}"),
+                    Ok((_, responder)) => {
+                        if let Some(r) = responder {
+                            r.send(Err(DshError::internal("apply aborted (storage failure)")));
                         }
                     }
                 }
-                self.write_last_applied(&log_id)?;
-                responses.push(resp);
             }
-        } // 写锁释放
-          // 锁外广播（watch）：所有节点本地 apply 后推送，语义一致。
-          // 行为说明：解锁后广播 → "状态先于事件可见"窗口（读可先见新状态、watch 事件后到），
-          // SSE watch 通知语义 + after_version 重放可回补，接受。
+        }
+        // 锁外广播（watch）：所有节点本地 apply 后推送，语义一致。
+        // 行为说明：解锁后广播 → "状态先于事件可见"窗口（读可先见新状态、watch 事件后到），
+        // SSE watch 通知语义 + after_version 重放可回补，接受。
         for e in &pending_events {
             let _ = self.events.send(e.clone());
         }
-        Ok(responses)
+        // 统一 flush（happy path 不变 + P1 error path）：every consumed entry has a response.
+        for (responder, resp) in pending_responses {
+            responder.send(resp);
+        }
+        if let Some(f) = fatal {
+            return Err(f);
+        }
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -629,56 +884,64 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             inner: Arc::new(StateMachineStore {
                 sm: self.sm.clone(),
                 db: self.db.clone(),
+                data_dir: self.data_dir.clone(),
                 current_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
                 events: self.events.clone(),
                 rotation_hook: self.rotation_hook.clone(),
+                fail_last_applied_at: self.fail_last_applied_at.clone(),
+                last_applied_calls: self.last_applied_calls.clone(),
             }),
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, ErrOf> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
+    // 0.10：begin_receiving_snapshot 已 gone —— install_snapshot 直接接受 SnapshotData（PathBuf）
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<NodeId, NodeInfo>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        meta: &SnapshotMetaOf<TypeConfig>,
+        snapshot: Self::SnapshotData,
     ) -> Result<(), ErrOf> {
-        let data = snapshot.into_inner();
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_slice(&data)
-            .map_err(|e| io_err(ErrorSubject::StateMachine, ErrorVerb::Read, e.to_string()))?;
+        // P2a: read + validate the incoming payload file BEFORE touching state
+        //（failure = no half state; 输入文件 not modified by us）
+        let data = read_payload_file(snapshot)?;
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+            serde_json::from_slice(&data).map_err(|e| io_read(e.to_string()))?;
         {
-            let sm = self
-                .sm
-                .write()
-                .map_err(|e| io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e.to_string()))?;
+            let sm = self.sm.write().map_err(|e| io_write(e.to_string()))?;
             sm.restore_all(&pairs).map_err(storage_err)?;
         }
         if let Some(last_log_id) = &meta.last_log_id {
             self.write_last_applied(last_log_id)?;
         }
         self.write_membership(&meta.last_membership)?;
-        // 安装的快照也落盘（重启后仍可用）
-        persist_snapshot(&self.db, meta, &data)?;
-        *self.current_snapshot.lock().await = Some((meta.clone(), data));
+        // 落盘（重启后仍可用）: materialize an owned copy under this node's snapshots dir ——
+        // the input file may live in the sender's data dir（进程内 network）or the HTTP
+        // server's materialized temp（handler deletes it after install returns）.
+        let path =
+            write_payload_file(self.data_dir.join(SNAP_SUBDIR), snap_file_name(meta), &data)?;
+        let old = persist_snapshot_registry(&self.db, meta, path.clone())?;
+        delete_old_snapshot_file(old);
+        *self.current_snapshot.lock().await = Some((meta.clone(), path));
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, ErrOf> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<SnapshotOf<TypeConfig, PathBuf>>, ErrOf> {
         let guard = self.current_snapshot.lock().await;
-        if let Some((meta, data)) = guard.as_ref() {
+        if let Some((meta, path)) = guard.as_ref() {
+            // P2a: PathBuf 拷贝 —— no whole-payload blob clone（P1 每次 clone 整个 Vec）
             return Ok(Some(Snapshot {
                 meta: meta.clone(),
-                snapshot: Box::new(Cursor::new(data.clone())),
+                snapshot: path.clone(),
             }));
         }
         drop(guard);
-        // 重启后内存为空 → 读盘（B5：快照跨重启持久化）
-        match load_persisted_snapshot(&self.db)? {
-            Some((meta, data)) => Ok(Some(Snapshot {
+        // 重启后内存为空 → 读盘（B5：快照跨重启持久化；P2a: registry meta+file, legacy data 迁移）
+        match load_snapshot_registry(&self.db, self.data_dir.join(SNAP_SUBDIR))? {
+            Some((meta, path)) => Ok(Some(Snapshot {
                 meta,
-                snapshot: Box::new(Cursor::new(data)),
+                snapshot: path,
             })),
             None => Ok(None),
         }
@@ -691,10 +954,18 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 mod tests {
     use super::*;
     use dsh_storage::RedbStorage;
+    use futures_util::stream;
     use openraft::storage::RaftLogStorageExt;
     use std::sync::Mutex;
 
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // 0.10：apply 消费 Stream<EntryResponder>；测试 entries 无 client responder（None）
+    fn entry_stream(
+        entries: Vec<EntryOf>,
+    ) -> Vec<Result<(EntryOf, Option<ApplyResponder<TypeConfig>>), ErrOf>> {
+        entries.into_iter().map(|e| Ok((e, None))).collect()
+    }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -706,18 +977,24 @@ mod tests {
     }
 
     fn blank(index: u64) -> EntryOf {
-        Entry {
+        EntryOf {
             log_id: LogId {
-                leader_id: LeaderId::new(1, 1),
+                leader_id: LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index,
             },
             payload: EntryPayload::Blank,
         }
     }
 
-    fn truncate_at(index: u64) -> LogId<NodeId> {
+    fn truncate_at(index: u64) -> LogIdOf {
         LogId {
-            leader_id: LeaderId::new(1, 1),
+            leader_id: LeaderId {
+                term: 1,
+                node_id: 1,
+            },
             index,
         }
     }
@@ -755,13 +1032,13 @@ mod tests {
         assert_eq!(log_state_of(&mut store).await, (None, Some(3)));
         assert_eq!(indexes_of(&mut store, 1..=3).await, vec![1, 2, 3]);
 
-        // 截断 index >= 2
-        store.truncate(truncate_at(2)).await.unwrap();
+        // 截断 index >= 2（0.10：truncate_after —— 删除 > last_log_id.index）
+        store.truncate_after(Some(truncate_at(1))).await.unwrap();
         assert_eq!(log_state_of(&mut store).await, (None, Some(1)));
         assert_eq!(indexes_of(&mut store, 1..=3).await, vec![1]);
 
-        // 截到头：last_log_id 变 None
-        store.truncate(truncate_at(1)).await.unwrap();
+        // 截到头：last_log_id 变 None（0.10：truncate_after(None) → 删除全部）
+        store.truncate_after(None).await.unwrap();
         assert_eq!(log_state_of(&mut store).await, (None, None));
         assert!(indexes_of(&mut store, 1..=3).await.is_empty());
 
@@ -797,34 +1074,39 @@ mod tests {
 
         // 安装快照（install_snapshot 内部落盘到 snapshots 表）
         let data = serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap();
-        let meta = SnapshotMeta {
+        let meta: SnapshotMetaOf<TypeConfig> = SnapshotMeta {
             last_log_id: Some(LogId {
-                leader_id: LeaderId::new(1, 1),
+                leader_id: LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 5,
             }),
             last_membership: StoredMembership::default(),
-            snapshot_id: "5-2".to_string(),
+            // 0.10：SnapshotMeta.snapshot_id 已 gone（serde wire slot 保留，always empty）
         };
         {
             let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
-            let mut store = StateMachineStore::new(sm, storage.raw_db());
-            store
-                .install_snapshot(&meta, Box::new(Cursor::new(data.clone())))
-                .await
-                .unwrap();
+            let mut store = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
+            let payload_path = write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta, &data).unwrap();
+            store.install_snapshot(&meta, payload_path).await.unwrap();
         }
 
         // 「重启」：全新 StateMachineStore（内存快照为空）→ 从盘恢复
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
-        let mut revived = StateMachineStore::new(sm, storage.raw_db());
+        let mut revived = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
         let snap = revived
             .get_current_snapshot()
             .await
             .unwrap()
             .expect("snapshot should persist (B5)");
-        assert_eq!(snap.meta.snapshot_id, meta.snapshot_id);
         assert_eq!(snap.meta.last_log_id, meta.last_log_id);
-        assert_eq!(snap.snapshot.into_inner(), data);
+        // P2a: SnapshotData 即 PathBuf——payload 落盘文件,not inline Vec
+        assert!(
+            std::fs::exists(&snap.snapshot).unwrap_or(false),
+            "snapshot payload file must exist"
+        );
+        assert_eq!(read_snapshot_payload(snap.snapshot).unwrap(), data);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -835,14 +1117,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let storage = open_storage(&dir);
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
-        let mut store = StateMachineStore::new(sm, storage.raw_db());
+        let mut store = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
 
         assert!(
             !store.has_persisted_state(),
             "fresh store: no persisted state"
         );
         // apply 一条空白日志 → last_applied 落盘（per-entry 独立事务）
-        store.apply([blank(1)]).await.unwrap();
+        store
+            .apply(stream::iter(entry_stream([blank(1)].to_vec())))
+            .await
+            .unwrap();
         assert!(store.has_persisted_state());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -869,13 +1154,17 @@ mod tests {
                     hook_received.lock().unwrap().push(kek.clone());
                 }
             })),
+            dir.clone(),
         );
 
         // RotateMasterKey 条目 → 钩子被调用且收到正确 kek（旧日志明文路径）
         let kek = vec![1u8; 32];
-        let rotate = Entry {
+        let rotate = EntryOf {
             log_id: LogId {
-                leader_id: LeaderId::new(1, 1),
+                leader_id: LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 1,
             },
             payload: EntryPayload::Normal(dsh_core::command::Command::RotateMasterKey {
@@ -883,7 +1172,10 @@ mod tests {
                 kek_enc: vec![],
             }),
         };
-        store.apply([rotate]).await.unwrap();
+        store
+            .apply(stream::iter(entry_stream([rotate].to_vec())))
+            .await
+            .unwrap();
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::Relaxed),
             1,
@@ -896,20 +1188,165 @@ mod tests {
         );
 
         // 普通命令 → 钩子不再被调用
-        let normal = Entry {
+        let normal = EntryOf {
             log_id: LogId {
-                leader_id: LeaderId::new(1, 1),
+                leader_id: LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
                 index: 2,
             },
             payload: EntryPayload::Normal(dsh_core::command::Command::SessionLogout),
         };
-        store.apply([normal]).await.unwrap();
+        store
+            .apply(stream::iter(entry_stream([normal].to_vec())))
+            .await
+            .unwrap();
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "hook must NOT fire for non-rotate commands"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P1 responder 错误路径（0.10 RaftStateMachine::apply 的 contract：
+    // ApplyResponder::send 的必须 called，否则 client_write 永不 return） ----
+
+    #[tokio::test]
+    async fn apply_mid_stream_error_flushes_collected_entries() {
+        // Stream 的 Err 即 apply 的 stop，已收集条目仍 responded（collected flush）+ Err return。
+        // 0.9-style early `?` 即 dropped pending responders（client_write hang）。
+        let dir = tmpdir("apply-err-mid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), storage.raw_db(), dir.clone());
+
+        let mut items = entry_stream([blank(1), blank(2)].to_vec());
+        items.push(Err(io_write("injected mid-stream log read failure")));
+        let r = store.apply(stream::iter(items)).await;
+        assert!(r.is_err(), "mid-stream Err must propagate to openraft");
+
+        // 前条目 flush 前 Err return：last_applied 即 2（no lost responder、no rollback）
+        let last = store.read_last_applied().unwrap();
+        assert!(
+            last.is_some() && last.unwrap().index == 2,
+            "collected entries must flush before Err"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_last_applied_failure_responds_then_recovers() {
+        // write_last_applied 的 IO 的 Err：该 entry's responder 已 get Err(...) resp（push 前 return）
+        // + apply 的 Err；store 的 remain usable（replay 的 succeed）——0.9-style `?` 即 responder lost。
+        let dir = tmpdir("apply-err-la");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), storage.raw_db(), dir.clone());
+
+        store.set_fail_last_applied(1); // 第 1 write_last_applied 即 IO 的 Err
+        let r = store
+            .apply(stream::iter(entry_stream([blank(7)].to_vec())))
+            .await;
+        assert!(r.is_err(), "persist failure must surface as apply Err");
+        assert!(
+            store.read_last_applied().unwrap().is_none(),
+            "failed persist must not record last_applied"
+        );
+
+        store.set_fail_last_applied(0); // 关闭注入
+        store
+            .apply(stream::iter(entry_stream([blank(7)].to_vec())))
+            .await
+            .unwrap();
+        let last = store.read_last_applied().unwrap();
+        assert!(
+            last.is_some() && last.unwrap().index == 7,
+            "replay after failure must succeed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_inline_snapshot_key_migrates_to_file_on_read() {
+        // 0.9/P1 即 inline `data` key（no file key）: first read must materialize the payload
+        // file, rewrite the registry (meta + file key) and REMOVE the legacy data key.
+        let dir = tmpdir("legacy-snap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let meta: SnapshotMetaOf<TypeConfig> = SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 5,
+            }),
+            last_membership: StoredMembership::default(),
+        };
+        let data = serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(TBL_SNAPSHOTS).unwrap();
+            t.insert(SNAP_META_KEY, ser(&meta).unwrap().as_slice())
+                .unwrap();
+            t.insert(SNAP_DATA_KEY, data.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut revived = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+        let snap = revived
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("legacy inline snapshot must load (migrated)");
+        assert!(
+            std::fs::exists(&snap.snapshot).unwrap_or(false),
+            "payload file must be materialized"
+        );
+        assert_eq!(read_snapshot_payload(snap.snapshot).unwrap(), data);
+
+        // registry rewritten exactly once: file key present, legacy data key gone
+        let read_txn = db.begin_read().unwrap();
+        let t = read_txn.open_table(TBL_SNAPSHOTS).unwrap();
+        assert!(
+            t.get(SNAP_FILE_KEY).unwrap().is_some(),
+            "file key must exist post-migration"
+        );
+        assert!(
+            t.get(SNAP_DATA_KEY).unwrap().is_none(),
+            "legacy data key must be removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_rejects_corrupt_payload_keeps_registry_untouched() {
+        // install 即 validation-first: corrupt payload file 即 Err,registry untouched
+        // (no half-install state, no registry entry pointing at bad payload).
+        let dir = tmpdir("snap-bad");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), storage.raw_db(), dir.clone());
+        let meta: SnapshotMetaOf<TypeConfig> = SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+        };
+        let bad = write_snapshot_payload(dir.clone().join(SNAP_SUBDIR), &meta, b"not-json-bytes")
+            .unwrap();
+        let r = store.install_snapshot(&meta, bad).await;
+        assert!(r.is_err(), "corrupt payload must be rejected");
+        let cur = store.get_current_snapshot().await.unwrap();
+        assert!(cur.is_none(), "rejected install must not touch registry");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

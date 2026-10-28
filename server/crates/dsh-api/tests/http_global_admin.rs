@@ -137,7 +137,11 @@ async fn start_raft_with_join_token() -> TestServer {
     let storage = dsh_storage::RedbStorage::open(&dir.display().to_string()).unwrap();
     let db = storage.raw_db();
     let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
-    let sm_store = Arc::new(dsh_raft::StateMachineStore::new(sm.clone(), db.clone()));
+    let sm_store = Arc::new(dsh_raft::StateMachineStore::new(
+        sm.clone(),
+        db.clone(),
+        dir.clone(),
+    ));
     let log_store = dsh_raft::LogStore::new(db.clone());
     let network = dsh_raft::NetworkFactory::new();
     let node = dsh_raft::NodeInfo {
