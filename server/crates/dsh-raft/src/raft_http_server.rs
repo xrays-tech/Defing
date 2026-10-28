@@ -297,6 +297,14 @@ async fn full_snapshot(
                         } else {
                             header_vote = Some(vote);
                             header_meta = Some(meta.clone());
+                            // P3d: 传输开始标记。openraft 的 `install full snapshot` 只在整份
+                            // payload 收完之后才打印，用它当窗口会漏掉「传输期间心跳被抑制」这类
+                            // 0.9 失败模式；压测 harness 用本标记把传输段并入 install 窗口。
+                            tracing::info!(
+                                target: "dsh_raft::snapshot",
+                                index = meta.last_log_id.map(|l| l.index),
+                                "full-snapshot transfer start"
+                            );
                             // mint the canonical payload name ONCE, then open `.part`
                             part_name = snapshot_file_name(&meta);
                             part_opened = true;

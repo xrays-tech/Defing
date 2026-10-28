@@ -109,7 +109,11 @@ FORBIDDEN = (
 # interrupted-by-election + victim-0-election assertions (NOT a FORBIDDEN token —
 # elections are normal chatter elsewhere).
 ELECTION_MARKERS = (
+    # 0.10（openraft raft_core.rs:2208/2235/2238，均 INFO）
+    "election timeout expired, triggering election",
+    "trigger pre-vote",
     "trigger election",
+    # 0.9 术语，保留兼容
     "starting a real election",
     "election timeout passed",
 )
@@ -224,6 +228,38 @@ def members(base, token=None):
     return None
 
 
+def git_rev(bin_path):
+    """worktree 的 git HEAD（能定位到被测源码版本）。"""
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, timeout=5
+        )
+        return out.decode().strip()
+    except Exception:
+        return None
+
+
+def sha256_of(path, limit=None):
+    """二进制 sha256（>512MB 时只算前 limit 字节并注明）。"""
+    import hashlib
+
+    try:
+        size = os.path.getsize(path)
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            remain = size if limit is None else min(size, limit)
+            while remain > 0:
+                chunk = f.read(min(1 << 20, remain))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remain -= len(chunk)
+        return h.hexdigest() if limit is None else "%s(prefix-%d)" % (h.hexdigest(), limit)
+    except OSError:
+        return None
+
+
 def healthz(base):
     r = http_get(base, None, "/healthz", timeout=4.0)
     return r["status"] == 200
@@ -265,33 +301,58 @@ def latest_snapshot_bytes(node):
     return max(sizes) if sizes else None
 
 
-def install_window_seconds(node):
-    """victim 日志中最后一次 `install full snapshot` → `Done install complete snapshot` 的耗时。
+def install_windows(node):
+    """从 victim 日志解析 full-snapshot 窗口：transfer → install → done。
 
-    openraft 0.10 的 INFO 行：`... install full snapshot, meta: ...` 与
-    `... Done install complete snapshot, meta: ...`。取最后一次配对，避免把 catch-up 窗口内
-    更早的一次 install 算成这一轮的耗时（墙钟 catchup 还包含等其他分块/重连的时间）。
+    - `full-snapshot transfer start`：本仓库在收到 Header frame 时打印（含传输起点）；
+    - `install full snapshot,`：openraft 在整份 payload 收完后打印（install 起点）；
+    - `Done install complete snapshot`：状态机应用完成（窗口终点）。
+
+    为什么必须从 transfer 起算：openraft 的 install 标记在**传输结束之后**才出现，只测
+    install→done 会漏掉传输段——而 0.9 的失败模式（`Inflight::Snapshot` 抑制心跳导致选举）
+    正是发生在传输段。返回按时间排序的完整窗口列表（meta 相同的一对才算一个窗口）。
     """
     try:
         with open(node.log_path, "r", errors="replace") as f:
             lines = f.readlines()
     except OSError:
-        return None
-    start = done = None
+        return []
+    windows = []
+    cur = None
     for ln in lines:
-        if "install full snapshot," in ln:
-            start = ln.split(" ", 1)[0]
-        elif "Done install complete snapshot" in ln:
-            done = ln.split(" ", 1)[0]
-    if not start or not done:
-        return None
-    try:
-        t0 = datetime.fromisoformat(start.replace("Z", "+00:00"))
-        t1 = datetime.fromisoformat(done.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    dt = (t1 - t0).total_seconds()
-    return round(dt, 3) if dt >= 0 else None
+        low = ln.lower()
+        ts = _line_ts(ln)
+        if ts is None:
+            continue
+        if "full-snapshot transfer start" in low:
+            if cur is not None and cur.get("done") is not None:
+                windows.append(cur)
+            cur = {"transfer": ts, "install": None, "done": None}
+        elif cur is not None and cur.get("install") is None and "install full snapshot," in low:
+            cur["install"] = ts
+        elif cur is not None and cur.get("done") is None and "done install complete snapshot" in low:
+            cur["done"] = ts
+            windows.append(cur)
+            cur = None
+    return windows
+
+
+def install_window_stats(node):
+    """install 窗口统计：端到端（transfer→done）、传输段、apply 段。"""
+    ws = [w for w in install_windows(node) if w.get("done") is not None]
+    if not ws:
+        return {"windows": 0, "end_to_end_seconds": None,
+                "transfer_seconds": None, "apply_seconds": None}
+    w = ws[-1]
+    transfer = (w["install"] - w["transfer"]).total_seconds() if w.get("install") else None
+    apply_s = (w["done"] - w["install"]).total_seconds() if w.get("install") else None
+    return {
+        "windows": len(ws),
+        "end_to_end_seconds": round((w["done"] - w["transfer"]).total_seconds(), 3),
+        "transfer_seconds": round(transfer, 3) if transfer is not None else None,
+        "apply_seconds": round(apply_s, 3) if apply_s is not None else None,
+    }
+
 
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
 
@@ -307,47 +368,74 @@ def _line_ts(line):
 
 
 def election_attribution(log_path, offset):
-    """把 victim 重启后的选举按 install 窗口归属。
+    """把 victim 重启后的选举按 **full-snapshot 窗口** 归属（transfer → done）。
 
-    返回 (since_restart, during_install, window_count)。
+    返回 dict：
+      - `since_restart`：重启后全部选举/预投票次数（诊断，不判失败）
+      - `during`：落在窗口内的次数（判失败：0.10 独立心跳必须让 follower 在传输+安装期间保持 follower）
+      - `pre_votes`：窗口内的预投票次数（enable_pre_vote=true 时 victim 可能只 pre-vote，
+        旧实现只认 "trigger election" 会漏掉这类）
+      - `windows`：窗口数；`unclosed`：未闭合窗口数（安装被打断，保守把尾巴算进窗口）
 
-    为什么要分开：重启后、首个 snapshot frame 到达之前的选举只是「刚起来还没连上 leader」的
-    普通 Raft 行为；0.9 的活锁要防的是 **InstallSnapshot 传输/安装期间** 心跳被抑制导致的选举。
-    旧实现把两者混在一起（只要日志里出现过 install 标记就算 interrupted），会把健康的
-    快装（install 1.68s，选举发生在其之前）误判成失败。
+    窗口 = `full-snapshot transfer start` → `Done install complete snapshot`，即传输 + install +
+    状态机 apply 全程。openraft 自身的 `install full snapshot` 标记在传输结束之后才出现，
+    只用它会漏掉 0.9 那种「传输期间心跳被抑制」的失败模式。
     """
     try:
         with open(log_path, "rb") as f:
             f.seek(offset)
             blob = f.read().decode("utf-8", "replace")
     except OSError:
-        return 0, 0, 0
-    total = 0
-    during = 0
+        return {"since_restart": 0, "during": 0, "pre_votes": 0, "windows": 0, "unclosed": 0}
+    lines = blob.splitlines()
     windows = []
-    open_ts = None
+    cur = None
     last_ts = None
-    for line in blob.splitlines():
+    for line in lines:
         low = line.lower()
         ts = _line_ts(line)
         if ts is not None:
             last_ts = ts
-        if open_ts is None and ("install full snapshot," in low or "install_full_snapshot()" in low):
-            open_ts = ts or last_ts
-        if open_ts is not None and "done install complete snapshot" in low:
-            end = ts or last_ts
-            if end is not None and end >= open_ts:
-                windows.append((open_ts, end))
-            open_ts = None
-        if any(tok in low for tok in ELECTION_MARKERS):
-            total += 1
-            if open_ts is not None:
-                during += 1
-    if open_ts is not None:
-        # 未闭合的 install 窗口（安装被打断/进程退出）：保守计入
-        if last_ts is not None and last_ts >= open_ts:
-            windows.append((open_ts, last_ts))
-    return total, during, len(windows)
+        if "full-snapshot transfer start" in low:
+            if cur is not None and cur.get("done") is not None:
+                windows.append(cur)
+            cur = {"start": ts or last_ts, "done": None}
+        elif cur is not None and cur.get("done") is None and "done install complete snapshot" in low:
+            cur["done"] = ts or last_ts
+            windows.append(cur)
+            cur = None
+    unclosed = 0
+    if cur is not None:
+        unclosed = 1
+        if last_ts is not None and cur.get("start") is not None and last_ts >= cur["start"]:
+            windows.append({"start": cur["start"], "done": last_ts})
+
+    total = 0
+    during = 0
+    pre_votes = 0
+    for line in lines:
+        low = line.lower()
+        ts = _line_ts(line)
+        hit = any(tok in low for tok in ELECTION_MARKERS)
+        if not hit:
+            continue
+        total += 1
+        is_pre_vote = "pre-vote" in low or "pre_vote" in low
+        in_window = any(
+            w["done"] is not None and w["start"] is not None and w["start"] <= ts <= w["done"]
+            for w in windows
+        ) if ts is not None else False
+        if in_window:
+            during += 1
+            if is_pre_vote:
+                pre_votes += 1
+    return {
+        "since_restart": total,
+        "during": during,
+        "pre_votes": pre_votes,
+        "windows": len([w for w in windows if w.get("done") is not None]),
+        "unclosed": unclosed,
+    }
 
 
 # ---------------------------------------------------------------- Node model
@@ -579,6 +667,10 @@ class Stats:
         self.freeze_count = 0
         self.observed_leader_changes = 0
         self.snapshot_chaos_injections = 0
+        # C3 证据：kill 目标身份校验 + leader 变化观测
+        self.leader_kill_targets_verified = 0
+        self.leader_kill_target_not_leader = 0
+        self.leader_change_missing = 0
         self.per_node = {n.node_id: 0 for n in nodes}
 
     def bump(self, attr, node_id=None, n=1):
@@ -873,6 +965,12 @@ class Chaos:
             return
         if CLUSTER.lock.locked():
             return
+        # C3 证据：击杀前必须确认目标**自认 leader**（随机节点报的 current_leader 可能是
+        # 陈旧视图，杀掉一个 follower 不能算 leader-kill 证据）。
+        own = members(leader.http_base(), None) or {}
+        if not own.get("is_leader"):
+            self.stats.bump("leader_kill_target_not_leader")
+            return
         with CLUSTER.lock:
             # need >=4 live before killing so live stays >=3 (5-node quorum floor)
             if CLUSTER.live_count() < 4:
@@ -880,6 +978,7 @@ class Chaos:
             leader.kill()
         self.leader_kill_count += 1
         self.stats.bump("leader_kills")
+        self.stats.bump("leader_kill_targets_verified")
         self.record("leader_kill", leader.node_id)
         # restart 0.2–1.2s later with same data-dir/argv
         time.sleep(self.rng.uniform(0.2, 1.2))
@@ -891,6 +990,8 @@ class Chaos:
         if new_leader is not None and new_leader != lid:
             STATS.bump("observed_leader_changes")
             self.last_leader = new_leader
+        else:
+            STATS.bump("leader_change_missing")
 
     def follower_freeze(self):
         live = [n for n in CLUSTER.live() if not n.frozen]
@@ -1086,7 +1187,8 @@ def snapshot_phase(args, stats, token, rng):
         for _ in range(n_ev):
             chaos_schedule.append(t_ev)
             t_ev += rng.uniform(4.0, 9.0)
-        log("  chaos-during-snapshot: %d leader kill/freeze 事件 @ t+%s"
+        log("  chaos-during-snapshot: 计划 %d 次 leader kill/freeze；优先在 victim 的 "
+            "transfer 窗口内注入（fallback 墙钟 t+%s）"
             % (n_ev, [round(x, 1) for x in chaos_schedule]))
 
     def current_leader_obj():
@@ -1144,9 +1246,24 @@ def snapshot_phase(args, stats, token, rng):
     lag_none_seen = False   # victim lag reported null at least once
     chaos_done = []
     cfg_gate_diag = 0       # first few lag==0-but-gate-fail reasons (diagnosis only)
+    transfer_seen_at = None
+    chaos_target = rng.choice([1, 2]) if args.chaos_during_snapshot else 0
     while time.time() - catchup_t0 < args.catchup_timeout:
-        # fire scheduled churn injections while lag not settled
-        while chaos_schedule and time.time() - catchup_t0 >= chaos_schedule[0]:
+        # churn 注入：优先在 victim 的 transfer 窗口刚打开时打（这才是 C4「churn during
+        # install」）；transfer 未出现时退回墙钟计划。
+        if args.chaos_during_snapshot and transfer_seen_at is None:
+            try:
+                with open(victim.log_path, "rb") as f:
+                    f.seek(victim_restart_offset)
+                    tail = f.read().decode("utf-8", "replace").lower()
+                if "full-snapshot transfer start" in tail:
+                    transfer_seen_at = time.time()
+                    log("  transfer window opened @ catchup+t%.1fs → 注入 churn"
+                        % (transfer_seen_at - catchup_t0))
+                    chaos_done.append(snapshot_chaos_once("transfer-window"))
+            except OSError:
+                pass
+        if len(chaos_done) < chaos_target and chaos_schedule and time.time() - catchup_t0 >= chaos_schedule[0]:
             if catchup_seconds is None and (max_lag is None or max_lag > 0):
                 chaos_done.append(snapshot_chaos_once("scheduled"))
             chaos_schedule.pop(0)
@@ -1192,9 +1309,9 @@ def snapshot_phase(args, stats, token, rng):
 
     # C4 证据：victim 峰值 RSS（VmHWM）覆盖 restart → install full-snapshot → 追平窗口
     victim_peak_rss_kb = read_peak_rss_kb(victim)
-    # C4 证据：install 真实耗时 + 快照字节数（从 victim 日志/落盘文件量测，不用 catchup 墙钟替代）
+    # C4 证据：install 窗口（transfer→install→done）+ 快照字节数
     snapshot_bytes = latest_snapshot_bytes(victim)
-    snapshot_install_seconds = install_window_seconds(victim)
+    win = install_window_stats(victim)
 
     # 6. interrupted-by-election diagnostic (a failure EXPLANATION, not a FORBIDDEN token —
     #    campaigning is normal chatter otherwise). If the victim repeatedly started an election
@@ -1204,22 +1321,26 @@ def snapshot_phase(args, stats, token, rng):
     #    0.10: "install full snapshot" (following_handler) / legacy "installsnapshot".
     # 选举归属：只有落在 install 窗口内的选举才算「打断安装」；窗口外（重启后尚未收到首个
     # snapshot frame）的选举单独计数、只做诊断，不判失败。
-    elections_since_restart, victim_elections, install_windows = election_attribution(
-        victim.log_path, victim_restart_offset
-    )
+    attr = election_attribution(victim.log_path, victim_restart_offset)
+    victim_elections = attr["during"]
     interrupted_by_election = victim_elections > 0
 
     return {"victim_id": victim_id, "catchup_seconds": catchup_seconds,
             "max_lag": max_lag, "lag_none_seen": lag_none_seen, "lag_values": lag_values,
             "victim_peak_rss_kb": victim_peak_rss_kb,
             "snapshot_bytes": snapshot_bytes,
-            "snapshot_install_seconds": snapshot_install_seconds,
+            "snapshot_install_seconds": win["end_to_end_seconds"],
+            "snapshot_transfer_seconds": win["transfer_seconds"],
+            "snapshot_apply_seconds": win["apply_seconds"],
+            "snapshot_elections_pre_vote": attr["pre_votes"],
+            "snapshot_elections_since_restart": attr["since_restart"],
+            "snapshot_windows_unclosed": attr["unclosed"],
             "lag_points": lag_points,
             "lag_trajectory": _sample_lag_points(lag_points),
             "interrupted_by_election": interrupted_by_election,
             "victim_elections": victim_elections,
-            "victim_elections_since_restart": elections_since_restart,
-            "install_windows": install_windows,
+            "victim_elections_since_restart": attr["since_restart"],
+            "install_windows": win["windows"],
             "snapshot_chaos_injections": len(chaos_done),
             "bulk_seconds": bulk_seconds, "leader_node": leader,
             "projects": projects}, victim
@@ -1376,9 +1497,47 @@ def validate_final(args, token, writers, snapshot_info, errors):
             errors.append("catch_up_seconds %s >= timeout %s" % (cs, args.catchup_timeout))
         if snapshot_info.get("max_lag") is None and snapshot_info.get("lag_none_seen"):
             errors.append("victim lag stayed null throughout (InstallSnapshot never established)")
+        # ---- C3 断言：kill 的目标确实是 leader，且确实观测到 leader 变化 ----
+        if STATS.leader_kills > 0:
+            if STATS.leader_kill_targets_verified < STATS.leader_kills:
+                errors.append("C3: %d 次 kill 但只有 %d 次确认目标是 leader（其余是陈旧视图）"
+                              % (STATS.leader_kills, STATS.leader_kill_targets_verified))
+            if STATS.observed_leader_changes < 1:
+                errors.append("C3: %d 次 leader kill 后没有观测到任何 leader 变化"
+                              % STATS.leader_kills)
+
+        # ---- C4 断言（旧实现只报告不断言，样例里「日志追平、根本没走快照」也会绿）----
+        if snapshot_info.get("install_windows", 0) < 1:
+            errors.append("C4: victim 没有走 full-snapshot（install_windows=0）——日志追平/learner 路径不算 C4")
+        end2end = snapshot_info.get("snapshot_install_seconds")
+        if end2end is None:
+            errors.append("C4: 无法量测 install 端到端耗时（缺 transfer/install/done 标记）")
+        elif end2end > args.max_install_seconds:
+            errors.append("C4: install 端到端 %ss 超过预算 %ss（transfer=%ss apply=%ss）"
+                          % (end2end, args.max_install_seconds,
+                             snapshot_info.get("snapshot_transfer_seconds"),
+                             snapshot_info.get("snapshot_apply_seconds")))
+        sb = snapshot_info.get("snapshot_bytes")
+        if sb is None:
+            errors.append("C4: victim 没有落盘快照文件（snapshot_bytes=None）")
+        elif sb < args.min_snapshot_bytes:
+            errors.append("C4: 快照只有 %s 字节 < 下限 %s（规模不足以覆盖大快照场景）"
+                          % (sb, args.min_snapshot_bytes))
+        # victim 必须是 voter（learner 追平不算 C4）
+        md = members(leader.http_base(), None) if leader else None
+        voter_ok = None
+        if md:
+            for m in md.get("members", []):
+                if str(m.get("node_id")) == str(snapshot_info.get("victim_id")):
+                    voter_ok = bool(m.get("is_voter"))
+                    break
+        if voter_ok is not True:
+            errors.append("C4: victim node %s 不是 voter（is_voter=%s）——learner 追平不能算 C4"
+                          % (snapshot_info.get("victim_id"), voter_ok))
+
         # P3 churn 并发 invariant: 正在被 full-snapshot 追赶的 follower（含 leader kill/freeze
-        # churn 期间）在 **InstallSnapshot 窗口内** 必须一次选举都不发起。窗口外的选举（重启后
-        # 尚未连上 leader）只做诊断输出——它不是 0.9 的「安装期间心跳被抑制」失败模式。
+        # churn 期间）在 **transfer→install→done 窗口内** 必须一次选举/预投票都不发起。
+        # 窗口外的选举（重启后尚未连上 leader）只做诊断输出。
         log("  victim elections: inside_install=%s, since_restart=%s, install_windows=%s"
             % (snapshot_info.get("victim_elections"),
                snapshot_info.get("victim_elections_since_restart"),
@@ -1422,6 +1581,10 @@ def parse_args():
     p.add_argument("--value-bytes", type=int, default=60000)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--catchup-timeout", type=float, default=60.0)
+    p.add_argument("--max-install-seconds", type=float, default=30.0,
+                   help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
+    p.add_argument("--min-snapshot-bytes", type=int, default=100_000_000,
+                   help="C4 规模下限：victim 实际落盘快照字节数，默认 100MB（153MB/12k 目标的下限保护）")
     p.add_argument("--chaos-during-snapshot", action="store_true",
                    default=os.environ.get("CHAOS_DURING_SNAPSHOT", "0") in ("1", "true", "yes"),
                    help="churn 并发: inject 1-2 leader kill/freeze while the victim is catching "
@@ -1619,8 +1782,18 @@ def main():
             summary["chaos_during_snapshot"] = bool(args.chaos_during_snapshot)
             summary["victim_elections_during_catchup"] = snapshot_info.get("victim_elections")
             summary["victim_elections_since_restart"] = snapshot_info.get("victim_elections_since_restart")
+            summary["victim_pre_votes_during_install"] = snapshot_info.get("snapshot_elections_pre_vote")
             summary["snapshot_install_windows"] = snapshot_info.get("install_windows")
+            summary["snapshot_transfer_seconds"] = snapshot_info.get("snapshot_transfer_seconds")
+            summary["snapshot_apply_seconds"] = snapshot_info.get("snapshot_apply_seconds")
+            summary["max_install_seconds_budget"] = args.max_install_seconds
+            summary["min_snapshot_bytes"] = args.min_snapshot_bytes
             summary["snapshot_chaos_injections"] = snapshot_info.get("snapshot_chaos_injections")
+        # 证据溯源（复核要求：日志必须能定位到源码版本与二进制）
+        summary["git_rev"] = git_rev(args.bin)
+        summary["bin_sha256"] = sha256_of(args.bin)
+        summary["tmpdir"] = os.environ.get("TMPDIR")
+        summary["argv"] = sys.argv[1:]
         log("== SUMMARY ==")
         for k, v in summary.items():
             log("  %-24s %s" % (k + ":", v))

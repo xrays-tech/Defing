@@ -102,6 +102,10 @@ enum PendingOp {
 }
 
 /// 确定性状态机。
+/// 快照安装恢复的分块预算：块内单 redb 事务（一次 fsync）提交，块间独立提交。
+/// 16MiB 级快照 1 块；400MB 快照约 6~7 块，兼顾 fsync 次数与单事务脏页内存。
+const RESTORE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
 pub struct StateMachine {
     store: Box<dyn Store>,
     /// 命令级写缓冲（perf 方案①：apply 期间收集写操作，命令末统一 write_batch 单事务提交）。
@@ -612,12 +616,21 @@ impl StateMachine {
 
     /// 清空并恢复全部状态（快照安装用）。
     ///
+    ///
     /// P3c：改走 `Store::write_batch`（单事务 + 一次 fsync）——旧实现逐 key `delete`/`put`
     /// 各开一个事务，400MB 快照（约 4 万对 KV）在 btrfs 上要 ~4 万次 fsync，实测 install 84s
     /// 基本全耗在这里。按字节预算分块提交：块内单事务，块间可重试（与旧实现的部分恢复语义一致），
     /// 同时避免单事务把整份 payload 的脏页驻留内存。
     pub fn restore_all(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error> {
-        const CHUNK_BYTES: usize = 64 * 1024 * 1024;
+        self.restore_all_batched(pairs, RESTORE_CHUNK_BYTES)
+    }
+
+    /// `restore_all` 的分块实现；`chunk_bytes` 可注入（单测用小值验证多块语义）。
+    fn restore_all_batched(
+        &self,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        chunk_bytes: usize,
+    ) -> Result<(), Error> {
         let existing: Vec<Vec<u8>> = self
             .get_prefix_merged(b"")?
             .into_iter()
@@ -634,7 +647,7 @@ impl StateMachine {
         while start < pairs.len() {
             let mut end = start;
             let mut bytes = 0usize;
-            while end < pairs.len() && (bytes < CHUNK_BYTES || end == start) {
+            while end < pairs.len() && (bytes < chunk_bytes || end == start) {
                 bytes += pairs[end].0.len() + pairs[end].1.len();
                 end += 1;
             }
@@ -3653,5 +3666,55 @@ mod tests {
         let st = s.get_structure(&ProjectId("dst".into())).unwrap().unwrap();
         assert_eq!(st.version, 1);
         assert!(st.groups.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod restore_batch_tests {
+    use super::*;
+    use crate::store::InMemoryStore;
+
+    fn pairs(n: usize, size: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        (0..n)
+            .map(|i| (format!("k{i}").into_bytes(), vec![b'v'; size]))
+            .collect()
+    }
+
+    fn sm() -> StateMachine {
+        StateMachine::new(Box::new(InMemoryStore::new()))
+    }
+
+    /// 多块路径：chunk_bytes 小于单条 entry，强制一人一块，验证块间不丢 key。
+    #[test]
+    fn multi_chunk_restore_keeps_every_key() {
+        let sm = sm();
+        let p = pairs(5, 8);
+        sm.restore_all_batched(&p, 1).unwrap();
+        for (k, v) in &p {
+            assert_eq!(sm.store.get(k).unwrap().as_deref(), Some(v.as_slice()));
+        }
+    }
+
+    /// 覆盖旧状态：旧 key 必须被清掉（快照是「全量替换」，不是 merge）。
+    #[test]
+    fn restore_replaces_existing_state() {
+        let sm = sm();
+        sm.store.put(b"stale", b"x").unwrap();
+        let p = pairs(3, 4);
+        sm.restore_all_batched(&p, 4).unwrap();
+        assert!(sm.store.get(b"stale").unwrap().is_none(), "旧状态必须被清空");
+        for (k, v) in &p {
+            assert_eq!(sm.store.get(k).unwrap().as_deref(), Some(v.as_slice()));
+        }
+    }
+
+    /// 空快照 = 清空全部状态（不能留下旧 key）。
+    #[test]
+    fn empty_snapshot_clears_state() {
+        let sm = sm();
+        sm.restore_all_batched(&pairs(2, 4), 4).unwrap();
+        sm.restore_all_batched(&[], 4).unwrap();
+        assert!(sm.store.get(b"k0").unwrap().is_none());
+        assert!(sm.store.get(b"k1").unwrap().is_none());
     }
 }

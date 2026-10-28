@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use dsh_core::error::Error as DshError;
 use dsh_core::model::PublishEvent;
@@ -77,14 +77,34 @@ pub const SNAP_SUBDIR: &str = "snapshots";
 /// Per-process monotonic suffix for snapshot payload file names (unique across rebuilds).
 static SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Per-process nonce：文件名里的进程随机位。
+///
+/// 只有 `SNAP_SEQ` 时，进程重启后 seq 从 0 重新计数，同名 meta 会生成与**已持久化 registry**
+/// 完全相同的文件名 —— 落盘时会覆盖 registry 指向的 payload；再叠加 `delete_old_snapshot_file`
+/// 就会把刚登记的文件删掉（P3 复核 blocker）。加上非零 nonce 后进程间不重名。
+fn process_nonce() -> &'static str {
+    static NONCE: OnceLock<String> = OnceLock::new();
+    NONCE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        format!("{:x}{:x}", std::process::id(), nanos & 0xffff_ffff)
+    })
+}
+
 fn snap_file_name(meta: &SnapshotMetaOf<TypeConfig>) -> String {
     let seq = SNAP_SEQ.fetch_add(1, Ordering::Relaxed);
     match meta.last_log_id {
         Some(id) => format!(
-            "snap-t{}-n{}-i{}-{}.snap",
-            id.leader_id.term, id.leader_id.node_id, id.index, seq
+            "snap-t{}-n{}-i{}-{}-{}.snap",
+            id.leader_id.term,
+            id.leader_id.node_id,
+            id.index,
+            seq,
+            process_nonce()
         ),
-        None => format!("snap-initial-{}.snap", seq),
+        None => format!("snap-initial-{}-{}.snap", seq, process_nonce()),
     }
 }
 
@@ -201,25 +221,29 @@ fn read_payload_pairs(path: &std::path::Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// P3c：把收到的 payload 落成本节点 canonical snapshot 文件。
-/// - 输入已在 `{data_dir}/snapshots`（HTTP full-snapshot handler materialize 到本节点目录）
-///   → `rename` 直接采纳，省掉一次整份重写；
-/// - 输入在别的目录/设备（进程内 network、测试的 sender 目录）→ 复制，不动输入文件。
-fn adopt_payload_file(
-    dir: PathBuf,
-    name: String,
-    src: &std::path::Path,
-) -> Result<PathBuf, ErrOf> {
+///
+/// 用**文件级 copy**（`fs::copy`，内核零拷贝路径），不做整份 `Vec<u8>` 中转，也不 rename
+/// 输入文件。原因是输入可能是本节点 registry 自己的 payload（openraft `restore_from_snapshot`
+/// 启动路径会把 registry 路径直接传给 `install_snapshot`），rename 采纳会把 registry 指向的
+/// 文件移走，再叠加 `delete_old_snapshot_file` 就直接删掉刚登记的快照；copy 失败时输入
+/// 保持原样，registry 仍指向可用文件。名字带进程 nonce + 自增 seq（见 `snap_file_name`），
+/// 不会覆盖既有 canonical 文件。
+fn copy_payload_file(dir: PathBuf, name: String, src: &std::path::Path) -> Result<PathBuf, ErrOf> {
     fs::create_dir_all(&dir).map_err(io_write)?;
+    let part_path = dir.join(format!("{name}.part"));
     let final_path = dir.join(&name);
-    let same_dir = match (src.parent(), fs::canonicalize(&dir)) {
-        (Some(p), Ok(d)) => fs::canonicalize(p).map(|sp| sp == d).unwrap_or(false),
-        _ => false,
-    };
-    if same_dir && fs::rename(src, &final_path).is_ok() {
-        return Ok(final_path);
+    let _ = fs::remove_file(&part_path);
+    if let Err(e) = fs::copy(src, &part_path) {
+        let _ = fs::remove_file(&part_path);
+        return Err(io_read(e));
     }
-    let bytes = fs::read(src).map_err(io_read)?;
-    write_payload_file(dir, name, &bytes)
+    match fs::rename(&part_path, &final_path) {
+        Ok(()) => Ok(final_path),
+        Err(e) => {
+            let _ = fs::remove_file(&part_path);
+            Err(io_write(e))
+        }
+    }
 }
 
 /// Registry read: return the current snapshot as (meta, payload file path).
@@ -644,7 +668,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             // `last_log_id < last_purged_log_id` 的硬校验（helper.rs "inverted log order"），
             // 而 `None < Some(_)` 恒真。快照追平的 follower 会在 install 后 purge 到快照 index
             // （日志清空），此刻重启 = 节点永久起不来。所以空日志必须回落成 purge 位置。
-            last_log_id: last_log.or_else(|| last_purged.clone()),
+            last_log_id: last_log.or(last_purged),
             last_purged_log_id: last_purged,
         })
     }
@@ -1077,11 +1101,15 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         meta: &SnapshotMetaOf<TypeConfig>,
         snapshot: Self::SnapshotData,
     ) -> Result<(), ErrOf> {
-        // P2a: parse + validate the incoming payload file BEFORE touching state
-        //（failure = no half state）.
-        // P3c: `from_reader` 流式解析 —— 旧实现 `fs::read` 整份 + `from_slice` 再解析，
-        // 404MB 快照会同时驻留「整份 Vec<u8>」+「pairs」两份全量数据（实测峰值 RSS ≈ 2x payload）。
+        // 顺序（P3d）：先把 payload 落成 canonical 文件 + 解析校验，**再**动状态机。
+        // 这样 copy/解析失败时状态机和 last_applied 都没有前进（旧顺序先 restore 再落盘，
+        // 落盘失败会留下「last_applied 已前进但没有 registry 快照」的窗口）。
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = read_payload_pairs(&snapshot)?;
+        let path = copy_payload_file(
+            self.data_dir.join(SNAP_SUBDIR),
+            snap_file_name(meta),
+            &snapshot,
+        )?;
         {
             let sm = self.sm.write().map_err(|e| io_write(e.to_string()))?;
             sm.restore_all(&pairs).map_err(storage_err)?;
@@ -1090,17 +1118,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             self.write_last_applied(last_log_id)?;
         }
         self.write_membership(&meta.last_membership)?;
-        // 落盘（重启后仍可用）: canonical copy under this node's snapshots dir ——
-        // the input file may live in the sender's data dir（进程内 network/测试）or the HTTP
-        // server's materialized payload（同目录，handler deletes it after install returns）.
-        // P3c: 同目录时 rename 采纳，省掉一次整份 4xx MB 重写。
-        let path = adopt_payload_file(
-            self.data_dir.join(SNAP_SUBDIR),
-            snap_file_name(meta),
-            &snapshot,
-        )?;
         let old = persist_snapshot_registry(&self.db, meta, path.clone())?;
-        delete_old_snapshot_file(old);
+        // P3d：old 与 path 相同时**不能删**（名字复用/同名 meta 会命中，删掉就等于删掉刚登记的快照）
+        if old.as_deref() != Some(path.as_path()) {
+            delete_old_snapshot_file(old);
+        }
         *self.current_snapshot.lock().await = Some((meta.clone(), path));
         Ok(())
     }
@@ -1673,6 +1695,119 @@ mod tests {
         assert!(r.is_err(), "corrupt payload must be rejected");
         let cur = store.get_current_snapshot().await.unwrap();
         assert!(cur.is_none(), "rejected install must not touch registry");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn snap_meta(index: u64) -> SnapshotMetaOf<TypeConfig> {
+        SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index,
+            }),
+            last_membership: StoredMembership::default(),
+        }
+    }
+
+    fn snap_part_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir.join(SNAP_SUBDIR))
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn snap_snap_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir.join(SNAP_SUBDIR))
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".snap"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// P3d 回归（架构复核 blocker）：输入路径本身就是 registry 登记的 payload
+    /// （openraft `restore_from_snapshot` 启动路径正是这样调用 install_snapshot）。
+    /// 旧实现 rename「采纳」+ 随后 delete_old 会把刚登记的文件删掉 → 重启后没有快照。
+    #[tokio::test]
+    async fn reinstall_from_registry_path_keeps_payload_file() {
+        let dir = tmpdir("snap-reinstall");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
+
+        let data = serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap();
+        let meta = snap_meta(6);
+        let payload = write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta, &data).unwrap();
+        store.install_snapshot(&meta, payload).await.unwrap();
+
+        let snap = store.get_current_snapshot().await.unwrap().expect("snapshot");
+        assert!(std::fs::exists(&snap.snapshot).unwrap());
+
+        // 第二次：输入 = registry 自己的路径
+        store
+            .install_snapshot(&snap.meta, snap.snapshot.clone())
+            .await
+            .unwrap();
+        let snap2 = store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot after reinstall");
+        assert!(
+            std::fs::exists(&snap2.snapshot).unwrap(),
+            "registry 指向的 payload 必须存在（不能被 adopt/delete 掉）"
+        );
+        assert_eq!(snap_part_count(&dir), 0, "不得残留 .part");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 覆盖装：旧 registry 文件应被清理，只保留新的 canonical 文件，registry 指向它。
+    /// 输入 payload 放在 staging 目录（生产中是传输层 materialize / sender 目录），
+    /// store 只做 canonical copy，不删调用方的输入文件。
+    #[tokio::test]
+    async fn reinstall_over_existing_replaces_registry_and_files() {
+        let dir = tmpdir("snap-replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        let staging = dir.join("incoming");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
+
+        let m1 = snap_meta(3);
+        let d1 = serde_json::to_vec(&vec![(b"a".to_vec(), b"1".to_vec())]).unwrap();
+        let p1 = staging.join("payload-1.json");
+        std::fs::write(&p1, &d1).unwrap();
+        store.install_snapshot(&m1, p1.clone()).await.unwrap();
+        assert!(std::fs::exists(&p1).unwrap(), "staging 输入不应被 store 删除");
+
+        let m2 = snap_meta(7);
+        let d2 = serde_json::to_vec(&vec![(b"b".to_vec(), b"2".to_vec())]).unwrap();
+        let p2 = staging.join("payload-2.json");
+        std::fs::write(&p2, &d2).unwrap();
+        store.install_snapshot(&m2, p2.clone()).await.unwrap();
+        assert!(std::fs::exists(&p2).unwrap(), "staging 输入不应被 store 删除");
+
+        let snap = store.get_current_snapshot().await.unwrap().expect("snapshot");
+        assert_eq!(snap.meta.last_log_id, m2.last_log_id);
+        assert!(std::fs::exists(&snap.snapshot).unwrap());
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+            serde_json::from_slice(&std::fs::read(&snap.snapshot).unwrap()).unwrap();
+        assert_eq!(
+            pairs,
+            vec![(b"b".to_vec(), b"2".to_vec())],
+            "registry 必须指向新内容"
+        );
+        assert_eq!(snap_snap_count(&dir), 1, "旧 canonical 文件应被清理，只留 registry 那一份");
+        assert_eq!(snap_part_count(&dir), 0, "不得残留 .part");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
