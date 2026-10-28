@@ -57,7 +57,7 @@ struct Node {
     log_store: LogStore,
     dir: std::path::PathBuf,
     // P3 voter 用例: 端口预绑定但 HTTP 服务可延迟启动（模拟「节点 down 追赶」voter）
-    listener: Option<tokio::net.TcpListener>,
+    listener: Option<tokio::net::TcpListener>,
 }
 
 /// 装配一个节点：bind 127.0.0.1:0 真实端口（HttpNetworkFactory base=
@@ -65,7 +65,7 @@ struct Node {
 /// P3 voter 用例：bind_node 预绑定端口+raft 但【延迟】HTTP serve（模拟 down 节点——
 /// 地址在集群成员表而服务未 answering），serve_node 后「重」上线 → 经 full-snapshot 追平。
 async fn bind_node(node_id: NodeId, tag: &str, network: &HttpNetworkFactory) -> Node {
-    let listener = tokio::net.TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
     let dir = tmpdir(tag);
@@ -102,8 +102,8 @@ async fn bind_node(node_id: NodeId, tag: &str, network: &HttpNetworkFactory) -> 
 }
 
 /// 上线 /raft/* 服务（axum serve 同一 pre-bound listener）——「节点重上线」动作。
-fn serve_node(n: &Node) {
-    let listener = n.listener.expect("listener bound in bind_node");
+fn serve_node(n: &mut Node) {
+    let listener = n.listener.take().expect("listener bound in bind_node");
     let state = RaftServerState::with_token(
         n.raft.clone(),
         Some(Arc::from(TOKEN)),
@@ -112,14 +112,12 @@ fn serve_node(n: &Node) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, raft_router(state)).await;
     });
-    n.listener = None;
 }
 
 async fn start_node(node_id: NodeId, tag: &str, network: &HttpNetworkFactory) -> Node {
-    let n = bind_node(node_id, tag, network).await;
-    serve_node(&n);
+    let mut n = bind_node(node_id, tag, network).await;
+    serve_node(&mut n);
     n
-}
 }
 
 // 0.10：RaftMetrics 泛型 <C>（0.9 <NID, N>）; metrics() -> WatchReceiver trait .borrow() gone

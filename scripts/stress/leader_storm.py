@@ -80,8 +80,11 @@ PROFILES = {
 #   - "crc mismatch"       = full-snapshot stream end-crc guard fired (wire corruption)
 #   - "frame too large"    = snapshot_stream FrameDecoder MAX_FRAME_BYTES guard
 #   - "snapshot too large" = snapshot_stream check_total MAX_SNAPSHOT_BYTES budget guard
-#   - "full_snapshot"      = 0.9 JSON InstallSnapshot identifier — must be gone on 0.10
-#     (0.10 route/identifier is full-snapshot with hyphen; underscore form = stale 0.9 code)
+#   - "/raft/full_snapshot" = 0.9 JSON InstallSnapshot *wire route* — must be gone on 0.10
+#     (0.10 route is /raft/full-snapshot with hyphen). Scope the token to the route: openraft
+#     0.10 INFO logs legitimately contain "Raft::install_full_snapshot()",
+#     "handle_install_full_snapshot" and "finished sending full_snapshot", so a bare
+#     "full_snapshot" token false-positives on a perfectly healthy install.
 #   - "soft_ttl"           = 0.9-era Config field name — must be gone on 0.10 (0.10 wires
 #     RPCOption budgets in-network, never logs this token)
 FORBIDDEN = (
@@ -94,7 +97,7 @@ FORBIDDEN = (
     "crc mismatch",
     "frame too large",
     "snapshot too large",
-    "full_snapshot",
+    "/raft/full_snapshot",
     "soft_ttl",
 )
 
@@ -222,6 +225,28 @@ def members(base, token=None):
 def healthz(base):
     r = http_get(base, None, "/healthz", timeout=4.0)
     return r["status"] == 200
+
+
+def read_peak_rss_kb(node):
+    """Victim 进程的峰值 RSS（VmHWM，内核高水位）—— P3 C4 的 install RSS 证据。
+
+    victim 在 snapshot 阶段是 restart 后的新进程，VmHWM 覆盖的正是 「重启 → install
+    full-snapshot → 追平」窗口，可直接当作 install 峰值内存。读不到（进程已退出）→ None。
+    """
+    try:
+        pid = node.proc.pid if node and node.proc else None
+    except AttributeError:
+        pid = None
+    if not pid:
+        return None
+    try:
+        with open("/proc/%d/status" % pid, "r") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1])
+    except OSError:
+        return None
+    return None
 
 
 # ---------------------------------------------------------------- Node model
@@ -1064,6 +1089,9 @@ def snapshot_phase(args, stats, token, rng):
                        probe["status"], probe.get("err"), str(probe.get("data"))[:160]))
         time.sleep(0.4)
 
+    # C4 证据：victim 峰值 RSS（VmHWM）覆盖 restart → install full-snapshot → 追平窗口
+    victim_peak_rss_kb = read_peak_rss_kb(victim)
+
     # 6. interrupted-by-election diagnostic (a failure EXPLANATION, not a FORBIDDEN token —
     #    campaigning is normal chatter otherwise). If the victim repeatedly started an election
     #    while a snapshot was arriving, the transfer was interrupted.
@@ -1085,6 +1113,7 @@ def snapshot_phase(args, stats, token, rng):
 
     return {"victim_id": victim_id, "catchup_seconds": catchup_seconds,
             "max_lag": max_lag, "lag_none_seen": lag_none_seen, "lag_values": lag_values,
+            "victim_peak_rss_kb": victim_peak_rss_kb,
             "lag_points": lag_points,
             "lag_trajectory": _sample_lag_points(lag_points),
             "interrupted_by_election": interrupted_by_election,
@@ -1469,6 +1498,7 @@ def main():
             "freeze_count": STATS.freeze_count,
             "follower_kills": STATS.follower_kills,
             "snapshot_catchup_seconds": (snapshot_info or {}).get("catchup_seconds"),
+            "snapshot_victim_peak_rss_kb": (snapshot_info or {}).get("victim_peak_rss_kb"),
             "max_lag": (snapshot_info or {}).get("max_lag"),
             # (t_rel_since_catchup_start, victim lag) sampled; null for quick/no-snapshot
             "lag_trajectory": (snapshot_info or {}).get("lag_trajectory"),
