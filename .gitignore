@@ -57,3 +57,6 @@ server/target-host/
 /.zigcache/
 /.xdg-cache/
 .cargo-local/
+
+# Deepwork local progress
+.slim/deepwork/

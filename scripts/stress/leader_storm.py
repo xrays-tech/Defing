@@ -37,6 +37,7 @@ import uuid
 import urllib.error
 import urllib.request
 
+
 # module-level shared state (set in main(); helpers reference one instance)
 from typing import Any  # noqa: E402
 CLUSTER: Any = None
@@ -74,6 +75,23 @@ FORBIDDEN = ("panic", "fatal", "length limit exceeded", "installsnapshot rpc tim
 
 # login/healthz 免 Bearer; 其余 /api/v1 需 Bearer
 # data-plane /v1/... 需 session 或 project token (admin session 覆盖全项目 → 可读 config)
+
+
+# 启动参数断点: dsh-cli main.rs prints the EFFECTIVE Raft config once per node startup
+# ("raft config: heartbeat_interval=... install_snapshot_timeout=... ..."), and the harness
+# parses + asserts it equals the dsh-raft raft.rs dev_config() expectations below.
+# Any "heartbeat 100ms / InstallSnapshot 30s" conclusion therefore maps to the config that
+# ACTUALLY ran (stale binary / drifted config → exit 2, no silent green run).
+# cluster_name is NOT overridden by dev_config() → openraft Config default "foo".
+EXPECTED_RAFT_CONFIG = {
+    "heartbeat_interval": 100,
+    "election_timeout_min": 300,
+    "election_timeout_max": 600,
+    "max_payload_entries": 64,
+    "install_snapshot_timeout": 30_000,      # ms
+    "snapshot_max_chunk_size": 1024 * 1024,  # 1 MiB raw
+    "cluster_name": "foo",
+}
 
 
 def log(msg):
@@ -314,6 +332,69 @@ def wait_healthz(node, timeout):
             return True
         time.sleep(0.2)
     return False
+
+
+# ---------------------------------------------------------------- raft config assertion (启动参数断点)
+
+
+def raft_config_from_log(node):
+    """Parse the LAST "raft config:" line in the node log (restart/rejoin re-emits it).
+
+    dsh-cli main.rs logs the effective openraft Config after Raft::new wiring:
+      raft config: heartbeat_interval=100 election_timeout_min=300 ... cluster_name=foo
+    Returns dict[str,str] or None (missing line = pre-断点 binary → stale binary signal).
+    """
+    found = None
+    try:
+        with open(node.log_path, "rb") as f:
+            for line in f.read().decode("utf-8", "replace").splitlines():
+                if "raft config:" in line:
+                    found = line
+    except OSError:
+        return None
+    if found is None:
+        return None
+    kv = {}
+    for part in found.split("raft config:", 1)[1].split():
+        if "=" in part:
+            k, v = part.split("=", 1)
+            kv[k] = v
+    return kv if kv else None
+
+
+def assert_raft_config(nodes):
+    """Every node's log must carry a raft-config line matching dev_config() exactly.
+
+    Mismatch or missing line → caller exits 2 (启动失败 class): never validate semantics
+    under an unknown/unverifiable Raft configuration.
+    """
+    ok = True
+    for n in nodes:
+        got = raft_config_from_log(n)
+        if got is None:
+            log("FAIL: node %d log has no 'raft config:' line "
+                "(binary predates the config 断点 or logged elsewhere — rebuild)" % n.node_id)
+            ok = False
+            continue
+        bad = []
+        for k, exp in EXPECTED_RAFT_CONFIG.items():
+            v = got.get(k)
+            if v is None:
+                bad.append("%s missing" % k)
+            elif str(exp) != v:
+                bad.append("%s=%s != expected %s" % (k, v, exp))
+        if bad:
+            log("FAIL: node %d raft config mismatch: %s (expected %s)"
+                % (n.node_id, ", ".join(bad), EXPECTED_RAFT_CONFIG))
+            ok = False
+        else:
+            log("  raft config断点 ok node %d: hb=%s election=%s..%s payload=%s "
+                "install_snapshot_timeout=%s chunk=%s cluster_name=%s"
+                % (n.node_id, got["heartbeat_interval"],
+                   got["election_timeout_min"], got["election_timeout_max"],
+                   got["max_payload_entries"], got["install_snapshot_timeout"],
+                   got["snapshot_max_chunk_size"], got["cluster_name"]))
+    return ok
 
 
 # ---------------------------------------------------------------- stats (thread-safe)
@@ -705,6 +786,34 @@ class Chaos:
 # ---------------------------------------------------------------- snapshot catch-up phase
 
 
+def _sample_lag_points(points, max_pts=100):
+    """截断/采样 lag 轨迹 for summary+JSON: head 10 + tail 40 exact, middle stride-sampled."""
+    if len(points) <= max_pts:
+        return list(points)
+    head, tail = points[:10], points[-40:]
+    mid = points[10:-40]
+    room = max(1, max_pts - len(head) - len(tail))
+    step = max(1, len(mid) // room)
+    return head + mid[::step][:room] + tail
+
+
+def describe_lag_trend(points):
+    """Classify the lag time series: constant-stuck (活锁) vs slow descent vs divergence."""
+    if not points:
+        return "no numeric lag observations"
+    lags = [p[1] for p in points]
+    first, last = lags[0], lags[-1]
+    span = points[-1][0] - points[0][0]
+    if len(set(lags)) == 1:
+        return ("constant at %d across %.1fs (恒定不动 — 活锁: InstallSnapshot 未推进 matched index)"
+                % (first, span))
+    if last < first:
+        rate = (first - last) / span if span > 0 else float("inf")
+        return ("decreasing %d → %d over %.1fs (缓慢下降 ~%.1f entries/s — 追赶但未 settled)"
+                % (first, last, span, rate))
+    return ("increasing/diverging %d → %d over %.1fs (追-up 落后 grow)" % (first, last, span))
+
+
 def snapshot_phase(args, stats, token, rng):
     """非常规重点: kill a follower (keep down) → bulk writes to exceed snapshot_policy →
     restart follower → it must catch up via InstallSnapshot (not 413 / timed out).
@@ -803,6 +912,7 @@ def snapshot_phase(args, stats, token, rng):
     catchup_seconds = None
     max_lag = None          # only numeric lag observations update it; None is NOT "0"
     lag_values = []         # every numeric victim lag observed (for summary/diagnosis)
+    lag_points = []         # (t_rel_from_catchup_start, lag) time series → lag_trajectory
     lag_none_seen = False   # victim lag reported null at least once
     while time.time() - catchup_t0 < args.catchup_timeout:
         victim_lag = None
@@ -816,6 +926,7 @@ def snapshot_phase(args, stats, token, rng):
                             lag_none_seen = True
                     else:
                         lag_values.append(int(lag))
+                        lag_points.append((round(time.time() - catchup_t0, 2), int(lag)))
                         max_lag = int(lag) if max_lag is None else max(max_lag, int(lag))
                         victim_lag = int(lag)
                     break
@@ -842,6 +953,8 @@ def snapshot_phase(args, stats, token, rng):
 
     return {"victim_id": victim_id, "catchup_seconds": catchup_seconds,
             "max_lag": max_lag, "lag_none_seen": lag_none_seen, "lag_values": lag_values,
+            "lag_points": lag_points,
+            "lag_trajectory": _sample_lag_points(lag_points),
             "interrupted_by_election": interrupted_by_election,
             "bulk_seconds": bulk_seconds, "leader_node": leader,
             "projects": projects}, victim
@@ -990,9 +1103,10 @@ def validate_final(args, token, writers, snapshot_info, errors):
         cs = snapshot_info.get("catchup_seconds")
         if cs is None:
             errors.append("follower catch-up not reached: victim lag never settled to numeric 0 "
-                          "within %ss (lag_none_seen=%s, max_lag=%s)"
+                          "within %ss (lag_none_seen=%s, max_lag=%s; %s)"
                           % (args.catchup_timeout, snapshot_info.get("lag_none_seen"),
-                             snapshot_info.get("max_lag")))
+                             snapshot_info.get("max_lag"),
+                             describe_lag_trend(snapshot_info.get("lag_points") or [])))
         elif cs >= args.catchup_timeout:
             errors.append("catch_up_seconds %s >= timeout %s" % (cs, args.catchup_timeout))
         if snapshot_info.get("max_lag") is None and snapshot_info.get("lag_none_seen"):
@@ -1083,6 +1197,9 @@ def main():
                     log("  boot fail node %d; log tail:" % n.node_id)
                     for line in n.tail(30):
                         log("    " + line)
+            return 2
+        # 启动参数断点: 每个节点 log 的 effective Raft config must equal dev_config()
+        if not assert_raft_config(node_objs):
             return 2
         # login once (login 免 Bearer; auto-forwards to leader)
         tok_data = None
@@ -1205,6 +1322,8 @@ def main():
             "follower_kills": STATS.follower_kills,
             "snapshot_catchup_seconds": (snapshot_info or {}).get("catchup_seconds"),
             "max_lag": (snapshot_info or {}).get("max_lag"),
+            # (t_rel_since_catchup_start, victim lag) sampled; null for quick/no-snapshot
+            "lag_trajectory": (snapshot_info or {}).get("lag_trajectory"),
             "per_node_requests": STATS.per_node,
         }
         # only meaningful when the snapshot catch-up phase actually ran (not quick)
@@ -1224,8 +1343,19 @@ def main():
         # one-line JSON
         log("JSON " + json.dumps({"ok": not errors, **summary}, ensure_ascii=False))
 
-        # failure → print victim/leader tails
+        # failure → print lag trajectory tail (distinguish 活锁 constant-stuck vs slow descent)
+        # then victim/leader tails
         if errors:
+            if snapshot_info is not None:
+                pts = snapshot_info.get("lag_points") or []
+                if pts:
+                    log("--- victim %s lag 轨迹: last %d of %d points ---"
+                        % (snapshot_info.get("victim_id"), min(10, len(pts)), len(pts)))
+                    for t, lag in pts[-10:]:
+                        log("  t=%6.2fs lag=%s" % (t, lag))
+                    log("  trend: " + describe_lag_trend(pts))
+                else:
+                    log("--- victim lag: no numeric observations (lag stayed null) ---")
             for n in node_objs:
                 if any(("node %d " % n.node_id) in e for e in errors):
                     log("--- node %d log tail ---" % n.node_id)
