@@ -39,6 +39,7 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 
 # module-level shared state (set in main(); helpers reference one instance)
@@ -247,6 +248,49 @@ def read_peak_rss_kb(node):
     except OSError:
         return None
     return None
+
+
+def latest_snapshot_bytes(node):
+    """victim 落盘的最新快照字节数（{data_dir}/snapshots/*.snap 中最大者）——C4 规模证据。"""
+    try:
+        snap_dir = os.path.join(node.data_dir, "snapshots")
+        sizes = [
+            os.path.getsize(os.path.join(snap_dir, f))
+            for f in os.listdir(snap_dir)
+            if f.endswith(".snap")
+        ]
+    except OSError:
+        return None
+    return max(sizes) if sizes else None
+
+
+def install_window_seconds(node):
+    """victim 日志中最后一次 `install full snapshot` → `Done install complete snapshot` 的耗时。
+
+    openraft 0.10 的 INFO 行：`... install full snapshot, meta: ...` 与
+    `... Done install complete snapshot, meta: ...`。取最后一次配对，避免把 catch-up 窗口内
+    更早的一次 install 算成这一轮的耗时（墙钟 catchup 还包含等其他分块/重连的时间）。
+    """
+    try:
+        with open(node.log_path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    start = done = None
+    for ln in lines:
+        if "install full snapshot," in ln:
+            start = ln.split(" ", 1)[0]
+        elif "Done install complete snapshot" in ln:
+            done = ln.split(" ", 1)[0]
+    if not start or not done:
+        return None
+    try:
+        t0 = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(done.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    dt = (t1 - t0).total_seconds()
+    return round(dt, 3) if dt >= 0 else None
 
 
 # ---------------------------------------------------------------- Node model
@@ -1091,6 +1135,9 @@ def snapshot_phase(args, stats, token, rng):
 
     # C4 证据：victim 峰值 RSS（VmHWM）覆盖 restart → install full-snapshot → 追平窗口
     victim_peak_rss_kb = read_peak_rss_kb(victim)
+    # C4 证据：install 真实耗时 + 快照字节数（从 victim 日志/落盘文件量测，不用 catchup 墙钟替代）
+    snapshot_bytes = latest_snapshot_bytes(victim)
+    snapshot_install_seconds = install_window_seconds(victim)
 
     # 6. interrupted-by-election diagnostic (a failure EXPLANATION, not a FORBIDDEN token —
     #    campaigning is normal chatter otherwise). If the victim repeatedly started an election
@@ -1114,6 +1161,8 @@ def snapshot_phase(args, stats, token, rng):
     return {"victim_id": victim_id, "catchup_seconds": catchup_seconds,
             "max_lag": max_lag, "lag_none_seen": lag_none_seen, "lag_values": lag_values,
             "victim_peak_rss_kb": victim_peak_rss_kb,
+            "snapshot_bytes": snapshot_bytes,
+            "snapshot_install_seconds": snapshot_install_seconds,
             "lag_points": lag_points,
             "lag_trajectory": _sample_lag_points(lag_points),
             "interrupted_by_election": interrupted_by_election,
@@ -1499,6 +1548,8 @@ def main():
             "follower_kills": STATS.follower_kills,
             "snapshot_catchup_seconds": (snapshot_info or {}).get("catchup_seconds"),
             "snapshot_victim_peak_rss_kb": (snapshot_info or {}).get("victim_peak_rss_kb"),
+            "snapshot_bytes": (snapshot_info or {}).get("snapshot_bytes"),
+            "snapshot_install_seconds": (snapshot_info or {}).get("snapshot_install_seconds"),
             "max_lag": (snapshot_info or {}).get("max_lag"),
             # (t_rel_since_catchup_start, victim lag) sampled; null for quick/no-snapshot
             "lag_trajectory": (snapshot_info or {}).get("lag_trajectory"),
