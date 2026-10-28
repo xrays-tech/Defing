@@ -1747,7 +1747,11 @@ mod tests {
         let payload = write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta, &data).unwrap();
         store.install_snapshot(&meta, payload).await.unwrap();
 
-        let snap = store.get_current_snapshot().await.unwrap().expect("snapshot");
+        let snap = store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot");
         assert!(std::fs::exists(&snap.snapshot).unwrap());
 
         // 第二次：输入 = registry 自己的路径
@@ -1787,16 +1791,26 @@ mod tests {
         let p1 = staging.join("payload-1.json");
         std::fs::write(&p1, &d1).unwrap();
         store.install_snapshot(&m1, p1.clone()).await.unwrap();
-        assert!(std::fs::exists(&p1).unwrap(), "staging 输入不应被 store 删除");
+        assert!(
+            std::fs::exists(&p1).unwrap(),
+            "staging 输入不应被 store 删除"
+        );
 
         let m2 = snap_meta(7);
         let d2 = serde_json::to_vec(&vec![(b"b".to_vec(), b"2".to_vec())]).unwrap();
         let p2 = staging.join("payload-2.json");
         std::fs::write(&p2, &d2).unwrap();
         store.install_snapshot(&m2, p2.clone()).await.unwrap();
-        assert!(std::fs::exists(&p2).unwrap(), "staging 输入不应被 store 删除");
+        assert!(
+            std::fs::exists(&p2).unwrap(),
+            "staging 输入不应被 store 删除"
+        );
 
-        let snap = store.get_current_snapshot().await.unwrap().expect("snapshot");
+        let snap = store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot");
         assert_eq!(snap.meta.last_log_id, m2.last_log_id);
         assert!(std::fs::exists(&snap.snapshot).unwrap());
         let pairs: Vec<(Vec<u8>, Vec<u8>)> =
@@ -1806,7 +1820,11 @@ mod tests {
             vec![(b"b".to_vec(), b"2".to_vec())],
             "registry 必须指向新内容"
         );
-        assert_eq!(snap_snap_count(&dir), 1, "旧 canonical 文件应被清理，只留 registry 那一份");
+        assert_eq!(
+            snap_snap_count(&dir),
+            1,
+            "旧 canonical 文件应被清理，只留 registry 那一份"
+        );
         assert_eq!(snap_part_count(&dir), 0, "不得残留 .part");
         let _ = std::fs::remove_dir_all(&dir);
     }

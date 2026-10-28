@@ -3702,7 +3702,10 @@ mod restore_batch_tests {
         sm.store.put(b"stale", b"x").unwrap();
         let p = pairs(3, 4);
         sm.restore_all_batched(&p, 4).unwrap();
-        assert!(sm.store.get(b"stale").unwrap().is_none(), "旧状态必须被清空");
+        assert!(
+            sm.store.get(b"stale").unwrap().is_none(),
+            "旧状态必须被清空"
+        );
         for (k, v) in &p {
             assert_eq!(sm.store.get(k).unwrap().as_deref(), Some(v.as_slice()));
         }

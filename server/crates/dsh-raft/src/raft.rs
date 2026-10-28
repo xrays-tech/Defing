@@ -24,8 +24,11 @@ pub type RaftConfig = Config;
 ///   wasted appends/network roundtrips when leadership moves。
 ///
 /// 快照传输配套（follower 落后根治，P2b2 streaming，see raft_http_server.rs `raft_router`）:
-/// - `install_snapshot_timeout=30s`：覆盖 streamed msgpack frames 分块传输 + 磁盘落盘
-///   （openraft 默认 200ms single-chunk budget 远低于 follower catch-up 需要）；
+/// - `install_snapshot_timeout=30s`：**0.9 时代的 knob，0.10 不生效**。0.10 的 full snapshot
+///   走独立 snapshot client 的流式 RPC（`http_network.rs` 里 300s 总超时），本字段只被旧
+///   per-chunk RPC 路径消费。安装端到端预算由压测断言（`--max-install-seconds`）而非此字段
+///   兜底；保留 30_000 仅为配置兼容。P4 决策：要么用 `RPCOption::soft_ttl()` 真正约束流式
+///   请求，要么改名/下线该字段并在运行手册里给出真实上限。
 /// - `snapshot_max_chunk_size=1MiB`：网络层 clamps frame payload ≤1MiB（snapshot_stream
 ///   MAX_CHUNK_BYTES）；body 是 msgpack frames（旧 0.9 JSON 数字数组 ~3.1x 膨胀已 resolved
 ///   by streaming；/raft/* 32MiB body limit now only guards frame framing —

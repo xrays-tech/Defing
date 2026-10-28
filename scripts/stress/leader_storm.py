@@ -957,19 +957,25 @@ class Chaos:
         live = CLUSTER.live()
         if not live:
             return
-        lid, _ = cluster_leader_id(random.choice(live))
-        if lid is None:
-            return
-        leader = CLUSTER.by_id(lid)
+        # C3 证据：只杀**自认 leader** 的节点。随机节点报的 current_leader 可能是陈旧视图，
+        # 杀掉 follower 不能算 leader-kill 证据；这里直接扫各节点自视图的 is_leader。
+        leader = None
+        for n in live:
+            own = members(n.http_base(), None) or {}
+            # is_leader 在 members[] 的元素里（node 自身视角），不在顶层 dict
+            entry = next(
+                (m for m in own.get("members", [])
+                 if str(m.get("node_id")) == str(n.node_id)),
+                None,
+            )
+            if entry and entry.get("is_leader"):
+                leader = n
+                break
         if leader is None or not leader.alive():
-            return
-        if CLUSTER.lock.locked():
-            return
-        # C3 证据：击杀前必须确认目标**自认 leader**（随机节点报的 current_leader 可能是
-        # 陈旧视图，杀掉一个 follower 不能算 leader-kill 证据）。
-        own = members(leader.http_base(), None) or {}
-        if not own.get("is_leader"):
             self.stats.bump("leader_kill_target_not_leader")
+            return
+        lid = leader.node_id
+        if CLUSTER.lock.locked():
             return
         with CLUSTER.lock:
             # need >=4 live before killing so live stays >=3 (5-node quorum floor)
@@ -980,18 +986,28 @@ class Chaos:
         self.stats.bump("leader_kills")
         self.stats.bump("leader_kill_targets_verified")
         self.record("leader_kill", leader.node_id)
+        # C3：**击杀后、重启前**观测 leader 是否真的换人。被杀节点 0.2–1.2s 后就会以同
+        # data-dir 重新上线并可能立刻重新当选，把「换人」掩盖掉（旧实现在 restart 之后才
+        # wait_leader，于是 5 次 kill 只记到 1 次变化）。
+        changed = False
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            nl = wait_leader(1)
+            if nl is not None and nl != lid:
+                changed = True
+                STATS.bump("observed_leader_changes")
+                self.last_leader = nl
+                self.record("leader_change", nl)
+                break
+            time.sleep(0.2)
+        if not changed:
+            STATS.bump("leader_change_missing")
         # restart 0.2–1.2s later with same data-dir/argv
         time.sleep(self.rng.uniform(0.2, 1.2))
         with CLUSTER.lock:
             leader.spawn(CLUSTER.seed_map)
         self.record("leader_restart", leader.node_id)
         wait_healthz(leader, 25)
-        new_leader = wait_leader(25)
-        if new_leader is not None and new_leader != lid:
-            STATS.bump("observed_leader_changes")
-            self.last_leader = new_leader
-        else:
-            STATS.bump("leader_change_missing")
 
     def follower_freeze(self):
         live = [n for n in CLUSTER.live() if not n.frozen]
@@ -1498,13 +1514,19 @@ def validate_final(args, token, writers, snapshot_info, errors):
         if snapshot_info.get("max_lag") is None and snapshot_info.get("lag_none_seen"):
             errors.append("victim lag stayed null throughout (InstallSnapshot never established)")
         # ---- C3 断言：kill 的目标确实是 leader，且确实观测到 leader 变化 ----
+        if args.leader_kills > 0 and STATS.leader_kills == 0:
+            errors.append("C3: 配置了 --leader-kills=%d 但一次都没杀到自认 leader 的节点"
+                          "（target_not_leader=%d）" % (args.leader_kills,
+                                                        STATS.leader_kill_target_not_leader))
         if STATS.leader_kills > 0:
             if STATS.leader_kill_targets_verified < STATS.leader_kills:
                 errors.append("C3: %d 次 kill 但只有 %d 次确认目标是 leader（其余是陈旧视图）"
                               % (STATS.leader_kills, STATS.leader_kill_targets_verified))
-            if STATS.observed_leader_changes < 1:
-                errors.append("C3: %d 次 leader kill 后没有观测到任何 leader 变化"
-                              % STATS.leader_kills)
+            if STATS.observed_leader_changes < STATS.leader_kills:
+                errors.append("C3: %d 次 leader kill 但只观测到 %d 次 leader 变化"
+                              "（missing=%d）——kill 未真正触发重新选举"
+                              % (STATS.leader_kills, STATS.observed_leader_changes,
+                                 STATS.leader_change_missing))
 
         # ---- C4 断言（旧实现只报告不断言，样例里「日志追平、根本没走快照」也会绿）----
         if snapshot_info.get("install_windows", 0) < 1:
@@ -1765,6 +1787,9 @@ def main():
             "observed_leader_changes": STATS.observed_leader_changes,
             "freeze_count": STATS.freeze_count,
             "follower_kills": STATS.follower_kills,
+            "leader_kill_targets_verified": STATS.leader_kill_targets_verified,
+            "leader_kill_target_not_leader": STATS.leader_kill_target_not_leader,
+            "leader_change_missing": STATS.leader_change_missing,
             "snapshot_catchup_seconds": (snapshot_info or {}).get("catchup_seconds"),
             "snapshot_victim_peak_rss_kb": (snapshot_info or {}).get("victim_peak_rss_kb"),
             "snapshot_bytes": (snapshot_info or {}).get("snapshot_bytes"),

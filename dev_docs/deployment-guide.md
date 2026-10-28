@@ -324,10 +324,13 @@ curl -s -H "$AUTH" -X POST http://127.0.0.1:8384/api/v1/cluster/promote \
 - **Raft RPC snapshot 分块流（P2b2:0.10 streaming msgpack frames）**：追落后 follower 经
   `InstallSnapshot` 流帧（`Header`/`Chunk`/`End`,wire = `[u32 BE len][frame]`),chunk payload
   ≤ `snapshot_max_chunk_size` = 1MiB（msgpack binary,no JSON numeric-array inflation — old
-  0.9's ~3.1x resolved by streaming).服务端已设 `/raft/*` request body limit = **32MiB**（frame
-  level large margin）;反向代理/网关（nginx `client_max_body_size`、ingress、ALB 等）配置更
-  小的 per-frame request body limit（需 ≥ ~2MiB）in raft RPC 路径后 snapshot POST 恒 HTTP 413
-  `length limit exceeded`,follower 经 snapshot 路径无法追平。
+  0.9's ~3.1x resolved by streaming).**注意 body limit 的粒度**：一次 `POST /raft/full-snapshot`
+  请求承载**整份快照**（可到数百 MB），不是一帧一个请求；服务端该路由用
+  `DefaultBodyLimit::disable()`，其余 `/raft/*` RPC 仍是 **32MiB**。因此反向代理/网关
+  （nginx `client_max_body_size`、ingress、ALB 等）必须按**最大快照尺寸**配置
+  （design §8.4：上限 ≥ 最大快照，且建议 `proxy_request_buffering off` 以流式转发），
+  只按「per-frame ~2MiB」配置会让 snapshot POST 恒 HTTP 413 `length limit exceeded`，
+  follower 经 snapshot 路径无法追平。
 - **follower 长期落后，排查顺序**：
   1. `GET /api/v1/cluster/members` 看 per-member `lag`（= `last_log_index` − `last_applied`；
      恒 `null` 时查询非 leader 节点——leader 观察的 replication 数据只在 leader）；
