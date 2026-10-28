@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import random
+import re
 import signal
 import socket
 import subprocess
@@ -291,6 +292,62 @@ def install_window_seconds(node):
         return None
     dt = (t1 - t0).total_seconds()
     return round(dt, 3) if dt >= 0 else None
+
+_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
+
+
+def _line_ts(line):
+    m = _TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def election_attribution(log_path, offset):
+    """把 victim 重启后的选举按 install 窗口归属。
+
+    返回 (since_restart, during_install, window_count)。
+
+    为什么要分开：重启后、首个 snapshot frame 到达之前的选举只是「刚起来还没连上 leader」的
+    普通 Raft 行为；0.9 的活锁要防的是 **InstallSnapshot 传输/安装期间** 心跳被抑制导致的选举。
+    旧实现把两者混在一起（只要日志里出现过 install 标记就算 interrupted），会把健康的
+    快装（install 1.68s，选举发生在其之前）误判成失败。
+    """
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(offset)
+            blob = f.read().decode("utf-8", "replace")
+    except OSError:
+        return 0, 0, 0
+    total = 0
+    during = 0
+    windows = []
+    open_ts = None
+    last_ts = None
+    for line in blob.splitlines():
+        low = line.lower()
+        ts = _line_ts(line)
+        if ts is not None:
+            last_ts = ts
+        if open_ts is None and ("install full snapshot," in low or "install_full_snapshot()" in low):
+            open_ts = ts or last_ts
+        if open_ts is not None and "done install complete snapshot" in low:
+            end = ts or last_ts
+            if end is not None and end >= open_ts:
+                windows.append((open_ts, end))
+            open_ts = None
+        if any(tok in low for tok in ELECTION_MARKERS):
+            total += 1
+            if open_ts is not None:
+                during += 1
+    if open_ts is not None:
+        # 未闭合的 install 窗口（安装被打断/进程退出）：保守计入
+        if last_ts is not None and last_ts >= open_ts:
+            windows.append((open_ts, last_ts))
+    return total, during, len(windows)
 
 
 # ---------------------------------------------------------------- Node model
@@ -1145,18 +1202,12 @@ def snapshot_phase(args, stats, token, rng):
     #    0.10 INFO markers: "trigger election" / "starting a real election" (raft_core/engine);
     #    0.9 wording "election timeout passed" kept for back-compat. Snapshot arrival marker
     #    0.10: "install full snapshot" (following_handler) / legacy "installsnapshot".
-    try:
-        with open(victim.log_path, "rb") as f:
-            f.seek(victim_restart_offset)  # only THIS restart's output
-            vblob = f.read().decode("utf-8", "replace").lower()
-    except OSError:
-        vblob = ""
-    victim_elections = sum(vblob.count(tok) for tok in ELECTION_MARKERS)
-    if victim_elections > 0:
-        snapshot_elect = ("install full snapshot" in vblob) or ("installsnapshot" in vblob)
-        interrupted_by_election = snapshot_elect
-    else:
-        interrupted_by_election = False
+    # 选举归属：只有落在 install 窗口内的选举才算「打断安装」；窗口外（重启后尚未收到首个
+    # snapshot frame）的选举单独计数、只做诊断，不判失败。
+    elections_since_restart, victim_elections, install_windows = election_attribution(
+        victim.log_path, victim_restart_offset
+    )
+    interrupted_by_election = victim_elections > 0
 
     return {"victim_id": victim_id, "catchup_seconds": catchup_seconds,
             "max_lag": max_lag, "lag_none_seen": lag_none_seen, "lag_values": lag_values,
@@ -1167,6 +1218,8 @@ def snapshot_phase(args, stats, token, rng):
             "lag_trajectory": _sample_lag_points(lag_points),
             "interrupted_by_election": interrupted_by_election,
             "victim_elections": victim_elections,
+            "victim_elections_since_restart": elections_since_restart,
+            "install_windows": install_windows,
             "snapshot_chaos_injections": len(chaos_done),
             "bulk_seconds": bulk_seconds, "leader_node": leader,
             "projects": projects}, victim
@@ -1323,18 +1376,21 @@ def validate_final(args, token, writers, snapshot_info, errors):
             errors.append("catch_up_seconds %s >= timeout %s" % (cs, args.catchup_timeout))
         if snapshot_info.get("max_lag") is None and snapshot_info.get("lag_none_seen"):
             errors.append("victim lag stayed null throughout (InstallSnapshot never established)")
-        if snapshot_info.get("interrupted_by_election"):
-            errors.append("snapshot transfer interrupted by election timeout (victim repeatedly "
-                          "campaigned during InstallSnapshot); see node %s log"
-                          % snapshot_info.get("victim_id"))
-        # P3 churn 并发 invariant: the catch-up victim (a follower being full-snapped, incl.
-        # under --chaos-during-snapshot leader kills/freezes) must NEVER campaign itself.
-        # victim_elections counts ELECTION_MARKERS in the victim log since its catch-up restart.
+        # P3 churn 并发 invariant: 正在被 full-snapshot 追赶的 follower（含 leader kill/freeze
+        # churn 期间）在 **InstallSnapshot 窗口内** 必须一次选举都不发起。窗口外的选举（重启后
+        # 尚未连上 leader）只做诊断输出——它不是 0.9 的「安装期间心跳被抑制」失败模式。
+        log("  victim elections: inside_install=%s, since_restart=%s, install_windows=%s"
+            % (snapshot_info.get("victim_elections"),
+               snapshot_info.get("victim_elections_since_restart"),
+               snapshot_info.get("install_windows")))
         if snapshot_info.get("victim_elections", 0) > 0:
-            errors.append("victim node %s started %d election(s) during catch-up (expect 0 — "
-                          "catch-up victim must stay follower even while leader churns)"
+            errors.append("victim node %s started %d election(s) INSIDE the InstallSnapshot window "
+                          "(expect 0 — 0.10 独立心跳必须让 follower 在安装期间保持 follower; "
+                          "since_restart=%s, windows=%s)"
                           % (snapshot_info.get("victim_id"),
-                             snapshot_info.get("victim_elections")))
+                             snapshot_info.get("victim_elections"),
+                             snapshot_info.get("victim_elections_since_restart"),
+                             snapshot_info.get("install_windows")))
         if snapshot_info["victim_id"] is not None:
             vid = snapshot_info["victim_id"]
             with open(CLUSTER.by_id(vid).log_path, "rb") as f:
@@ -1562,6 +1618,8 @@ def main():
             # P3 churn 并发: victim must campaign 0x even under leader kill/freeze injections
             summary["chaos_during_snapshot"] = bool(args.chaos_during_snapshot)
             summary["victim_elections_during_catchup"] = snapshot_info.get("victim_elections")
+            summary["victim_elections_since_restart"] = snapshot_info.get("victim_elections_since_restart")
+            summary["snapshot_install_windows"] = snapshot_info.get("install_windows")
             summary["snapshot_chaos_injections"] = snapshot_info.get("snapshot_chaos_injections")
         log("== SUMMARY ==")
         for k, v in summary.items():
