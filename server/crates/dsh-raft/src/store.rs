@@ -639,8 +639,13 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             });
         let last_log = last_log_entry(&self.db)?.map(|e| e.log_id);
         Ok(LogState {
+            // 0.10 契约（`storage/log_state.rs`）：日志为空时 `last_log_id` 必须等于
+            // `last_purged_log_id`；0.9 允许 None，但 0.10 `get_initial_state` 会做
+            // `last_log_id < last_purged_log_id` 的硬校验（helper.rs "inverted log order"），
+            // 而 `None < Some(_)` 恒真。快照追平的 follower 会在 install 后 purge 到快照 index
+            // （日志清空），此刻重启 = 节点永久起不来。所以空日志必须回落成 purge 位置。
+            last_log_id: last_log.or_else(|| last_purged.clone()),
             last_purged_log_id: last_purged,
-            last_log_id: last_log,
         })
     }
 
@@ -1329,6 +1334,61 @@ mod tests {
         store.purge(truncate_at(3)).await.unwrap();
         assert_eq!(log_state_of(&mut store).await, (Some(3), Some(5)));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.10 LogState 契约 + 重启可启动性。
+    ///
+    /// 快照追平的 follower 在 install 后被 openraft 无条件 purge 到快照 index（日志清空）。
+    /// 0.10 `get_initial_state` 有 0.9 没有的硬校验 `last_log_id >= last_purged_log_id`
+    /// （`None < Some(_)` 恒真）→ 空日志若仍返回 `last_log_id = None`，节点重启即报
+    /// "inverted log order in log store ... corrupted"，且状态已持久化，永久起不来。
+    #[tokio::test]
+    async fn purge_to_empty_then_restart_can_boot_raft() {
+        let dir = tmpdir("purge-empty-boot");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let storage = open_storage(&dir);
+            let db = storage.raw_db();
+            let mut store = LogStore::new(db.clone());
+            store
+                .blocking_append([blank(1), blank(2), blank(3)])
+                .await
+                .unwrap();
+            store.purge(truncate_at(3)).await.unwrap();
+            assert!(indexes_of(&mut store, 1..=u64::MAX).await.is_empty());
+            // 契约：日志空 + purged=3 ⇒ last_log_id 必须回落成 3
+            assert_eq!(log_state_of(&mut store).await, (Some(3), Some(3)));
+        }
+
+        // 「重启」：drop 掉全部 handle 后重新打开同一 data dir
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let mut store = LogStore::new(db.clone());
+        assert_eq!(log_state_of(&mut store).await, (Some(3), Some(3)));
+
+        // 真正用这份 data dir 起 Raft —— 0.10 的 inverted-order 校验就在 get_initial_state 里
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
+        let sm_store = Arc::new(StateMachineStore::new(sm, db.clone(), dir.clone()));
+        let net = crate::NetworkFactory::new();
+        let info = crate::NodeInfo {
+            grpc_addr: "127.0.0.1:0".into(),
+            http_addr: "http://127.0.0.1:0".into(),
+            raft_addr: "127.0.0.1:0".into(),
+        };
+        let raft = crate::new_raft_node(
+            1,
+            info,
+            LogStore::new(db),
+            sm_store,
+            &net,
+            crate::dev_config(),
+        )
+        .await
+        .expect("purged-empty log store 必须能在 openraft 0.10 上启动（空日志 last_log_id 回落）");
+        // 关键断言是上面的 `Raft::new` 成功：0.10 的 inverted-order 校验就在 get_initial_state
+        // 里跑，空日志回落不生效时这里会 Err。metrics 是异步填充的，不做即时断言。
+        let _ = raft.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
