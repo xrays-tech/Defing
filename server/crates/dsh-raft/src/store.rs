@@ -3716,8 +3716,8 @@ mod p4a_tests {
             "关闭后不得写 marker"
         );
 
-        // A2 的另一半：开关只关「写」，**已存在**的 marker 仍必须重放——recover 不接
-        // store 句柄、也不读该开关，这里手工放一个 marker 验证它照样被重放。
+        // A2 的另一半：开关只关「写」，**已存在**的 marker 仍必须重放——recover 不读该开关，
+        // 这里手工放一个 marker 验证它照样被重放。
         let meta2 = snap_meta(16);
         let pairs2 = pairs_of(&[("from", "marker")]);
         let payload2 =
@@ -4506,7 +4506,7 @@ mod p4_scale_tests {
     ///
     /// 默认 `#[ignore]`（~350MB payload、~10s、~700MB 磁盘）；显式运行：
     /// ```bash
-    /// DSH_TEST_LARGE_INSTALL=1 cargo test -p dsh-raft --lib large_install_rss_probe \
+    /// DSH_TEST_LARGE_INSTALL_BYTES=367001600 cargo test -p dsh-raft --lib large_install_rss_probe \
     ///   -- --ignored --nocapture --test-threads=1
     /// ```
     /// payload 用**流式写**生成（不整份驻留），baseline 在生成之后采样 → delta 反映安装路径本身。

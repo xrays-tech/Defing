@@ -371,6 +371,8 @@ msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / 
   「崩溃不可重放」），已有的标记**仍会被重放**。
 - `DSH_RAFT_RESTORE_FORCE=1` 才是「忽略标记、允许混合状态启动」的逃生门：节点会**以 poison 启动**
   （读写 503，直到一次完整快照安装成功），ERROR 日志 + 需人工确认数据一致性后使用。
+  该 fail-stop 是**持久化**的（raft-meta 的 `restore_poison` 键）：重启后仍是 503；FORCE 会
+  **保留** restore 标记——下次不带 FORCE 启动时走正常重放（安全路径）并自动解除 poison。
 
 **恢复失败后的 fail-stop（poison）**：非崩溃型 restore 错误（如磁盘 IO）会让节点进入 fail-stop：
 
@@ -384,9 +386,10 @@ msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / 
 - 写端（v2）按 **64MiB** 分页 dump + 逐页编码直接落盘，**不再整份驻留**；代价是快照构建期间
   leader 的写命令会等待一次写盘时间（日志行 `snapshot built: ... elapsed=...` 可观测；
   生产 p99 写延迟标定留 P5）。
-- 闸门口径：storm 用**绝对净增量 RSS**（`max(窗口采样, VmHWM) - 重启基线`）≤ 320MiB
-  （`--max-rss-delta-mb`）；payload/redb 比值只作观测（JSON payload 会被编成十进制数组放大 ~4x，
-  `dsh.redb` 含 raft 表/free page 且按 region 取整，两者都不适合当判定基准）。
+- 闸门口径：storm 用**绝对净增量 RSS**（`max(窗口采样 0.4s, VmHWM) - 重启基线`），预算
+  `min(--max-rss-delta-mb, 192MiB + payload)`（默认上限 320MiB）：固定开销 192MiB + 允许一份
+  payload 副本，「整份额外驻留」回归会超预算。payload/redb 比值只作观测（JSON payload 会被编成
+  十进制数组放大 ~4x，`dsh.redb` 含 raft 表/free page 且按 region 取整，都不适合当判定基准）。
 - 磁盘峰值仍是快照的约 3 倍（旧 canonical + 收到的 payload + install 的 canonical 副本）。
 
 **降级到 P4 之前的二进制**：旧二进制不认识 v2 payload（`DSHSNP` 头 → `unsupported snapshot

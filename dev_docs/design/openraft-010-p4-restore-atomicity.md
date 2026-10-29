@@ -169,3 +169,19 @@
 - 顺带修 `voter_catches_up_via_http_snapshot_after_being_down` 的读日志竞态：SM 里 value 可见时
   core 尚未推进 last_applied / 触发 purge，先 `poll_metrics`（last_applied ≥ snapshot_index 且
   purged ≥ snapshot_index）再断言前缀为空。
+
+### 8.1 attempt 2 复核补丁（提交 75abeb8）
+
+1. **install 与 snapshot builder 的一致视图（blocker）**：`restore_and_persist_inner` 的
+   `sm.write()` 现在覆盖 restore + last_applied/membership + registry 提交；builder 的
+   `sm.read()`（meta+body）与之互斥 → builder 只会看到 install 前或 install 后的完整状态，
+   不会再出现「meta=N / body=S(N')」。
+2. **durable fail-stop**：`poison()` 同时写 `restore_poison` 键；`new_with_rotation` 启动时
+   据此恢复 poison；一次成功 install 或成功 boot 重放清除它。FORCE **保留** marker（不带 FORCE
+   的下次启动走正常重放），因此 fail-stop 跨重启有效。
+3. **poisoned 时 `get_current_snapshot` 返回 `Ok(None)`**：openraft `Raft::new` 启动期会调用它，
+   返回 Err 会让进程直接退出（FORCE 反而起不来）；返回 None 让节点能启动并保持 503，
+   直到 leader 重发快照。
+4. **v1 写端锁范围**：dump 在锁内（与 meta 同一视图），JSON 序列化 + 写盘在锁外。
+5. **新增测试**：marker 清理失败 → poison+Err → 重试恢复；过期 marker 只清不重放；
+   FORCE poison 跨重启 + 不带 FORCE 重放解除；gRPC watch poison；初始快照 last_applied 删除。

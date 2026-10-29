@@ -13,7 +13,7 @@
 
 ## 2. 目标（按收益排序）
 
-1. **有界内存恢复**：不再一次性 materialize 全部 `(k,v)`；按 64MiB 批次「解析一批 → 恢复一批」，
+1. **有界内存恢复**：不再一次性 materialize 全部 `(k,v)`；按 16MiB 批次（写端页预算 64MiB）
    峰值 RSS 目标：**net ≤ 1.2x payload**（P4base 基线 net 1.00x；旧「≤0.5x」不可达，作废）。
 2. **更小的 payload**：msgpack（binary）替代 JSON 文本；同类数据的经验值：体积 −30~40%、解析快 2–3x。
 3. **格式可演进**：带 magic + version，读端接受 v1(JSON) / v2(msgpack)，写端默认 v2；
@@ -34,8 +34,8 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
   写，不为拼「头+体」再复制一份 payload）；install、boot 重放、发送前（`verify_payload_file`）
   三处同口径校验。无头旧文件没有完整性头，`verify_payload_file` 直接放行。
 
-- 写 v2（P4a2 已落地）：`rmp::encode::write_array_len` + `write_bin` 逐项编码，body 目前仍整份
-  `Vec`（`dump_all()` 返回整份）。**流式写**（dump 分页 → 边 dump 边写）属 P4c，前置是 P4c0。
+- 写 v2（P4a2 落地时 body 仍整份 `Vec`；**P4c 已改为流式**：P4c0 分页 dump → 逐页编码 → 直接写
+  `.part` + seek-back 回填头，见 §11）。
 - 读 v2（P4b）：`rmp::decode::read_array_len` / `read_bin_len` 逐项解码，按字节预算组装 batch
   （16MiB）→ `restore_stream`（B1：只清空一次 + ≥3 批）。P4a2 只提供整份解码的单测路径。
 - 读 v1：保持 `serde_json::from_reader`（升级期一次性路径，P4d 后按发布周期下线）。
@@ -132,7 +132,7 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
   测试：3 批全存活 + 旧 key 被清（逐批清空的旧写法会立刻失败）、空流清空、批错误传播。
 - **`read_payload_batches(path, budget)`（dsh-raft）**：返回 `PayloadBatches` 迭代器（读端预算 16MiB）。
   - v2：打开时先 `verify_payload_file`（total_len + crc32，B2'）并校验文件长度，再**惰性**逐项
-    `rmp::decode`，按 64MiB 预算切批（批因最后一条略超预算；单条超预算单独成批）。
+    `rmp::decode`，按 **16MiB** 预算切批（批因最后一条略超预算；单条超预算单独成批）。
   - v1（无头/带头 JSON）：整份解析后切批 —— 升级期一次性路径，设计 §3 已声明。
   - 完整性校验**先于**状态机写入：坏 payload 在 copy/marker 之前失败（
     `install_rejects_corrupt_v2_before_state_change`）。
@@ -240,3 +240,12 @@ redb 尺寸或 msgpack payload 近似），不再用 v1-JSON payload 当分母�
   VmHWM 342,592KiB、基线 119,340KiB → **delta 228.6MB ≤ 320MiB**（观测：payload 2.51x、
   db_file 0.48x）；5/5 kill 验证 + 5/5 换人、8 项目逐项相等、0 无法解释选举、churn 落在 episode、
   心跳 228ms、provenance 干净（rev c1d3041 / 干净树 / bin>src）。
+
+### 12.3 最终口径与数字（attempt 2 复核后，提交 75abeb8）
+
+- **C4 预算公式**：`budget = min(--max-rss-delta-mb, 192MiB + payload)`；`delta = max(窗口采样 0.4s, VmHWM) - 重启基线`。
+  固定开销 192MiB + 允许一份 payload 副本；「整份额外驻留」（≈+1x payload）会超预算（harness 有专项单测）。
+  payload/redb 比值只入 summary（`rss_delta_vs_payload` / `rss_delta_vs_db_file`）。
+- **数字以最终 gate 跑为准**（见 `evidence/p4-gate-final2.log`）：v2 12k 的 delta 与预算按上式重算；
+  §12.2 里 "−19%/211MB" 是修复前（03c3fb2）跑的 recompute，仅作历史对照。
+- `db_file` 与逻辑状态的倍率**因 run 而异**（含 raft 日志与 free page），不构成稳定倍率，只作观测。
