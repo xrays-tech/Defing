@@ -397,9 +397,13 @@ msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / 
   leader 的写命令会等待一次写盘时间（日志行 `snapshot built: ... elapsed=...` 可观测；
   生产 p99 写延迟标定留 P5）。
 - 闸门口径：storm 用**绝对净增量 RSS**（`max(窗口采样 0.4s, VmHWM) - 重启基线`），预算
-  `min(--max-rss-delta-mb, 192MiB + payload)`（默认上限 320MiB）：固定开销 192MiB + 允许一份
+  `192MiB + payload`（随规模放大；`--max-rss-delta-mb>0` 只能收紧）：固定开销 192MiB + 允许一份
   payload 副本，「整份额外驻留」回归会超预算。payload/redb 比值只作观测（JSON payload 会被编成
   十进制数组放大 ~4x，`dsh.redb` 含 raft 表/free page 且按 region 取整，都不适合当判定基准）。
+- **install_snapshot_timeout**：`DSH_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS`（默认 30000ms）是 openraft
+  0.10 传给 InstallSnapshot RPC 的 `hard_ttl`。v1 JSON 快照可达 GB 级，30s 内传不完会反复超时
+  重试（滚动演练里 1GB payload 实测 30s 不足）。按 `timeout ≥ payload_bytes / 带宽 + 安装时间`
+  配置（例如 1GB / 35MB/s ≈ 30s，建议 ≥ 120000；v2 msgpack 约 1/4 大小，30s 通常够）。
 - 磁盘峰值仍是快照的约 3 倍（旧 canonical + 收到的 payload + install 的 canonical 副本）。
 
 **降级到 P4 之前的二进制**：旧二进制不认识 v2 payload（`DSHSNP` 头 → `unsupported snapshot
