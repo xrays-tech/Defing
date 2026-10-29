@@ -28,6 +28,7 @@ use dsh_core::StateMachine;
 use dsh_raft::openraft::rt::WatchReceiver;
 use dsh_raft::openraft::storage::RaftLogReader;
 use dsh_raft::openraft::type_config::alias::LogIdOf;
+use dsh_raft::openraft::Config as RaftConfig;
 use dsh_raft::openraft::RaftMetrics;
 use dsh_raft::*;
 use dsh_storage::RedbStorage;
@@ -58,6 +59,8 @@ struct Node {
     dir: std::path::PathBuf,
     // P3 voter 用例: 端口预绑定但 HTTP 服务可延迟启动（模拟「节点 down 追赶」voter）
     listener: Option<tokio::net::TcpListener>,
+    // 正在跑的 axum /raft/* 服务任务（stop_serving 用 abort 模拟「节点下线」）
+    server: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// 装配一个节点：bind 127.0.0.1:0 真实端口（HttpNetworkFactory base=
@@ -65,6 +68,15 @@ struct Node {
 /// P3 voter 用例：bind_node 预绑定端口+raft 但【延迟】HTTP serve（模拟 down 节点——
 /// 地址在集群成员表而服务未 answering），serve_node 后「重」上线 → 经 full-snapshot 追平。
 async fn bind_node(node_id: NodeId, tag: &str, network: &HttpNetworkFactory) -> Node {
+    bind_node_with_cfg(node_id, tag, network, dev_config()).await
+}
+
+async fn bind_node_with_cfg(
+    node_id: NodeId,
+    tag: &str,
+    network: &HttpNetworkFactory,
+    cfg: RaftConfig,
+) -> Node {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
@@ -86,7 +98,7 @@ async fn bind_node(node_id: NodeId, tag: &str, network: &HttpNetworkFactory) -> 
         LogStore::new(db.clone()),
         sm_store.clone(),
         network,
-        dev_config(),
+        cfg,
     )
     .await
     .unwrap();
@@ -98,26 +110,66 @@ async fn bind_node(node_id: NodeId, tag: &str, network: &HttpNetworkFactory) -> 
         log_store: LogStore::new(db.clone()),
         dir,
         listener: Some(listener),
+        server: None,
     }
 }
 
-/// 上线 /raft/* 服务（axum serve 同一 pre-bound listener）——「节点重上线」动作。
-fn serve_node(n: &mut Node) {
-    let listener = n.listener.take().expect("listener bound in bind_node");
+/// 在给定 listener 上起 /raft/* 服务，并把任务句柄存进 Node（便于下线）。
+fn serve_listener(n: &mut Node, listener: tokio::net::TcpListener) {
     let state = RaftServerState::with_token(
         n.raft.clone(),
         Some(Arc::from(TOKEN)),
         n.dir.clone().join(store::SNAP_SUBDIR),
     );
-    tokio::spawn(async move {
+    n.server = Some(tokio::spawn(async move {
         let _ = axum::serve(listener, raft_router(state)).await;
-    });
+    }));
+}
+
+/// 上线 /raft/* 服务（axum serve 同一 pre-bound listener）——「节点重上线」动作。
+fn serve_node(n: &mut Node) {
+    let listener = n.listener.take().expect("listener bound in bind_node");
+    serve_listener(n, listener);
+}
+
+/// 「节点下线」：停掉 HTTP 服务（raft 实例仍在，成员表里仍是 voter → quorum 需要 2/3）。
+fn stop_serving(n: &mut Node) {
+    if let Some(h) = n.server.take() {
+        h.abort();
+    }
+}
+
+/// 「节点重上线」：在**同一 addr** 重新 bind 并起服务（abort 后 socket 已释放，带重试）。
+async fn restart_serving(n: &mut Node) {
+    let addr: std::net::SocketAddr = n.info.raft_addr.parse().expect("raft_addr 是 socket addr");
+    let mut last_err = None;
+    for _ in 0..100 {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                serve_listener(n, l);
+                return;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("rebind {addr} 失败: {last_err:?}");
 }
 
 async fn start_node(node_id: NodeId, tag: &str, network: &HttpNetworkFactory) -> Node {
     let mut n = bind_node(node_id, tag, network).await;
     serve_node(&mut n);
     n
+}
+
+/// 这两个 e2e 用例都起真实 socket 集群（每边 3~4 个 raft 节点 + axum + 各自 reqwest 池）。
+/// 并发跑会互相干扰：实测并行时约 15% 概率某个节点 catch-up 卡到 60s 超时（串行 5/5 稳定）。
+/// 用进程级 tokio 互斥量串行化，保证 `cargo test` 默认并行调用下也稳定。
+async fn e2e_guard_acquire() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 // 0.10：RaftMetrics 泛型 <C>（0.9 <NID, N>）; metrics() -> WatchReceiver trait .borrow() gone
@@ -175,6 +227,7 @@ async fn must_write(raft: &RaftHandle, cmd: Command, ctx: String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn learner_catches_up_via_http_snapshot() {
+    let _serial = e2e_guard_acquire().await;
     let network = HttpNetworkFactory::with_token(Some(TOKEN.into()));
 
     // 1) leader（真实 HTTP /raft/* 服务端）
@@ -364,6 +417,255 @@ async fn learner_catches_up_via_http_snapshot() {
 
     // 6) cleanup
     for n in [n1, n2] {
+        let _ = n.raft.shutdown().await;
+        let _ = std::fs::remove_dir_all(&n.dir);
+    }
+}
+
+/// 0.10 membership RPC 串行化：等 cluster_committed 见效再发下一个 membership 变更。
+async fn wait_membership_committed(raft: &RaftHandle) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if metrics_of(raft).cluster_committed.is_some() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 「voter 下线」用的配置：选举超时拉到分钟级。
+/// 测试里只是停掉 HTTP 服务来模拟节点 down（进程内 raft 仍在跑），若仍用 300–600ms 超时，
+/// 被隔离的 voter 会不断竞选并把集群 term 推高，测的就不是「快照追平」了。
+fn isolated_voter_config() -> RaftConfig {
+    let mut c = dev_config();
+    c.election_timeout_min = 600_000;
+    c.election_timeout_max = 1_200_000;
+    c
+}
+
+/// P3 §9.3 voter（非 learner）大快照 e2e：
+/// 3 voter 集群里把一个**已追平的 voter** 下线 → leader 写穿 >1MiB 状态并 snapshot+purge →
+/// voter 以同一 addr 重上线，必须经真实 HTTP full-snapshot 追平（日志已被 purge，value 只能来自快照）。
+/// 与 learner 用例的区别：victim 在成员表里是 voter（quorum 需要 2/3，写入仍提交），
+/// 因此它回到集群时 leadership/成员关系处于真实状态，而不是「空 learner 加入」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_catches_up_via_http_snapshot_after_being_down() {
+    let _serial = e2e_guard_acquire().await;
+    let network = HttpNetworkFactory::with_token(Some(TOKEN.into()));
+
+    // 1) 3 voter 集群：n1 leader、n2 helper、n3 victim（分钟级选举超时）
+    let n1 = start_node(1, "v-leader", &network).await;
+    initialize_single(&n1.raft, 1, n1.info.clone())
+        .await
+        .unwrap();
+    assert!(wait_for_leader(&n1.raft, Duration::from_secs(5))
+        .await
+        .is_some());
+
+    let n2 = start_node(2, "v-helper", &network).await;
+    wait_membership_committed(&n1.raft).await;
+    n1.raft
+        .add_learner(2, n2.info.clone(), false)
+        .await
+        .unwrap();
+    n1.raft
+        .change_membership(vec![1u64, 2], false)
+        .await
+        .unwrap();
+
+    let mut n3 = bind_node_with_cfg(3, "v-victim", &network, isolated_voter_config()).await;
+    serve_node(&mut n3);
+    wait_membership_committed(&n1.raft).await;
+    n1.raft
+        .add_learner(3, n3.info.clone(), false)
+        .await
+        .unwrap();
+    n1.raft
+        .change_membership(vec![1u64, 2, 3], false)
+        .await
+        .unwrap();
+
+    // 2) 基线写：确认 n3 作为 voter 已追上（否则「下线前就是落后的」，测不到快照路径）
+    must_write(
+        &n1.raft,
+        Command::ProjectCreate {
+            name: PID.into(),
+            operator: String::new(),
+            ts: 0,
+            clone_from: None,
+        },
+        "project create".to_string(),
+    )
+    .await;
+    let baseline = wait_until(|| sm_has_project(&n3.sm, PID), Duration::from_secs(20)).await;
+    assert!(baseline, "victim voter 基线未追上（成员/复制未建立）");
+
+    // 3) 打下线：只停 HTTP 服务，成员表里仍是 voter → 写入需要 2/3 quorum，n1+n2 仍可提交
+    stop_serving(&mut n3);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 4) 大状态（>1MiB）：structure + publish + 40×60KB draft value
+    let items: Vec<ItemDef> = (0..ITEM_COUNT)
+        .map(|i| ItemDef {
+            key: format!("k{}", i),
+            ty: ValueType::String,
+            required: false,
+            secret: false,
+            validate: None,
+            description: None,
+            shared: false,
+        })
+        .collect();
+    must_write(
+        &n1.raft,
+        Command::StructureDraftSet {
+            project: PID.into(),
+            base_version: 1,
+            groups: vec![GroupDef {
+                name: GROUP.into(),
+                items,
+            }],
+            operator: String::new(),
+        },
+        "structure draft set".to_string(),
+    )
+    .await;
+    must_write(
+        &n1.raft,
+        Command::PublishStructure {
+            project: PID.into(),
+            comment: "init".into(),
+            request_id: "v1".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        "publish structure".to_string(),
+    )
+    .await;
+    for i in 0..ITEM_COUNT {
+        must_write(
+            &n1.raft,
+            Command::DraftUpdate {
+                project: PID.into(),
+                branch: BranchName("dev".into()),
+                updates: vec![DraftUpdateItem {
+                    group: GROUP.into(),
+                    key: format!("k{}", i),
+                    value: Value::String("x".repeat(VALUE_BYTES)),
+                }],
+                deletes: vec![],
+                shared_bindings: vec![],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            format!("draft update k{}", i),
+        )
+        .await;
+    }
+    let last_write_index = metrics_of(&n1.raft).last_log_index.expect("last_log_index");
+
+    // 5) 强制 snapshot + purge 到快照 index（victim 的日志缺口只能靠 full-snapshot 补）
+    n1.raft.trigger().snapshot().await.unwrap();
+    let m1 = poll_metrics(&n1.raft, Duration::from_secs(10), |m| {
+        idx(m.snapshot) >= last_write_index
+    })
+    .await;
+    let snapshot_index = idx(m1.snapshot);
+    assert!(
+        snapshot_index >= last_write_index,
+        "snapshot 未覆盖 last write: snapshot={} last_write={}",
+        snapshot_index,
+        last_write_index,
+    );
+    n1.raft.trigger().purge_log(snapshot_index).await.unwrap();
+    let m2 = poll_metrics(&n1.raft, Duration::from_secs(10), |m| {
+        idx(m.purged) >= snapshot_index
+    })
+    .await;
+    assert!(
+        idx(m2.purged) >= snapshot_index,
+        "leader purge 未到快照 index"
+    );
+
+    // 6) 重上线（同一 addr，同一 raft 实例）→ 必须经 full-snapshot 追平
+    let t0 = std::time::Instant::now();
+    restart_serving(&mut n3).await;
+    let big = Value::String("x".repeat(VALUE_BYTES));
+    let caught = wait_until(
+        || sm_draft_value(&n3.sm, GROUP, "k0") == Some(big.clone()),
+        Duration::from_secs(60),
+    )
+    .await;
+    println!(
+        "[diag] voter caught_up={} elapsed={:?}",
+        caught,
+        t0.elapsed()
+    );
+    if !caught {
+        let ml = metrics_of(&n1.raft);
+        let mv = metrics_of(&n3.raft);
+        println!(
+            "[diag] FAIL leader  term={:?} last_log={:?} applied={:?} purged={:?} snapshot={:?} leader={:?}",
+            ml.current_term, ml.last_log_index, ml.last_applied, ml.purged, ml.snapshot, ml.current_leader
+        );
+        println!(
+            "[diag] FAIL leader  replication={:?} heartbeat={:?} vote={:?}",
+            ml.replication, ml.heartbeat, ml.vote
+        );
+        println!(
+            "[diag] FAIL victim  term={:?} last_log={:?} applied={:?} purged={:?} snapshot={:?} leader={:?} state={:?}",
+            mv.current_term, mv.last_log_index, mv.last_applied, mv.purged, mv.snapshot, mv.current_leader, mv.state
+        );
+    }
+    assert!(
+        caught,
+        "voter 60s 未经过 full-snapshot 追平（draft value 不可见）"
+    );
+
+    // 强证据：victim 日志 1..=snapshot_index 已被 install 后 purge ⇒ value 只可能来自快照
+    let covered = n3
+        .log_store
+        .try_get_log_entries(1..=snapshot_index)
+        .await
+        .unwrap();
+    assert!(
+        covered.is_empty(),
+        "voter log 1..={} 应 empty（value 经 snapshot 传输）, got {}",
+        snapshot_index,
+        covered.len(),
+    );
+    let m3 = poll_metrics(&n3.raft, Duration::from_secs(10), |m| {
+        idx(m.last_applied) >= snapshot_index && idx(m.purged) >= snapshot_index
+    })
+    .await;
+    assert!(
+        idx(m3.last_applied) >= snapshot_index,
+        "voter last_applied={:?} < snapshot_index={}",
+        m3.last_applied,
+        snapshot_index,
+    );
+    assert!(
+        idx(m3.purged) >= snapshot_index,
+        "voter purged={:?} < snapshot_index={}",
+        m3.purged,
+        snapshot_index,
+    );
+
+    // 强证据：victim 在成员表里确实是 voter（不是 learner），且集群仍有 3 voters
+    let voters: Vec<u64> = m3.membership_config.membership().voter_ids().collect();
+    assert!(
+        voters.contains(&3) && voters.len() == 3,
+        "victim 必须是 voter 且集群 3 voters, got {:?}",
+        voters
+    );
+
+    // 7) cleanup
+    for n in [&n1, &n2, &n3] {
         let _ = n.raft.shutdown().await;
         let _ = std::fs::remove_dir_all(&n.dir);
     }

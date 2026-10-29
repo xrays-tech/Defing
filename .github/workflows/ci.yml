@@ -79,6 +79,13 @@ jobs:
       - name: raft cluster tests
         working-directory: server
         run: cargo test -p dsh-raft --test cluster --test snapshot_persist --test forward_hint
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 压测 harness 的 parser + C3/C4 断言单测（storm 本体太重不进 CI，但其判定逻辑必须被覆盖：
+      # 「没走快照 / install 超预算 / 快照太小 / kill 没换人」都要能判失败）
+      - name: stress harness unit tests
+        run: python3 -m unittest scripts/stress/test_leader_storm.py -v
 
   # stage 6: 三语言 SDK 契约对拍（同一 dev-single 服务）
   sdk:

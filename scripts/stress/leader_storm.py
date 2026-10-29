@@ -1405,6 +1405,52 @@ def quiesce(timeout=30):
     return False
 
 
+def c3_errors(args, stats):
+    """C3（3+ 节点 HTTP leader kill / 换人）断言，纯函数便于单测。"""
+    errs = []
+    if args.leader_kills > 0 and stats.leader_kills == 0:
+        errs.append("C3: 配置了 --leader-kills=%d 但一次都没杀到自认 leader 的节点（target_not_leader=%d）"
+                    % (args.leader_kills, stats.leader_kill_target_not_leader))
+    if stats.leader_kills > 0:
+        if stats.leader_kill_targets_verified < stats.leader_kills:
+            errs.append("C3: %d 次 kill 但只有 %d 次确认目标是 leader（其余是陈旧视图）"
+                        % (stats.leader_kills, stats.leader_kill_targets_verified))
+        if stats.observed_leader_changes < stats.leader_kills:
+            errs.append("C3: %d 次 leader kill 但只观测到 %d 次 leader 变化（missing=%d）"
+                        % (stats.leader_kills, stats.observed_leader_changes,
+                           stats.leader_change_missing))
+    return errs
+
+
+def c4_errors(args, snapshot_info, victim_is_voter):
+    """C4（voter 大快照 / transfer 窗口 churn / install 预算 / RSS 前提）断言，纯函数便于单测。
+
+    旧实现只把指标写进 summary、不做判定，样例里「日志追平、根本没走快照」也会绿；
+    这里把「必须真的走了 full-snapshot、且规模/耗时/身份达标」变成硬错误。
+    """
+    errs = []
+    info = snapshot_info or {}
+    if info.get("install_windows", 0) < 1:
+        errs.append("C4: victim 没有走 full-snapshot（install_windows=0）——日志追平/learner 路径不算 C4")
+    end2end = info.get("snapshot_install_seconds")
+    if end2end is None:
+        errs.append("C4: 无法量测 install 端到端耗时（缺 transfer/install/done 标记）")
+    elif end2end > args.max_install_seconds:
+        errs.append("C4: install 端到端 %ss 超过预算 %ss（transfer=%ss apply=%ss）"
+                    % (end2end, args.max_install_seconds,
+                       info.get("snapshot_transfer_seconds"), info.get("snapshot_apply_seconds")))
+    sb = info.get("snapshot_bytes")
+    if sb is None:
+        errs.append("C4: victim 没有落盘快照文件（snapshot_bytes=None）")
+    elif sb < args.min_snapshot_bytes:
+        errs.append("C4: 快照只有 %s 字节 < 下限 %s（规模不足以覆盖大快照场景）"
+                    % (sb, args.min_snapshot_bytes))
+    if victim_is_voter is not True:
+        errs.append("C4: victim node %s 不是 voter（is_voter=%s）——learner 追平不能算 C4"
+                    % (info.get("victim_id"), victim_is_voter))
+    return errs
+
+
 def validate_final(args, token, writers, snapshot_info, errors):
     # leader
     lid = wait_leader(10)
@@ -1513,39 +1559,8 @@ def validate_final(args, token, writers, snapshot_info, errors):
             errors.append("catch_up_seconds %s >= timeout %s" % (cs, args.catchup_timeout))
         if snapshot_info.get("max_lag") is None and snapshot_info.get("lag_none_seen"):
             errors.append("victim lag stayed null throughout (InstallSnapshot never established)")
-        # ---- C3 断言：kill 的目标确实是 leader，且确实观测到 leader 变化 ----
-        if args.leader_kills > 0 and STATS.leader_kills == 0:
-            errors.append("C3: 配置了 --leader-kills=%d 但一次都没杀到自认 leader 的节点"
-                          "（target_not_leader=%d）" % (args.leader_kills,
-                                                        STATS.leader_kill_target_not_leader))
-        if STATS.leader_kills > 0:
-            if STATS.leader_kill_targets_verified < STATS.leader_kills:
-                errors.append("C3: %d 次 kill 但只有 %d 次确认目标是 leader（其余是陈旧视图）"
-                              % (STATS.leader_kills, STATS.leader_kill_targets_verified))
-            if STATS.observed_leader_changes < STATS.leader_kills:
-                errors.append("C3: %d 次 leader kill 但只观测到 %d 次 leader 变化"
-                              "（missing=%d）——kill 未真正触发重新选举"
-                              % (STATS.leader_kills, STATS.observed_leader_changes,
-                                 STATS.leader_change_missing))
-
-        # ---- C4 断言（旧实现只报告不断言，样例里「日志追平、根本没走快照」也会绿）----
-        if snapshot_info.get("install_windows", 0) < 1:
-            errors.append("C4: victim 没有走 full-snapshot（install_windows=0）——日志追平/learner 路径不算 C4")
-        end2end = snapshot_info.get("snapshot_install_seconds")
-        if end2end is None:
-            errors.append("C4: 无法量测 install 端到端耗时（缺 transfer/install/done 标记）")
-        elif end2end > args.max_install_seconds:
-            errors.append("C4: install 端到端 %ss 超过预算 %ss（transfer=%ss apply=%ss）"
-                          % (end2end, args.max_install_seconds,
-                             snapshot_info.get("snapshot_transfer_seconds"),
-                             snapshot_info.get("snapshot_apply_seconds")))
-        sb = snapshot_info.get("snapshot_bytes")
-        if sb is None:
-            errors.append("C4: victim 没有落盘快照文件（snapshot_bytes=None）")
-        elif sb < args.min_snapshot_bytes:
-            errors.append("C4: 快照只有 %s 字节 < 下限 %s（规模不足以覆盖大快照场景）"
-                          % (sb, args.min_snapshot_bytes))
-        # victim 必须是 voter（learner 追平不算 C4）
+        # ---- C3/C4 断言（纯函数，单测覆盖 scripts/stress/test_leader_storm.py）----
+        errors.extend(c3_errors(args, STATS))
         md = members(leader.http_base(), None) if leader else None
         voter_ok = None
         if md:
@@ -1553,9 +1568,7 @@ def validate_final(args, token, writers, snapshot_info, errors):
                 if str(m.get("node_id")) == str(snapshot_info.get("victim_id")):
                     voter_ok = bool(m.get("is_voter"))
                     break
-        if voter_ok is not True:
-            errors.append("C4: victim node %s 不是 voter（is_voter=%s）——learner 追平不能算 C4"
-                          % (snapshot_info.get("victim_id"), voter_ok))
+        errors.extend(c4_errors(args, snapshot_info, voter_ok))
 
         # P3 churn 并发 invariant: 正在被 full-snapshot 追赶的 follower（含 leader kill/freeze
         # churn 期间）在 **transfer→install→done 窗口内** 必须一次选举/预投票都不发起。
