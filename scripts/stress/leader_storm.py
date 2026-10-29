@@ -1260,6 +1260,11 @@ def snapshot_phase(args, stats, token, rng):
     lag_values = []         # every numeric victim lag observed (for summary/diagnosis)
     lag_points = []         # (t_rel_from_catchup_start, lag) time series → lag_trajectory
     lag_none_seen = False   # victim lag reported null at least once
+    # 心跳证据（plan §9.3）：leader 视角 victim 的「最近一次确认心跳」age。
+    # 0.10 的独立 heartbeat worker 要证明的正是「快照 install 期间心跳不停」。
+    hb_samples = 0
+    hb_max_ms = None
+    hb_max_in_window_ms = None
     chaos_done = []
     cfg_gate_diag = 0       # first few lag==0-but-gate-fail reasons (diagnosis only)
     transfer_seen_at = None
@@ -1289,6 +1294,15 @@ def snapshot_phase(args, stats, token, rng):
         if md:
             for m in md.get("members", []):
                 if str(m.get("node_id")) == str(victim_id):
+                    hb_age = m.get("last_heartbeat_ms_ago")
+                    if isinstance(hb_age, int) and not isinstance(hb_age, bool):
+                        hb_samples += 1
+                        hb_max_ms = hb_age if hb_max_ms is None else max(hb_max_ms, hb_age)
+                        if transfer_seen_at is not None and catchup_seconds is None:
+                            hb_max_in_window_ms = (
+                                hb_age if hb_max_in_window_ms is None
+                                else max(hb_max_in_window_ms, hb_age)
+                            )
                     lag = m.get("lag")
                     if lag is None or isinstance(lag, bool):
                         if lag is None:
@@ -1349,6 +1363,9 @@ def snapshot_phase(args, stats, token, rng):
             "snapshot_transfer_seconds": win["transfer_seconds"],
             "snapshot_apply_seconds": win["apply_seconds"],
             "snapshot_elections_pre_vote": attr["pre_votes"],
+            "victim_heartbeat_samples": hb_samples,
+            "victim_heartbeat_max_ms": hb_max_ms,
+            "victim_heartbeat_max_in_window_ms": hb_max_in_window_ms,
             "snapshot_elections_since_restart": attr["since_restart"],
             "snapshot_windows_unclosed": attr["unclosed"],
             "lag_points": lag_points,
@@ -1405,8 +1422,13 @@ def quiesce(timeout=30):
     return False
 
 
-def c3_errors(args, stats):
-    """C3（3+ 节点 HTTP leader kill / 换人）断言，纯函数便于单测。"""
+def c3_errors(args, stats, heartbeat=None):
+    """C3（3+ 节点 HTTP leader kill / 换人 / 心跳不停）断言，纯函数便于单测。
+
+    `heartbeat` = {"samples": int, "max_in_window_ms": int|None}：leader 视角 victim 心跳 age
+    在 install 窗口内的最大值。0.9 的失败模式正是「快照 offload 期间心跳被抑制」，所以
+    「窗口内出现过心跳采样且 age 不超预算」是 C3 的直接证据。
+    """
     errs = []
     if args.leader_kills > 0 and stats.leader_kills == 0:
         errs.append("C3: 配置了 --leader-kills=%d 但一次都没杀到自认 leader 的节点（target_not_leader=%d）"
@@ -1419,6 +1441,17 @@ def c3_errors(args, stats):
             errs.append("C3: %d 次 leader kill 但只观测到 %d 次 leader 变化（missing=%d）"
                         % (stats.leader_kills, stats.observed_leader_changes,
                            stats.leader_change_missing))
+    hb = heartbeat or {}
+    if hb.get("samples"):
+        age = hb.get("max_in_window_ms")
+        if age is None:
+            errs.append("C3: install 窗口内没有任何心跳采样（无法证明心跳未停）")
+        elif age > args.max_heartbeat_gap_ms:
+            errs.append("C3: install 窗口内 victim 心跳 age 最大 %sms 超过预算 %sms"
+                        "（0.9 失败模式：快照期间心跳被抑制）"
+                        % (age, args.max_heartbeat_gap_ms))
+    else:
+        errs.append("C3: 全程没有 last_heartbeat_ms_ago 采样（leader 心跳视图缺失）")
     return errs
 
 
@@ -1560,7 +1593,10 @@ def validate_final(args, token, writers, snapshot_info, errors):
         if snapshot_info.get("max_lag") is None and snapshot_info.get("lag_none_seen"):
             errors.append("victim lag stayed null throughout (InstallSnapshot never established)")
         # ---- C3/C4 断言（纯函数，单测覆盖 scripts/stress/test_leader_storm.py）----
-        errors.extend(c3_errors(args, STATS))
+        errors.extend(c3_errors(args, STATS, {
+            "samples": snapshot_info.get("victim_heartbeat_samples"),
+            "max_in_window_ms": snapshot_info.get("victim_heartbeat_max_in_window_ms"),
+        }))
         md = members(leader.http_base(), None) if leader else None
         voter_ok = None
         if md:
@@ -1618,6 +1654,8 @@ def parse_args():
     p.add_argument("--catchup-timeout", type=float, default=60.0)
     p.add_argument("--max-install-seconds", type=float, default=30.0,
                    help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
+    p.add_argument("--max-heartbeat-gap-ms", type=int, default=3000,
+                   help="C3 心跳证据：install 窗口内 leader 观测到的 victim 心跳 age 上限（默认 3s）")
     p.add_argument("--min-snapshot-bytes", type=int, default=100_000_000,
                    help="C4 规模下限：victim 实际落盘快照字节数，默认 100MB（153MB/12k 目标的下限保护）")
     p.add_argument("--chaos-during-snapshot", action="store_true",
@@ -1821,6 +1859,11 @@ def main():
             summary["victim_elections_during_catchup"] = snapshot_info.get("victim_elections")
             summary["victim_elections_since_restart"] = snapshot_info.get("victim_elections_since_restart")
             summary["victim_pre_votes_during_install"] = snapshot_info.get("snapshot_elections_pre_vote")
+            summary["victim_heartbeat_samples"] = snapshot_info.get("victim_heartbeat_samples")
+            summary["victim_heartbeat_max_ms"] = snapshot_info.get("victim_heartbeat_max_ms")
+            summary["victim_heartbeat_max_in_window_ms"] = snapshot_info.get(
+                "victim_heartbeat_max_in_window_ms")
+            summary["max_heartbeat_gap_ms_budget"] = args.max_heartbeat_gap_ms
             summary["snapshot_install_windows"] = snapshot_info.get("install_windows")
             summary["snapshot_transfer_seconds"] = snapshot_info.get("snapshot_transfer_seconds")
             summary["snapshot_apply_seconds"] = snapshot_info.get("snapshot_apply_seconds")

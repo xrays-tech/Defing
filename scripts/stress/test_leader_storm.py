@@ -36,6 +36,7 @@ def args(**kw):
         leader_kills=5,
         max_install_seconds=30.0,
         min_snapshot_bytes=100_000_000,
+        max_heartbeat_gap_ms=3000,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -191,27 +192,48 @@ class C4AssertionsTest(unittest.TestCase):
 
 
 class C3AssertionsTest(unittest.TestCase):
+    HEARTBEAT_OK = {"samples": 42, "max_in_window_ms": 240}
+
     def test_good_case_passes(self):
         errs = ls.c3_errors(args(), stats(leader_kills=5, leader_kill_targets_verified=5,
-                                         observed_leader_changes=5))
+                                         observed_leader_changes=5), self.HEARTBEAT_OK)
         self.assertEqual(errs, [])
 
+    def test_heartbeat_stalled_in_window_fails(self):
+        errs = ls.c3_errors(args(), stats(leader_kills=1, leader_kill_targets_verified=1,
+                                         observed_leader_changes=1),
+                            {"samples": 10, "max_in_window_ms": 20000})
+        self.assertTrue(any("心跳 age" in e for e in errs), errs)
+
+    def test_no_heartbeat_samples_fails(self):
+        errs = ls.c3_errors(args(), stats(leader_kills=1, leader_kill_targets_verified=1,
+                                         observed_leader_changes=1),
+                            {"samples": 0, "max_in_window_ms": None})
+        self.assertTrue(any("没有 last_heartbeat_ms_ago 采样" in e for e in errs), errs)
+
+    def test_heartbeat_samples_but_no_window_value_fails(self):
+        errs = ls.c3_errors(args(), stats(leader_kills=1, leader_kill_targets_verified=1,
+                                         observed_leader_changes=1),
+                            {"samples": 10, "max_in_window_ms": None})
+        self.assertTrue(any("没有任何心跳采样" in e for e in errs), errs)
+
     def test_no_kill_fails_when_requested(self):
-        errs = ls.c3_errors(args(), stats(leader_kill_target_not_leader=9))
+        errs = ls.c3_errors(args(), stats(leader_kill_target_not_leader=9), self.HEARTBEAT_OK)
         self.assertTrue(any("一次都没杀到" in e for e in errs), errs)
 
     def test_unverified_target_fails(self):
         errs = ls.c3_errors(args(), stats(leader_kills=5, leader_kill_targets_verified=3,
-                                         observed_leader_changes=5))
+                                         observed_leader_changes=5), self.HEARTBEAT_OK)
         self.assertTrue(any("确认目标是 leader" in e for e in errs), errs)
 
     def test_missing_leader_change_fails(self):
         errs = ls.c3_errors(args(), stats(leader_kills=5, leader_kill_targets_verified=5,
-                                         observed_leader_changes=1, leader_change_missing=4))
+                                         observed_leader_changes=1, leader_change_missing=4),
+                            self.HEARTBEAT_OK)
         self.assertTrue(any("leader 变化" in e for e in errs), errs)
 
     def test_zero_kills_when_not_requested_is_fine(self):
-        errs = ls.c3_errors(args(leader_kills=0), stats())
+        errs = ls.c3_errors(args(leader_kills=0), stats(), self.HEARTBEAT_OK)
         self.assertEqual(errs, [])
 
 

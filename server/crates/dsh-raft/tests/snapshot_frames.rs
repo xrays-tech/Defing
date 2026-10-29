@@ -283,3 +283,71 @@ async fn chunk_writer_streams_to_part_file() {
     assert_eq!(on_disk, expect, "streamed bytes equal concatenated chunks");
     let _ = std::fs::remove_file(part);
 }
+
+/// CRC32 已知答案（IEEE 802.3）："123456789" → 0xCBF43926。
+/// 这条锚定多项式常量本身——复核发现源码里写成 0xEDB68320（IEEE 应为 0xEDB88320），
+/// 旧实现自洽但无 KAT，与任何标准 CRC32 工具都不一致。
+#[test]
+fn crc32_known_answer_matches_ieee() {
+    let mut c = Crc32::init();
+    c.update(b"123456789");
+    assert_eq!(
+        c.finish(),
+        0xCBF4_3926,
+        "CRC32/IEEE 标准检查值（多项式 0xEDB88320）"
+    );
+}
+
+/// 帧编码必须是**命名（struct-map）**形式：positional 编码在 Option/skip_serializing_if
+/// 字段上会静默错位（compat §13.5 的 RPC 事故同源）。字节里能看到字段名即锚定该格式。
+#[test]
+fn frame_encoding_is_named_not_positional() {
+    let bytes = encode_frame(&Frame::Chunk {
+        seq: 7,
+        data: vec![1, 2, 3],
+    })
+    .expect("encode");
+    let body = &bytes[4..];
+    assert!(
+        body.windows(5).any(|w| w == b"Chunk"),
+        "variant 名必须以 map key 出现（named 编码）"
+    );
+    assert!(
+        body.windows(3).any(|w| w == b"seq"),
+        "字段名 seq 必须出现（positional 编码不会有字段名）"
+    );
+    // 往返仍然可用
+    let f = decode_frame(body).expect("decode");
+    match f {
+        Frame::Chunk { seq, data } => {
+            assert_eq!(seq, 7);
+            assert_eq!(data, vec![1, 2, 3]);
+        }
+        other => panic!("unexpected frame: {other:?}"),
+    }
+}
+
+/// 最大 chunk 的信封必须仍在上限内（复核：旧上限 1MiB+64 只剩 ~42B 余量）。
+#[test]
+fn max_chunk_frame_fits_limit() {
+    let bytes = encode_frame(&Frame::Chunk {
+        seq: 1,
+        data: vec![0u8; MAX_CHUNK_BYTES],
+    })
+    .expect("encode max chunk");
+    assert!(
+        bytes.len() - 4 <= MAX_FRAME_BYTES,
+        "max chunk frame body {} > MAX_FRAME_BYTES {}",
+        bytes.len() - 4,
+        MAX_FRAME_BYTES
+    );
+    let mut dec = FrameDecoder::init();
+    dec.feed(&bytes);
+    match dec.next_frame().expect("decoder accepts max chunk frame") {
+        Some(Frame::Chunk { seq, data }) => {
+            assert_eq!(seq, 1);
+            assert_eq!(data.len(), MAX_CHUNK_BYTES);
+        }
+        other => panic!("unexpected frame: {other:?}"),
+    }
+}

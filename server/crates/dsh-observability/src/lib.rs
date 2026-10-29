@@ -8,6 +8,7 @@ use dsh_core::command::Command;
 use dsh_core::model::PublishEvent;
 use dsh_core::StateMachine;
 use dsh_raft::openraft::rt::WatchReceiver;
+use dsh_raft::openraft::Instant as _; // TokioInstant::elapsed()（心跳 age）
 use dsh_raft::RaftHandle;
 
 /// 进程内 HTTP 计数（G5/D32：API middleware 自增；节点本地视图，非状态机数据）。
@@ -294,6 +295,10 @@ pub fn cluster_members_json(raft: Option<&RaftHandle>, node_id: Option<u64>) -> 
     let voter_ids: Vec<u64> = m.membership_config.membership().voter_ids().collect();
     // openraft: Metrics.replication 为 Some() 只在 leader，BTreeMap<NodeId, Option<LogId>>
     let replication = m.replication;
+    // 心跳证据（plan §9.3）：leader 视角「该节点最近一次确认心跳/复制的时间」。
+    // 0.10 的独立 heartbeat worker 要证明的就是「快照 install 期间心跳不停」——若被抑制，
+    // 这个 age 会涨到整个 install 时长。仅 leader 有值，其余 null。
+    let heartbeat = m.heartbeat.clone();
     let last_log_index = m.last_log_index;
     let members: Vec<serde_json::Value> = m
         .membership_config
@@ -312,6 +317,10 @@ pub fn cluster_members_json(raft: Option<&RaftHandle>, node_id: Option<u64>) -> 
                 "is_voter": voter_ids.contains(id),
                 "last_applied": matched_index,
                 "lag": replication_lag(matched_index, last_log_index),
+                "last_heartbeat_ms_ago": heartbeat
+                    .as_ref()
+                    .and_then(|hb| hb.get(id).and_then(|t| t.as_ref()))
+                    .map(|t| t.elapsed().as_millis() as u64),
             })
         })
         .collect();

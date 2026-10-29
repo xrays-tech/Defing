@@ -45,6 +45,15 @@ pub fn dev_config() -> RaftConfig {
         enable_tick: true,
         install_snapshot_timeout: 30_000,
         snapshot_max_chunk_size: 1024 * 1024,
+        // P3f（design §9.4「默认提升并可配置」）：快照已覆盖、但仍保留不 purge 的日志条数。
+        // 值越大，略落后的 follower 越可能靠增量日志追上而不必整份快照（issue #1706）；
+        // 代价是磁盘：60KB/entry 时 50k ≈ 3GB/节点。生产默认值留 P5 按写入速率压测确定，
+        // 这里默认沿用 openraft 的 1000，用 env 覆盖即可压测不同档位：
+        //   DSH_RAFT_MAX_IN_SNAPSHOT_LOG_TO_KEEP=50000
+        max_in_snapshot_log_to_keep: std::env::var("DSH_RAFT_MAX_IN_SNAPSHOT_LOG_TO_KEEP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or_else(|| Config::default().max_in_snapshot_log_to_keep),
         ..Default::default()
     }
 }

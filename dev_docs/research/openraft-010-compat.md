@@ -396,3 +396,37 @@ Gate in worktree `/tmp/opencode/defing-openraft-010/server` (`CARGO_TARGET_DIR=/
   map-structs natively; snapshot frame codec (no Option-bearing structs) unchanged.
   Wire grows by field names only; C1 6 MiB cap unaffected.
 - Verified: fresh-copy C2 boot shows 0 decode failures + full replication (13.4).
+
+## 13.6 P3 install 路径实测与整改（P3c/P3d/P3e/P3f）
+
+> 复核要求：数字必须可溯源（方法、数据集、构建、命令、rev、二进制 sha）。
+
+**方法**：`scripts/stress-leader-storm.sh --bin <release> --profile storm --snapshot-writes N
+--chaos-during-snapshot --catchup-timeout 120 --max-install-seconds 30 --min-snapshot-bytes 100000000
+--keep`，5 节点、数据目录在 btrfs（`TMPDIR` 指到项目内 `.tmp/tmp`），release 构建；
+harness 在 summary 里记录 `git_rev` / `bin_sha256` / `TMPDIR` / `argv`（见 `p3d-storm4.log`）。
+install 窗口 = `full-snapshot transfer start` → `install full snapshot` → `Done install complete snapshot`
+（端到端 = transfer + install + apply）。
+
+**根因与整改**（两处，均在 P2a 遗留的 compile-bridge 形态上）：
+
+| # | 问题 | 整改 | 效果 |
+|---|---|---|---|
+| 1 | `dsh-core::restore_all` 逐 key `delete`/`put`，每个 key 一个 redb 事务（400MB 快照 ≈ 4 万次 fsync） | 走既有 `Store::write_batch`（单事务 + 一次 fsync），按 64MiB 分块 | **install 84.1s → 1.5s 量级**（主因） |
+| 2 | `install_snapshot` 整份 `fs::read` + `from_slice`（两份全量驻留）并把 payload 再整份写一遍 | `serde_json::from_reader` 流式解析；文件级 `fs::copy`（不 rename 采纳，避免删掉 registry 自身 payload） | 峰值 RSS **2.05x → 1.3x**；`snapshots/` 只留 1 份 canonical 文件 |
+
+**实测**（release + btrfs）：
+
+| 轮次 | 快照 | install 端到端 | catch-up | victim 峰值 RSS | 备注 |
+|---|---|---|---|---|---|
+| 整改前（`56a3a6e`，A/B control，4k 写） | 197.6MB | 25.87s | 42.9s | 461MB (2.3x) | 同盘同构建对照 |
+| 整改后（4k 写，同参数） | 174.2MB | **0.657s** | 20.0s | 263MB (1.5x) | 50x 级差异，排除数据/机器因素 |
+| 整改后（6k 写，`p3d-storm4`） | 269.5MB | **1.779s**（transfer 0.747 + apply 1.031） | 10.2s | 368MB (1.37x) | C3/C4 断言全开 |
+
+**C3/C4 证据口径**（harness 现在会断言，不再只报告）：
+- C3：每次 leader kill 都先确认目标**自认 leader**（`members[].is_leader`），击杀后、重启前观测
+  是否真的换人（`p3d-storm4`：5/5 验证、5/5 换人）；install 窗口内 leader 视角 victim 心跳 age
+  最大 119–399ms（`last_heartbeat_ms_ago`，预算 3s）——0.10 独立 heartbeat worker 在快照期间不停。
+- C4：`install_windows>=1`、端到端 <= `--max-install-seconds`、`snapshot_bytes >= --min-snapshot-bytes`、
+  victim 必须 `is_voter`；churn 在 victim 的 **transfer 窗口一开**时注入；窗口内 victim
+  选举/预投票必须为 0（计入 `trigger pre-vote`）。

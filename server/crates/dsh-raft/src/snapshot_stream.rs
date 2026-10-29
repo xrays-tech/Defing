@@ -22,7 +22,9 @@
 //! 65550B ~= payload+14), so chunk payloads travel as msgpack BIN blobs.
 
 pub const MAX_CHUNK_BYTES: usize = 1024 * 1024; // option.snapshot_chunk_size() clamp
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024 + 64; // frame ceiling (Chunk envelope slack)
+                                                // 帧上限 = 最大 chunk + 4KiB 信封余量（map/str/seq/bin32 头 ~22B；留足后即使
+                                                // 未来给 Chunk 加字段也不会把合法 1MiB chunk 判成 4xx）
+pub const MAX_FRAME_BYTES: usize = MAX_CHUNK_BYTES + 4096;
 pub const MAX_SNAPSHOT_BYTES: usize = 640 * 1024 * 1024; // total ceiling (pairs route body limit)
 pub const READ_BUF_BYTES: usize = 64 * 1024; // client pump read buffer
 
@@ -53,6 +55,7 @@ pub enum Frame {
 
 /// Protocol-level framing failure (oversize frame / msgpack decode / ordering) ->
 /// server 4xx, client maps to StreamingError::Network.
+#[derive(Debug)]
 pub struct SnapshotProtoError {
     pub msg: String,
 }
@@ -64,8 +67,12 @@ fn proto_err(msg: String) -> SnapshotProtoError {
 /// Encode one frame: BIN-forced msgpack body + BE u32 length prefix.
 pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, SnapshotProtoError> {
     let mut wr: Vec<u8> = Vec::new();
-    let mut ser =
-        rmp_serde::Serializer::new(&mut wr).with_bytes(rmp_serde::config::BytesMode::ForceAll);
+    // P3f：命名（struct-map）编码。RPC 路径此前踩过 positional 编码在
+    // `skip_serializing_if`/Option 字段上错位的坑（compat §13.5）；帧这边统一用 named，
+    // 两端同 crate 编译，wire 变更无兼容负担，但杜绝同一类错位回归。
+    let mut ser = rmp_serde::Serializer::new(&mut wr)
+        .with_bytes(rmp_serde::config::BytesMode::ForceAll)
+        .with_struct_map();
     let done = match frame.serialize(&mut ser) {
         Ok(()) => Ok(()),
         Err(e) => Err(proto_err(format!("msgpack encode: {e}"))),
@@ -91,7 +98,7 @@ pub fn decode_frame(body: &[u8]) -> Result<Frame, SnapshotProtoError> {
     }
 }
 
-/// IEEE CRC32 (reflected poly 0xEDB68320) over chunk payload bytes; per-instance
+/// IEEE CRC32 (reflected poly 0xEDB88320) over chunk payload bytes; per-instance
 /// 256-entry table. End frame carries finish() - client and server compute
 /// independently and must agree.
 pub struct Crc32 {
@@ -107,7 +114,7 @@ impl Crc32 {
             let mut r = i as u32;
             for _ in 0..8 {
                 r = if (r & 1) != 0 {
-                    (r >> 1) ^ 0xEDB68320
+                    (r >> 1) ^ 0xEDB88320
                 } else {
                     r >> 1
                 };

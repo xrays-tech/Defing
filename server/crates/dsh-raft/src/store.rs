@@ -141,6 +141,7 @@ pub fn sweep_snapshot_payloads(db: &DbHandle, dir: PathBuf) -> Result<(u64, u64)
         Some(raw) => de(&raw)?,
         None => PathBuf::new(),
     };
+    let keep_canon = fs::canonicalize(&keep).ok();
     let mut parts: u64 = 0;
     let mut orphans: u64 = 0;
     let listing = fs::read_dir(&dir).map_err(io_read)?;
@@ -157,7 +158,14 @@ pub fn sweep_snapshot_payloads(db: &DbHandle, dir: PathBuf) -> Result<(u64, u64)
                         Err(e) => tracing::warn!("sweep remove {}: {e}", name),
                     }
                 } else if name.ends_with(".snap") {
-                    if name == keep.display().to_string() {
+                    // P3f：按 canonicalize 后比较，而不是 display() 字符串。`--data-dir data`
+                    // 与 `./data` / 绝对路径只是拼写不同，字符串比较会把 registry 正在使用的
+                    // payload 判成 orphan 删掉（重启后没有快照）。
+                    let is_keep = match (&keep_canon, fs::canonicalize(&path).ok()) {
+                        (Some(k), Some(p)) => *k == p,
+                        _ => path == keep,
+                    };
+                    if is_keep {
                         continue;
                     }
                     match fs::remove_file(&path) {
@@ -466,12 +474,24 @@ fn read_entries(db: &DbHandle, start: u64, end: u64) -> Result<Vec<EntryOf>, Err
     let txn = db.begin_read().map_err(io_read)?;
     let table = txn.open_table(TBL_RAFT_LOG).map_err(io_read)?;
     let start_key = log_key(start);
-    let mut out = Vec::new();
+    let mut out: Vec<EntryOf> = Vec::new();
+    let mut expected: Option<u64> = None;
     for row in table.range(start_key.as_slice()..).map_err(io_read)? {
         let (k, v) = row.map_err(io_read)?;
-        if log_index_from_key(k.value()) > end {
+        let idx = log_index_from_key(k.value());
+        if idx > end {
             break;
         }
+        // P3f：openraft 契约要求中间空洞报错（只有 purge 造成的前缀缺失可容忍）。
+        // 旧实现静默跳过空洞，leader 会以为拿到的是从 start 起的连续前缀。
+        if let Some(exp) = expected {
+            if idx != exp {
+                return Err(io_read(format!(
+                    "log store hole: expected index {exp}, found {idx}"
+                )));
+            }
+        }
+        expected = Some(idx + 1);
         out.push(de(v.value())?);
     }
     Ok(out)
@@ -491,13 +511,24 @@ fn read_entries_limited(
     let txn = db.begin_read().map_err(io_read)?;
     let table = txn.open_table(TBL_RAFT_LOG).map_err(io_read)?;
     let start_key = log_key(start);
-    let mut out = Vec::new();
+    let mut out: Vec<EntryOf> = Vec::new();
     let mut acc = 0u64;
+    let mut expected: Option<u64> = None;
     for row in table.range(start_key.as_slice()..).map_err(io_read)? {
         let (k, v) = row.map_err(io_read)?;
-        if log_index_from_key(k.value()) > end {
+        let idx = log_index_from_key(k.value());
+        if idx > end {
             break;
         }
+        // P3f：中间空洞必须报错（短读只能由 cap 触发，不能是缺失）。
+        if let Some(exp) = expected {
+            if idx != exp {
+                return Err(io_read(format!(
+                    "log store hole: expected index {exp}, found {idx}"
+                )));
+            }
+        }
+        expected = Some(idx + 1);
         let size = v.value().len() as u64;
         if !out.is_empty() && acc + size > cap {
             break;
@@ -1826,6 +1857,77 @@ mod tests {
             "旧 canonical 文件应被清理，只留 registry 那一份"
         );
         assert_eq!(snap_part_count(&dir), 0, "不得残留 .part");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3f 回归：registry 正在使用的 payload 不能被启动清扫删掉。
+    /// 复核场景：`--data-dir data` / `./data` / 绝对路径 拼写不同 → 旧实现用 display()
+    /// 字符串比较，把同一文件判成 orphan；这里用带 `.` 的非规范拼写扫同一目录。
+    #[tokio::test]
+    async fn sweep_keeps_registry_payload_under_noncanonical_dir_spelling() {
+        let dir = tmpdir("sweep-canon");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
+
+        let meta = snap_meta(9);
+        let data = serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap();
+        // 输入放 staging：snapshots 目录里只留 registry 的 canonical 文件，
+        // 否则「输入 payload 是 orphan」会混进本测试的断言。
+        let staging = dir.join("incoming");
+        std::fs::create_dir_all(&staging).unwrap();
+        let payload = staging.join("payload.json");
+        std::fs::write(&payload, &data).unwrap();
+        store.install_snapshot(&meta, payload).await.unwrap();
+        let snap = store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot");
+
+        // 非规范拼写扫同一目录（read_dir 出来的路径带 "./"）
+        let (parts, orphans) =
+            sweep_snapshot_payloads(&storage.raw_db(), dir.join("snapshots/.")).unwrap();
+        assert_eq!(
+            (parts, orphans),
+            (0, 0),
+            "registry 正在用的 payload 不能被当成 orphan 删掉"
+        );
+        assert!(
+            std::fs::exists(&snap.snapshot).unwrap(),
+            "registry 指向的 payload 必须仍然存在"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3f 回归：日志中间空洞必须报错（openraft 契约），不能静默跳过。
+    #[tokio::test]
+    async fn read_entries_rejects_interior_hole() {
+        let dir = tmpdir("log-hole");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let mut store = LogStore::new(db.clone());
+        store
+            .blocking_append([blank(1), blank(2), blank(3)])
+            .await
+            .unwrap();
+        // 人为删掉中间 index=2 的日志行（模拟存储损坏/外部篡改）
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(TBL_RAFT_LOG).unwrap();
+                t.remove(log_key(2).as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let got = store.try_get_log_entries(1..=3).await;
+        assert!(
+            got.is_err(),
+            "中间空洞必须报错，实际返回 {:?}",
+            got.map(|v| v.len())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

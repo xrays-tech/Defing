@@ -962,7 +962,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 对应实际运行配置。cluster_name 打印 openraft Config 默认（dev_config 未覆盖 → "foo"）。
     let raft_cfg = dsh_raft::dev_config();
     tracing::info!(
-        "raft config: heartbeat_interval={} election_timeout_min={} election_timeout_max={} max_payload_entries={} enable_pre_vote={} enable_tick={} install_snapshot_timeout={} snapshot_max_chunk_size={} cluster_name={}",
+        "raft config: heartbeat_interval={} election_timeout_min={} election_timeout_max={} max_payload_entries={} enable_pre_vote={} enable_tick={} install_snapshot_timeout={} snapshot_max_chunk_size={} max_in_snapshot_log_to_keep={} cluster_name={}",
         raft_cfg.heartbeat_interval,
         raft_cfg.election_timeout_min,
         raft_cfg.election_timeout_max,
@@ -971,6 +971,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         raft_cfg.enable_tick,
         raft_cfg.install_snapshot_timeout,
         raft_cfg.snapshot_max_chunk_size,
+        raft_cfg.max_in_snapshot_log_to_keep,
         raft_cfg.cluster_name,
     );
     let raft = dsh_raft::new_raft_node(
