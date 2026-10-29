@@ -1971,16 +1971,9 @@ def _wait_settled(nodes, timeout=90.0):
                 md = members(live[0].http_base())
                 if md:
                     voters = [m for m in md.get("members", []) if m.get("is_voter")]
-                    lag_ok = all(
-                        (m.get("lag") is None) or (isinstance(m.get("lag"), int) and m.get("lag") == 0)
-                        for m in voters
-                        if str(m.get("node_id")) == str(lid)
-                    ) and all(
-                        isinstance(m.get("lag"), int) and m.get("lag") == 0
-                        for m in voters
-                        if str(m.get("node_id")) != str(lid)
-                    )
-                    if voters and lag_ok:
+                    # lag=None 表示该 follower 尚未被 leader 追踪（启动初期/日志追平中），
+                    # 这里只做「集群可用」判定；**安装证据**由 _catch_up_victim 单独断言。
+                    if voters and all(m.get("lag") in (0, None) for m in voters):
                         return True
         time.sleep(0.4)
     return False
