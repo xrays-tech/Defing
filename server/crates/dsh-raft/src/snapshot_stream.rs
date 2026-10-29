@@ -25,7 +25,10 @@ pub const MAX_CHUNK_BYTES: usize = 1024 * 1024; // option.snapshot_chunk_size() 
                                                 // 帧上限 = 最大 chunk + 4KiB 信封余量（map/str/seq/bin32 头 ~22B；留足后即使
                                                 // 未来给 Chunk 加字段也不会把合法 1MiB chunk 判成 4xx）
 pub const MAX_FRAME_BYTES: usize = MAX_CHUNK_BYTES + 4096;
-pub const MAX_SNAPSHOT_BYTES: usize = 640 * 1024 * 1024; // total ceiling (pairs route body limit)
+// 单快照总上限。原 640MiB 是按「v1 JSON ≈ 4x 逻辑状态」估的，但 extreme 规模实测 v1 payload
+// 可达 ~824MB（逻辑 ~200MB）→ 超限后接收端在 640MB 处中断、发送端无限重试（lag 卡死）。
+// 提高到 2GiB 覆盖 v1 大快照；内存仍有界（流式 + MAX_FRAME_BYTES/run-time check 保护）。
+pub const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024 * 1024; // total ceiling (v2 生产路径远小于此)
 pub const READ_BUF_BYTES: usize = 64 * 1024; // client pump read buffer
 
 use std::io;

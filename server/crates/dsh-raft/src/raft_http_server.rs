@@ -95,7 +95,7 @@ fn authed(
 /// 覆盖 <=64MiB raw dev state 预算,详见 dev_docs/research/openraft-010-compat.md）。
 /// P2b2 streaming:the three msgpack RPC routes keep a fixed 32MiB cap(payloads tiny);
 /// /raft/full-snapshot runs with DefaultBodyLimit::disable() — its streaming frame
-/// body legitimately reaches MAX_SNAPSHOT_BYTES(640MiB),server memory is bounded by
+/// body legitimately reaches MAX_SNAPSHOT_BYTES(2GiB),server memory is bounded by
 /// the protocol guards instead:MAX_FRAME_BYTES per frame(FrameDecoder)+ check_total
 /// per chunk(payload accumulation). /raft/* 端点已 token 鉴权(RaftServerState.token),
 /// 因此放宽上限无匿名 DoS 面。
