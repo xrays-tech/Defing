@@ -369,10 +369,18 @@ msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / 
   不会带着「部分新 + 部分旧」的混合状态起来；
 - `DSH_RAFT_RESTORE_MARKER=0` **只关闭写标记**（发布期兜底；崩溃窗口重新变大，WARN 日志会说明
   「崩溃不可重放」），已有的标记**仍会被重放**。
-- `DSH_RAFT_RESTORE_FORCE=1` 才是「忽略标记、允许混合状态启动」的逃生门：节点会**以 poison 启动**
-  （读写 503，直到一次完整快照安装成功），ERROR 日志 + 需人工确认数据一致性后使用。
-  该 fail-stop 是**持久化**的（raft-meta 的 `restore_poison` 键）：重启后仍是 503；FORCE 会
-  **保留** restore 标记——下次不带 FORCE 启动时走正常重放（安全路径）并自动解除 poison。
+- `DSH_RAFT_RESTORE_FORCE=1` 才是「忽略标记、允许混合状态启动」的逃生门。实际保证（经 Raft 启动
+  路径测试固定）：
+  - 节点**没有 purge 过的日志、且没有未应用的 committed 条目** → 能以 poison 启动，HTTP 503、
+    `/healthz` 200、`/readyz` 503；ERROR 日志 + 需人工确认数据一致性后使用。
+  - 节点**已有 purge 过的日志**（快照追平后的正常状态）或 `last_applied < committed` → openraft
+    启动期会强制重建快照/重放日志，而 poisoned 状态拒绝这两件事 → **启动失败（fail-fast）**，
+    这是有意的安全行为（混合状态不能拿来构建快照或继续 apply）。此时只能**清卷重建/从备份恢复**，
+    不要再指望 FORCE 把节点拉起来。
+  - 该 fail-stop 是**持久化**的（raft-meta 的 `restore_poison` 键）：重启后仍是 503；FORCE 会
+    **保留** restore 标记——下次不带 FORCE 启动时走正常重放（安全路径）并自动解除 poison。
+  - 已 poison 启动的节点若 leader 先给它发的是普通日志（而不是快照），openraft 会把 apply 的
+    Err 当 fatal，节点会退出；即「等 leader 重发快照自愈」只在 leader 的下一条消息是快照时成立。
 
 **恢复失败后的 fail-stop（poison）**：非崩溃型 restore 错误（如磁盘 IO）会让节点进入 fail-stop：
 

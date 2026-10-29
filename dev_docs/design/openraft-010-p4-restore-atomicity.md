@@ -180,8 +180,11 @@
    据此恢复 poison；一次成功 install 或成功 boot 重放清除它。FORCE **保留** marker（不带 FORCE
    的下次启动走正常重放），因此 fail-stop 跨重启有效。
 3. **poisoned 时 `get_current_snapshot` 返回 `Ok(None)`**：openraft `Raft::new` 启动期会调用它，
-   返回 Err 会让进程直接退出（FORCE 反而起不来）；返回 None 让节点能启动并保持 503，
-   直到 leader 重发快照。
+   返回 Err 会让进程直接退出；返回 None 让「无需快照重建/重放」的节点能启动并保持 503。
+   **边界（已用 Raft 启动测试固定）**：若节点有 purge 过的日志或 `last_applied < committed`，
+   openraft 启动期会强制重建快照/重放日志——poisoned 的 `build_snapshot`/`apply` 拒绝 → `Raft::new`
+   Err（fail-fast，有意为之：混合状态不能构建快照/继续 apply）。此类节点只能清卷/备份恢复。
+   poison/marker 的清除放在**同一个 redb 事务**里（避免「poison 在、marker 不在」的永久 503 窗口）。
 4. **v1 写端锁范围**：dump 在锁内（与 meta 同一视图），JSON 序列化 + 写盘在锁外。
 5. **新增测试**：marker 清理失败 → poison+Err → 重试恢复；过期 marker 只清不重放；
    FORCE poison 跨重启 + 不带 FORCE 重放解除；gRPC watch poison；初始快照 last_applied 删除。

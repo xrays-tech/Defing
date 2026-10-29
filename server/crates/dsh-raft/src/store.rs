@@ -1074,6 +1074,19 @@ fn meta_del(db: &DbHandle, key: &[u8]) -> Result<(), ErrOf> {
     txn.commit().map_err(io_write)
 }
 
+/// 删除多个 raft-meta 键（**单事务**）。`restore_poison` 与 `restore_begin` 必须一起清：
+/// 两次独立事务之间崩溃会留下「poison 在、marker 不在」→ 重启后永久 503 且没有重放路径。
+fn meta_del_many(db: &DbHandle, keys: &[&[u8]]) -> Result<(), ErrOf> {
+    let txn = db.begin_write().map_err(io_write)?;
+    {
+        let mut table = txn.open_table(TBL_RAFT_META).map_err(io_write)?;
+        for k in keys {
+            table.remove(*k).map_err(io_write)?;
+        }
+    }
+    txn.commit().map_err(io_write)
+}
+
 fn meta_put(db: &DbHandle, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
     let txn = db.begin_write().map_err(io_write)?;
     let mut table = txn.open_table(TBL_RAFT_META).map_err(io_write)?;
@@ -2066,19 +2079,14 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // 快照点——与已 purge 的日志冲突（openraft 拒绝启动）或对已应用条目重复 apply。
         // 这里 fail-stop 并返回 Err：openraft 会重试安装，下一次成功安装会重写 marker 并在尾部
         // 清理，poison 也随之解除。
-        // 先清 durable poison，再清 marker：两步都失败即 fail-stop（marker 仍在 → boot 重放）。
-        // 顺序很重要：若先删 marker、再删 poison 失败，重启后会「无 marker 但 poison」→ 只能等
-        // leader 重发快照（可用性下降）；反过来失败时 marker 仍在，重放即可恢复。
-        if let Err(e) = meta_del(&self.db, META_POISON) {
-            self.poison(format!("clear durable poison flag failed: {e}"));
-            return Err(io_write(format!("clear durable poison flag: {e}")));
-        }
+        // **单事务**同时清 `restore_poison` 与 `restore_begin`（复核 NB2）：两次独立事务之间
+        // 崩溃会留下「poison 在、marker 不在」→ 重启后永久 503 且无重放路径。
         let cleared = if self.fail_clear_marker.load(Ordering::Relaxed) {
             self.fail_clear_marker.store(false, Ordering::Relaxed);
             Err(io_write("injected restore-marker clear failure"))
         } else {
-            meta_del(&self.db, META_RESTORE_BEGIN)
-                .map_err(|e| io_write(format!("clear restore marker: {e}")))
+            meta_del_many(&self.db, &[META_POISON, META_RESTORE_BEGIN])
+                .map_err(|e| io_write(format!("clear restore marker/poison: {e}")))
         };
         if let Err(e) = cleared {
             // 不能只 warn（复核 blocker）：残留 marker + 继续 apply，会在下次崩溃时把
@@ -2249,10 +2257,8 @@ pub fn recover_interrupted_restore_with(
     if old.as_deref() != Some(marker.payload.as_path()) {
         delete_old_snapshot_file(old);
     }
-    // 先清 durable poison 再清 marker（理由同 install）：任何一步失败都 Err 并保留 marker，
-    // 下次 boot 重放仍是安全路径。
-    meta_del(db, META_POISON)?;
-    meta_del(db, META_RESTORE_BEGIN)?;
+    // 单事务同时清 poison 与 marker（与 install 相同的崩溃语义）。
+    meta_del_many(db, &[META_POISON, META_RESTORE_BEGIN])?;
     store.poisoned.store(false, Ordering::SeqCst);
     tracing::warn!(
         "restore replayed on boot: last_log_id={:?} payload={} (streamed) elapsed={:?}",
@@ -2308,7 +2314,7 @@ mod tests {
         }
     }
 
-    fn truncate_at(index: u64) -> LogIdOf {
+    pub(super) fn truncate_at(index: u64) -> LogIdOf {
         LogId {
             leader_id: LeaderId {
                 term: 1,
@@ -3582,8 +3588,8 @@ mod p4a_tests {
             store2.get_current_snapshot().await.unwrap().is_none(),
             "poisoned 时 get_current_snapshot 必须返回 Ok(None)（Raft::new 才能启动）"
         );
-        // 不带 FORCE 的正常重放 → 状态一致 + 解除 poison
-        let out2 = recover_interrupted_restore(&store2).unwrap();
+        // 不带 FORCE 的正常重放 → 状态一致 + 解除 poison（用 _with(false)，不受环境变量影响）
+        let out2 = recover_interrupted_restore_with(&store2, false).unwrap();
         assert!(out2.is_some(), "不带 FORCE 时应重放 marker");
         assert!(!store2.is_poisoned());
         assert_eq!(
@@ -4631,6 +4637,90 @@ mod p4a_initial_snapshot_tests {
         );
         assert_eq!(sm.read().unwrap().dump_all().unwrap(), pairs);
         assert!(meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod p4a_force_boot_tests {
+    use super::tests::{blank, open_storage, tmpdir, truncate_at};
+    use super::*;
+    use openraft::storage::RaftLogStorageExt;
+
+    fn node_info() -> crate::NodeInfo {
+        crate::NodeInfo {
+            grpc_addr: "127.0.0.1:0".into(),
+            http_addr: "http://127.0.0.1:0".into(),
+            raft_addr: "127.0.0.1:0".into(),
+        }
+    }
+
+    /// attempt-3 复核 NB1(a)：poisoned store（无 purge、无未应用日志）——`Raft::new` **可以启动**
+    /// （`get_current_snapshot → None`，无强制重建/重放），节点保持 503 直到一次完整 install。
+    #[tokio::test]
+    async fn poisoned_store_without_purged_logs_can_boot_raft() {
+        let dir = tmpdir("p4a-poison-boot-ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
+        let sm_store = Arc::new(StateMachineStore::new(sm, db.clone(), dir.clone()));
+        sm_store.poison("test: mixed state");
+        assert!(sm_store.is_poisoned());
+
+        let net = crate::NetworkFactory::new();
+        let raft = crate::new_raft_node(
+            1,
+            node_info(),
+            LogStore::new(db),
+            sm_store.clone(),
+            &net,
+            crate::dev_config(),
+        )
+        .await
+        .expect("poisoned 但无需快照重建/重放的节点必须能启动（API 侧保持 503）");
+        assert!(sm_store.is_poisoned(), "启动不得解除 fail-stop");
+        let _ = raft.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// attempt-3 复核 NB1(b)：poisoned + **日志已 purge**（快照追平后的正常状态）——openraft 启动期
+    /// 强制重建快照，而 poisoned 的 `build_snapshot` 拒绝 → `Raft::new` Err（fail-fast）。
+    /// 这是**有意**的安全行为：混合状态不能被拿去构建快照/服务；运维清卷或从备份恢复。
+    /// 文档（部署手册/设计 §8.1）必须按此收窄，不能承诺「FORCE 一律能启动」。
+    #[tokio::test]
+    async fn poisoned_store_with_purged_logs_fails_fast_on_raft_boot() {
+        let dir = tmpdir("p4a-poison-boot-purged");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let storage = open_storage(&dir);
+            let db = storage.raw_db();
+            let mut log = LogStore::new(db.clone());
+            log.blocking_append([blank(1), blank(2), blank(3)])
+                .await
+                .unwrap();
+            meta_put(&db, META_LAST_APPLIED, &ser(&truncate_at(3)).unwrap()).unwrap();
+            log.purge(truncate_at(3)).await.unwrap();
+        }
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
+        let sm_store = Arc::new(StateMachineStore::new(sm, db.clone(), dir.clone()));
+        sm_store.poison("test: mixed state with purged logs");
+        let net = crate::NetworkFactory::new();
+        let r = crate::new_raft_node(
+            1,
+            node_info(),
+            LogStore::new(db),
+            sm_store,
+            &net,
+            crate::dev_config(),
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "poisoned + purged 日志必须 fail-fast（不能拿混合状态重建快照）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
