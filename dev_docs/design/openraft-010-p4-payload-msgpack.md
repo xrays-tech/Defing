@@ -200,3 +200,17 @@ v1 的 `snapshot_bytes` 被 JSON 数字数组放大了 ~4x，而 delta 主要由
 
 **建议 P4 gate 采纳的口径**：RSS 以「净增量 / **逻辑状态字节**」为准（逻辑状态可用 victim 落盘
 redb 尺寸或 msgpack payload 近似），不再用 v1-JSON payload 当分母；或直接改用绝对增量 + 探针曲线。
+
+### 12.1 C4 RSS 口径修正与最终 gate 跑（03c3fb2）
+
+- **口径**：`net = delta / snapshot_bytes` 跨格式不可比（见 §12）。harness 改为
+  `rss_delta_vs_state = delta / victim 逻辑状态（{data_dir}/dsh.redb）`，缺基准判失败；
+  `rss_delta_vs_payload` 只入 summary 对照（带 `rss_ratio_note`）。harness 单测 26 项
+  （缺 state 失败 / payload 变化不影响判定 / 超预算失败）。
+- **最终 v2 12k gate**（`evidence/p4-gate-msgpack-12k-final.log`，rev 03c3fb2、干净树、bin>src）：
+  `ok:true`、exit=0；快照 **93.6MB**、install **0.758s**（attempts=1）、catch-up 5.26s、
+  victim state 314.6MB、delta 180.3MB → **rss_delta_vs_state 0.57**（payload 比值 1.93 仅对照）；
+  5/5 kill 验证 + 5/5 换人、8 项目逐项相等、0 无法解释选举、churn 落在 episode、心跳 100ms。
+- 与 v1 A/B（同命令）：payload 386.0MB→93.6MB（**0.25x**）、install 3.67s→0.758s、
+  delta 255.3MB→180.3MB（**−30%**）；350MB 尺度探针 net **0.44x**。
+- 结论：§6 的 volume / install / RSS 三项在「逻辑状态」口径下全部达标；P4 实现侧证据齐。
