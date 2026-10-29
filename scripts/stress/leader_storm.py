@@ -2144,10 +2144,12 @@ def main():
                 if _db:
                     summary["rss_delta_vs_db_file"] = round(_delta / float(_db), 2)
                 _pmb = (float(_sb) / (1024.0 * 1024.0)) if _sb else 0.0
+                _auto = 192.0 + _pmb
                 summary["rss_delta_budget_mb"] = round(
-                    min(float(args.max_rss_delta_mb), 192.0 + _pmb), 1)
+                    _auto if float(args.max_rss_delta_mb) <= 0
+                    else min(float(args.max_rss_delta_mb), _auto), 1)
                 summary["rss_ratio_note"] = (
-                    "断言=绝对净增量（预算 = min(--max-rss-delta-mb, 192MiB + payload)）；"
+                    "断言=绝对净增量（预算 = 192MiB + payload；--max-rss-delta-mb>0 只能收紧）；"
                     "payload/db_file 比值仅供对照——v1 JSON payload 是 Vec<u8> 的十进制数字数组（≈4x），"
                     "dsh.redb 含 raft 表/free page；窗口 RSS 采样 0.4s + VmHWM")
             summary["victim_heartbeat_samples"] = snapshot_info.get("victim_heartbeat_samples")
