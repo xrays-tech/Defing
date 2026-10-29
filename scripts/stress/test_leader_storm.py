@@ -42,7 +42,7 @@ def args(**kw):
         leader_kills=5,
         max_install_seconds=30.0,
         min_snapshot_bytes=100_000_000,
-        max_rss_delta_mb=320.0,
+        max_rss_delta_mb=0.0,  # P5：0=auto（192MiB+payload）；测试里按需收紧
         chaos_during_snapshot=True,
     )
     base.update(kw)
@@ -233,30 +233,46 @@ class C4AssertionsTest(unittest.TestCase):
         self.assertTrue(any("redb 尺寸" in e for e in ls.c4_errors(args(), info, True)))
 
     def test_rss_budget_scales_with_payload(self):
-        """预算 = min(320MiB, 192 + payload)：
-        - payload 386MB（v1）→ 预算 320MiB；delta 350MiB 超预算 → 失败
+        """预算 = 192MiB + payload（随规模放大；flag 只能收紧）：
+        - payload 386MB（v1）→ 预算 ~560MiB；delta 350MiB → 通过（大 payload 合法内存更高）
         - payload 95MB（v2）→ 预算 ~283MiB；同一 delta 350MiB → 失败
-        - payload 95MB、delta 300MiB > 283 → 仍然失败（不再被大上限放过）
-        - payload 95MB、delta 250MiB → 通过
+        - payload 95MB、delta 300MiB > 283 → 失败；delta 250MiB → 通过
         """
         info = good_info()
         info["victim_rss_baseline_kb"] = 100_000
-        # v1 payload
+        # v1 大 payload：同一 delta 合法
         info["snapshot_bytes"] = 386_000_000
-        info["victim_rss_max_in_window_kb"] = 450_000  # 350MiB
-        self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(args(), info, True)))
-        # v2 payload，同一 delta
+        info["victim_rss_max_in_window_kb"] = 450_000  # delta 350MiB < 560
+        info["victim_peak_rss_kb"] = 450_000
+        self.assertEqual(ls.c4_errors(args(), info, True), [])
+        # v2 小 payload：同一 delta 超预算
         info["snapshot_bytes"] = 95_000_000
         self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(
             args(min_snapshot_bytes=0), info, True)))
-        # v2 payload，delta 300MiB > 283 预算
+        # delta 300MiB > 283 预算
         info["victim_rss_max_in_window_kb"] = 400_000
+        info["victim_peak_rss_kb"] = 400_000
         self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(
             args(min_snapshot_bytes=0), info, True)))
-        # v2 payload，delta 250MiB → 通过（VmHWM 也要一起降，否则 max() 取到旧峰值）
+        # delta 250MiB → 通过
         info["victim_rss_max_in_window_kb"] = 350_000
         info["victim_peak_rss_kb"] = 350_000
         self.assertEqual(ls.c4_errors(args(min_snapshot_bytes=0), info, True), [])
+
+    def test_rss_budget_flag_can_tighten_but_not_loosen(self):
+        """flag > 0 只能收紧：min(flag, 192+payload)；flag 小于 auto 时按 flag 判。"""
+        info = good_info()
+        info["victim_rss_baseline_kb"] = 100_000
+        info["snapshot_bytes"] = 95_000_000        # auto = 192+90.6 = 282.6
+        info["victim_rss_max_in_window_kb"] = 350_000  # delta 250MiB
+        info["victim_peak_rss_kb"] = 350_000
+        self.assertEqual(ls.c4_errors(args(min_snapshot_bytes=0), info, True), [])
+        # 收紧到 200 → 250 超预算
+        self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(
+            args(min_snapshot_bytes=0, max_rss_delta_mb=200.0), info, True)))
+        # 放宽到 1000 → 仍按 auto（282.6），250 通过
+        self.assertEqual(ls.c4_errors(
+            args(min_snapshot_bytes=0, max_rss_delta_mb=1000.0), info, True), [])
 
     def test_rss_budget_catches_whole_payload_residency(self):
         """整份 payload 额外驻留（+1x payload）必须超预算——这是预算公式的核心目的。"""
@@ -272,7 +288,7 @@ class C4AssertionsTest(unittest.TestCase):
         """窗口采样漏采峰值时用 VmHWM：window 150MiB 但 VmHWM 350MiB → 超预算判失败。"""
         info = good_info()
         info["victim_rss_max_in_window_kb"] = 250_000   # delta 150MiB（看起来 OK）
-        info["victim_peak_rss_kb"] = 450_000            # delta 350MiB（真实峰值）
+        info["victim_peak_rss_kb"] = 700_000            # delta 600MiB（真实峰值 > auto 430）
         self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(args(), info, True)))
 
 class C3AssertionsTest(unittest.TestCase):

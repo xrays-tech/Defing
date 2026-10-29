@@ -1708,15 +1708,17 @@ def c4_errors(args, snapshot_info, victim_is_voter):
         # - `rss_delta_vs_payload` / `rss_delta_vs_db_file` 只入 summary 供对照。
         peak_kb = max(int(rss_kb), int(vhm_kb or 0))
         delta_kb = max(0, peak_kb - int(base_kb))
-        # 预算 = min(上限, 固定开销 192MiB + 一份 payload 大小)。这样既吸收固定开销，又能在
-        # 「整份 payload 被额外驻留」的回归上失败（回归 ≈ +1x payload），且 P5 可随规模放大。
+        # 预算 = 固定开销 192MiB + **一份 payload**（随规模放大）。`--max-rss-delta-mb > 0` 时
+        # 只能**收紧**（min(flag, 公式)）——不能用一个固定上限去卡大 payload（extreme 244MB 的
+        # 合法 delta 355MiB 会被 320 上限误判）。整份额外驻留（+1x payload）仍会超预算。
         payload_mb = (float(sb) / (1024.0 * 1024.0)) if sb else 0.0
-        budget_mb = min(float(args.max_rss_delta_mb), 192.0 + payload_mb)
+        auto_mb = 192.0 + payload_mb
+        budget_mb = auto_mb if float(args.max_rss_delta_mb) <= 0 else min(float(args.max_rss_delta_mb), auto_mb)
         budget_kb = int(budget_mb * 1024)
         if delta_kb > budget_kb:
-            errs.append("C4: install 窗口净增量 RSS %dMiB > 预算 %.0fMiB（= min(%.0f, 192+payload %.0f)）"
+            errs.append("C4: install 窗口净增量 RSS %dMiB > 预算 %.0fMiB（auto=192+payload %.0f，flag=%.0f）"
                         "（window=%dKiB vmhwm=%sKiB baseline=%dKiB payload=%sB db_file=%dB）"
-                        % (delta_kb // 1024, budget_mb, float(args.max_rss_delta_mb), payload_mb,
+                        % (delta_kb // 1024, budget_mb, auto_mb, payload_mb,
                            rss_kb, vhm_kb, int(base_kb), sb, state_b))
     return errs
 
@@ -1903,8 +1905,9 @@ def parse_args():
     p.add_argument("--max-write-p99-ms", type=float, default=0.0,
                    help="P5 写停顿预算：publish ack 延迟 p99 上限（load/bulk 两阶段分别检查）。"
                         "默认 0=只观测（summary.write_latency_ms）；标定后由 gate/CI 传值")
-    p.add_argument("--max-rss-delta-mb", type=float, default=320.0,
-                   help="C4 内存预算上限：实际预算 = min(该值, 192MiB + payload 大小)。"
+    p.add_argument("--max-rss-delta-mb", type=float, default=0.0,
+                   help="C4 内存预算：0=自动（192MiB + payload，随规模放大）；>0 只能收紧"
+                        "（实际 = min(该值, 192+payload)）。"
                         "install 窗口净增量 RSS = max(窗口采样 0.4s, VmHWM) - 重启基线；"
                         "192MiB 吸收固定开销，+payload 允许一份副本，整份额外驻留（≈+1x payload）"
                         "会超预算。payload/redb 比值只入 summary 供对照")
