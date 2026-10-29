@@ -1909,6 +1909,8 @@ def parse_args():
                    help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
     p.add_argument("--rolling-rehearsal", action="store_true",
                    help="P5 release gate：真实进程级滚动升级/降级演练（忽略 load/chaos 参数）")
+    p.add_argument("--rolling-install-timeout-ms", type=int, default=300000,
+                   help="演练用 install_snapshot_timeout（大 payload 传输；默认 300s）")
     p.add_argument("--rolling-writes", type=int, default=4000,
                    help="每个阶段的写入条数（默认 4000 × 16KB ≈ 64MB/阶段）")
     p.add_argument("--max-write-p99-ms", type=float, default=0.0,
@@ -1930,6 +1932,10 @@ def parse_args():
 
 
 # ---------------------------------------------------------------- rolling upgrade rehearsal
+#
+# 模块级：演练的基础 env（install timeout 等），由 rolling_rehearsal 设置。
+ROLL_BASE_ENV = {}
+
 #
 # 真实进程级滚动升级/降级演练（P5 release gate）：
 #   phase 1 全 v1 写端 → 写入 ~N×16KB（触发策略快照）→ 杀掉 follower 让它经 v1 快照追平
@@ -1983,7 +1989,7 @@ def _rolling_restart(nodes, seed_map, env, label):
     """一次一个节点：kill → 设 env → spawn → 等健康；最后等集群 settled。"""
     for n in nodes:
         n.kill()
-        n.extra_env = dict(env)
+        n.extra_env = {**ROLL_BASE_ENV, **env}
         n.spawn(seed_map)
         if not wait_healthz(n, 30):
             log("  [%s] node %d 重启失败；log tail:" % (label, n.node_id))
@@ -2048,11 +2054,11 @@ def _catch_up_victim(nodes, seed_map, token, writes, env, expect_version, label)
         leader = CLUSTER.by_id(wait_leader(5))
         snap_ok = leader is not None and leader_snap is not None
     if not snap_ok:
-        victim.extra_env = dict(env)
+        victim.extra_env = {**ROLL_BASE_ENV, **env}
         victim.spawn(seed_map)
         return (False, "leader 没有在超时内构建出 v%d 快照（victim 会走日志追平）" % expect_version)
     time.sleep(1.0)  # 给 purge 一个拍
-    victim.extra_env = dict(env)
+    victim.extra_env = {**ROLL_BASE_ENV, **env}
     victim.spawn(seed_map)
     if not wait_healthz(victim, 30):
         return (False, "victim restart failed")
@@ -2088,6 +2094,9 @@ def rolling_rehearsal(args):
     nodes = []
     seed_map = ""
     n_nodes = int(args.nodes or 5)
+    # 大 payload（v1 JSON 可到 1GB）安装需要更长 hard_ttl，否则 InstallSnapshot 反复超时重试
+    ROLL_BASE_ENV = {"DSH_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS": str(args.rolling_install_timeout_ms)}
+    globals()["ROLL_BASE_ENV"] = ROLL_BASE_ENV
     try:
         for i in range(1, n_nodes + 1):
             d = os.path.join(work, "n%d" % i)
@@ -2096,7 +2105,7 @@ def rolling_rehearsal(args):
         seed_map = ",".join("%d@%s@%s" % (n.node_id, n.raft_addr, n.http_addr) for n in nodes)
         globals()["CLUSTER"] = Cluster(nodes, seed_map)
         for n in nodes:
-            n.extra_env = {}
+            n.extra_env = dict(ROLL_BASE_ENV)
             n.spawn(seed_map)
         if not all(wait_healthz(n, 30) for n in nodes):
             return (2, {"ok": False, "phase": "boot"})
