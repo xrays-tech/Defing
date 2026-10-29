@@ -42,7 +42,7 @@ def args(**kw):
         leader_kills=5,
         max_install_seconds=30.0,
         min_snapshot_bytes=100_000_000,
-        max_rss_ratio=2.0,
+        max_rss_state_ratio=1.2,
         chaos_during_snapshot=True,
     )
     base.update(kw)
@@ -162,6 +162,8 @@ def good_info():
         "snapshot_elections_unexplained": 0,
         "victim_rss_max_in_window_kb": 400_000,
         "victim_rss_baseline_kb": 100_000,
+        # P4 口径：RSS 比值基准 = 逻辑状态（redb）字节；300MB 状态 → 净增 300MB = 1.0x
+        "victim_state_bytes": 300_000_000,
     }
 
 
@@ -220,6 +222,27 @@ class C4AssertionsTest(unittest.TestCase):
     def test_rss_over_budget_fails(self):
         info = good_info()
         info["victim_rss_max_in_window_kb"] = 1_000_000
+        self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(args(), info, True)))
+
+    def test_missing_state_bytes_fails(self):
+        """P4 口径：没有格式无关基准（redb 尺寸）必须判失败，而不是静默跳过比值。"""
+        info = good_info()
+        info["victim_state_bytes"] = None
+        self.assertTrue(any("逻辑状态尺寸" in e for e in ls.c4_errors(args(), info, True)))
+
+    def test_rss_state_ratio_uses_state_not_payload(self):
+        """同一 delta：payload 386MB（v1 JSON 4x 膨胀）与 95MB（v2）都不影响判定——
+        判定只认 delta/state。delta 360MB / state 300MB = 1.2x 恰好等于预算（不失败）。"""
+        info = good_info()
+        info["snapshot_bytes"] = 386_000_000   # v1 的膨胀 payload
+        info["victim_rss_baseline_kb"] = 100_000
+        info["victim_rss_max_in_window_kb"] = 450_000  # delta 350MiB ≈ 1.19x state
+        self.assertEqual(ls.c4_errors(args(), info, True), [])
+        # payload 缩到 v2 尺寸，判定不变（不再拿 payload 当分母）
+        info["snapshot_bytes"] = 95_000_000
+        self.assertEqual(ls.c4_errors(args(min_snapshot_bytes=0), info, True), [])
+        # 超预算（delta 390MiB / 300MB ≈ 1.33x）
+        info["victim_rss_max_in_window_kb"] = 490_000
         self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(args(), info, True)))
 
 
