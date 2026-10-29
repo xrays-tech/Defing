@@ -87,6 +87,40 @@ jobs:
       - name: stress harness unit tests
         run: python3 -m unittest scripts/stress/test_leader_storm.py -v
 
+  # stage 5.5: 缩短版 leader-storm（P3 验收链路冒烟：快照追平 + snapshot 期间 churn）
+  # 完整验收跑在本地（12k 写 / 269MB 快照 / install 预算 30s）；CI 只保证：
+  #   1) 二进制 + harness 在 runner 上能端到端跑通；
+  #   2) 判定逻辑（C3/C4 断言、install 窗口、选举归属、心跳采样）在真实数据上成立。
+  # runner 比本地慢且抖动大，预算放宽到 120s / 快照下限 20MB，避免 flaky。
+  storm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('server/Cargo.lock') }}
+      - name: build defing (release)
+        working-directory: server
+        run: cargo build --release --bin defing
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: shortened leader storm (snapshot + churn)
+        run: |
+          ./scripts/stress-leader-storm.sh --no-build \
+            --bin server/target/release/defing \
+            --profile storm --duration 8 --leader-kills 2 --snapshot-writes 1500 \
+            --chaos-during-snapshot --catchup-timeout 90 \
+            --max-install-seconds 120 --min-snapshot-bytes 20000000 --keep
+
   # stage 6: 三语言 SDK 契约对拍（同一 dev-single 服务）
   sdk:
     runs-on: ubuntu-latest

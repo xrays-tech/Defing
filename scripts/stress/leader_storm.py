@@ -1226,14 +1226,41 @@ def snapshot_phase(args, stats, token, rng):
         if leader_n is None or CLUSTER.live_count() < 4:
             log("  snapshot chaos skipped (%s): no live leader / live<4" % kind_note)
             return None
+        # C3：和 load 阶段的 roulette 一样，kill 之前必须确认目标**自认 leader**
+        # （majority-vote 找到的 id 也可能是陈旧视图）。freeze 不做身份校验（不产生 C3 计数）。
+        own = members(leader_n.http_base(), None) or {}
+        entry = next(
+            (m for m in own.get("members", [])
+             if str(m.get("node_id")) == str(leader_n.node_id)),
+            None,
+        )
+        is_leader = bool(entry and entry.get("is_leader"))
         kind = rng.choice(["kill", "freeze"])
         if kind == "kill":
+            if not is_leader:
+                stats.bump("leader_kill_target_not_leader")
+                log("  snapshot chaos skipped (%s): 目标 %d 自认 follower"
+                    % (kind_note, leader_n.node_id))
+                return None
             with CLUSTER.lock:
                 leader_n.kill()
             stats.bump("leader_kills")
+            stats.bump("leader_kill_targets_verified")
             stats.bump("snapshot_chaos_injections")
             log("  snapshot chaos: leader %d SIGKILL @ catchup+t%.1fs"
                 % (leader_n.node_id, time.time() - catchup_t0))
+            # C3：与 load 阶段一致——kill 后、重启前观测是否真的换人（否则 C3 计数不平）
+            changed = False
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                nl = wait_leader(1)
+                if nl is not None and nl != leader_n.node_id:
+                    changed = True
+                    stats.bump("observed_leader_changes")
+                    break
+                time.sleep(0.2)
+            if not changed:
+                stats.bump("leader_change_missing")
             time.sleep(rng.uniform(0.3, 1.0))
             with CLUSTER.lock:
                 leader_n.spawn(CLUSTER.seed_map)
@@ -1313,13 +1340,25 @@ def snapshot_phase(args, stats, token, rng):
                         max_lag = int(lag) if max_lag is None else max(max_lag, int(lag))
                         victim_lag = int(lag)
                     break
-        # primary catch-up: victim healthz + victim lag == 0 (numeric) + config equal to leader
+        # primary catch-up: victim healthz + victim lag == 0 (numeric) + **全部** snapshot 项目
+        # 配置相等。复核指出只看 projects[0] 会乐观（一个项目相等不等于整份快照 restore 完成）；
+        # 这里逐项目比对，最后再由 validate_final 对全节点全项目复核。
         if victim_lag == 0 and healthz(victim.http_base()):
-            lc = read_config(leader, token, projects[0]) if leader else None
-            vc = read_config(victim, token, projects[0])
-            if lc and vc and lc.get("value") and lc.get("value") == vc.get("value"):
+            all_equal = True
+            first_mismatch = None
+            for proj in projects:
+                lc = read_config(leader, token, proj) if leader else None
+                vc = read_config(victim, token, proj)
+                if not lc or not vc or not lc.get("value") or lc.get("value") != vc.get("value"):
+                    all_equal = False
+                    first_mismatch = proj
+                    break
+            if all_equal:
                 catchup_seconds = time.time() - catchup_t0
                 break
+            elif cfg_gate_diag < 3:
+                cfg_gate_diag += 1
+                log("  diag cfg-gate: project %s 仍未与 leader 相等" % (first_mismatch,))
             elif cfg_gate_diag < 3:
                 # why the gate refuses to settle despite lag==0: which side unreadable,
                 # or value mismatch (len+tail) — distinguishes harness/transport vs state.
@@ -1815,8 +1854,10 @@ def main():
             info = snapshot_phase(args, STATS, tok_data, rng)
             if info:
                 snapshot_info = info[0]
+        t_quiesce = time.time()
         if not quiesce(40):
             log("  WARN: cluster not fully settled before final validation")
+        quiesce_seconds = round(time.time() - t_quiesce, 1)
 
         # final validation
         errors = []
@@ -1841,6 +1882,8 @@ def main():
             "leader_kill_targets_verified": STATS.leader_kill_targets_verified,
             "leader_kill_target_not_leader": STATS.leader_kill_target_not_leader,
             "leader_change_missing": STATS.leader_change_missing,
+            "quiesce_seconds": quiesce_seconds,
+            "snapshot_projects_compared": len(SNAPSHOT_PROJECTS),
             "snapshot_catchup_seconds": (snapshot_info or {}).get("catchup_seconds"),
             "snapshot_victim_peak_rss_kb": (snapshot_info or {}).get("victim_peak_rss_kb"),
             "snapshot_bytes": (snapshot_info or {}).get("snapshot_bytes"),

@@ -422,11 +422,16 @@ install 窗口 = `full-snapshot transfer start` → `install full snapshot` → 
 | 整改前（`56a3a6e`，A/B control，4k 写） | 197.6MB | 25.87s | 42.9s | 461MB (2.3x) | 同盘同构建对照 |
 | 整改后（4k 写，同参数） | 174.2MB | **0.657s** | 20.0s | 263MB (1.5x) | 50x 级差异，排除数据/机器因素 |
 | 整改后（6k 写，`p3d-storm4`） | 269.5MB | **1.779s**（transfer 0.747 + apply 1.031） | 10.2s | 368MB (1.37x) | C3/C4 断言全开 |
+| 整改后（12k 写，`p3g-gate`，全项目比对判据） | 397.4MB | **2.727s** | 10.2s | 483.5MB (1.22x) | 5/5 kill 验证+换人，8 项目逐项相等 |
 
 **C3/C4 证据口径**（harness 现在会断言，不再只报告）：
-- C3：每次 leader kill 都先确认目标**自认 leader**（`members[].is_leader`），击杀后、重启前观测
-  是否真的换人（`p3d-storm4`：5/5 验证、5/5 换人）；install 窗口内 leader 视角 victim 心跳 age
-  最大 119–399ms（`last_heartbeat_ms_ago`，预算 3s）——0.10 独立 heartbeat worker 在快照期间不停。
+- C3：每次 leader kill（load 与 snapshot 阶段都算）都先确认目标**自认 leader**（`members[].is_leader`），
+  击杀后、重启前观测是否真的换人（`p3d-storm4`/`p3g-gate`：5/5 验证、5/5 换人、0 missing）；
+  install 窗口内 leader 视角 victim 心跳 age（`last_heartbeat_ms_ago`）在 120MB 档为 119–399ms，
+  397MB 的 12k 跑为 1.742s（预算 3s）。
+  口径：这是 leader 侧「最近一次确认心跳/复制」的 age；install 期间 follower 忙于收帧/应用会延后 ack，
+  但 follower 的选举计时器由「收到请求」重置 —— 所以 age 1.7s 与「窗口内 victim 0 次选举」不矛盾，
+  它证明的是心跳**没有整段停摆**（0.9 失败模式下该 age 会逼近整个 install 时长）。
 - C4：`install_windows>=1`、端到端 <= `--max-install-seconds`、`snapshot_bytes >= --min-snapshot-bytes`、
   victim 必须 `is_voter`；churn 在 victim 的 **transfer 窗口一开**时注入；窗口内 victim
   选举/预投票必须为 0（计入 `trigger pre-vote`）。
