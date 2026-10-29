@@ -5,7 +5,7 @@
 Focus: 频繁 leader 变更 (leader roulette) + 高并发读写 + snapshot 追赶.
 The snapshot stage reproduces the fixed "follower 永久落后" scenario
 (dev_docs/deployment-guide.md §6.5, dsh-raft raft.rs: /raft/* body limit 32MiB,
-chunk 1MiB, install_snapshot_timeout 30s). 超过 openraft snapshot_policy
+chunk 1MiB, install_snapshot_timeout 120s). 超过 openraft snapshot_policy
 since_last 阈值 → 被重新加入 follower 追平必须走 InstallSnapshot, 旧
 配置恒 413 / InstallSnapshot RPC timed out.
 
@@ -135,7 +135,8 @@ EXPECTED_RAFT_CONFIG = {
     "election_timeout_min": 300,
     "election_timeout_max": 600,
     "max_payload_entries": 64,
-    "install_snapshot_timeout": 30_000,      # ms
+    # P5：默认 120s（v1 ~1GB 快照需要）；env 可覆盖，harness 期望值随 env 走
+    "install_snapshot_timeout": int(os.environ.get("DSH_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS", "120000")),  # ms
     "snapshot_max_chunk_size": 1024 * 1024,  # 1 MiB raw
     "cluster_name": "foo",
     "enable_pre_vote": "true",
