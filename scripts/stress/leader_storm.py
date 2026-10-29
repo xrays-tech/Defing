@@ -1971,7 +1971,16 @@ def _wait_settled(nodes, timeout=90.0):
                 md = members(live[0].http_base())
                 if md:
                     voters = [m for m in md.get("members", []) if m.get("is_voter")]
-                    if voters and all(m.get("lag") in (0, None) for m in voters):
+                    lag_ok = all(
+                        (m.get("lag") is None) or (isinstance(m.get("lag"), int) and m.get("lag") == 0)
+                        for m in voters
+                        if str(m.get("node_id")) == str(lid)
+                    ) and all(
+                        isinstance(m.get("lag"), int) and m.get("lag") == 0
+                        for m in voters
+                        if str(m.get("node_id")) != str(lid)
+                    )
+                    if voters and lag_ok:
                         return True
         time.sleep(0.4)
     return False
@@ -2049,15 +2058,24 @@ def _catch_up_victim(nodes, seed_map, token, writes, env, expect_version, label)
     victim.spawn(seed_map)
     if not wait_healthz(victim, 30):
         return (False, "victim restart failed")
-    if not _wait_settled(nodes, 120):
-        return (False, "victim did not settle")
+    # 直接等安装证据（比 members.lag 更硬）：日志出现 transfer start + victim 落盘出现新版本文件
+    t_restart = time.time()
+    transfer = False
+    snap = None
+    while time.time() - t_restart < 150:
+        if not transfer and any("full-snapshot transfer start" in line for line in victim.tail(400)):
+            transfer = True
+        snap = _latest_snap_file(victim)
+        if snap is not None and os.path.getmtime(snap) > t_writes - 1.0 and _snap_header_version(snap) == expect_version:
+            break
+        time.sleep(0.5)
+    if not _wait_settled(nodes, 60):
+        return (False, "victim did not settle (transfer=%s snap=%s)" % (transfer, snap))
     snap = _latest_snap_file(victim)
     if snap is None:
         return (False, "victim has no snapshot file")
     ver = _snap_header_version(snap)
-    ok = (ver == expect_version) and os.path.getmtime(snap) > t_writes - 1.0
-    # 证据：victim 日志里应有 full-snapshot transfer start（安装路径，而非日志追平）
-    transfer = any("full-snapshot transfer start" in line for line in victim.tail(400))
+    ok = (ver == expect_version) and os.path.getmtime(snap) > t_writes - 1.0 and transfer
     return (ok,
             "victim=%d snap=%s version=%s expected=%s transfer_started=%s leader_snap=%s"
             % (victim.node_id, os.path.basename(snap), ver, expect_version, transfer,
