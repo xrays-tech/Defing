@@ -685,7 +685,11 @@ async fn voter_catches_up_via_http_snapshot_after_being_down() {
     let storage2 = reopened.expect("重启时重新打开 data dir 失败（文件锁未释放？）");
     let db2 = storage2.raw_db();
     let sm2 = Arc::new(RwLock::new(StateMachine::new(Box::new(storage2))));
-    let sm_store2 = Arc::new(StateMachineStore::new(sm2.clone(), db2.clone(), victim_dir.clone()));
+    let sm_store2 = Arc::new(StateMachineStore::new(
+        sm2.clone(),
+        db2.clone(),
+        victim_dir.clone(),
+    ));
     let rebooted = new_raft_node(
         3,
         victim_info,

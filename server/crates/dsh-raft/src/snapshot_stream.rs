@@ -439,10 +439,10 @@ impl futures_util::stream::Stream for FrameEmitter {
                     }
                 };
             }
-            if !e.queue.is_empty() {
-                continue;
-            }
-            return std::task::Poll::Pending;
+            // 复核 minor：这里原来直接返回 Pending。若本次 read 有数据但没填满 chunk，
+            // queue 仍为空 → 返回 Pending 却没注册任何 waker，只能靠 hyper 重新 poll 掩盖。
+            // 继续循环去 poll_read：没数据时它自己会注册 waker（正确的 Pending 语义）。
+            continue;
         }
     }
 }

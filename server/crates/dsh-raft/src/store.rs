@@ -251,7 +251,6 @@ fn fsync_dir(dir: &std::path::Path) -> Result<(), ErrOf> {
     }
 }
 
-
 fn copy_payload_file(dir: PathBuf, name: String, src: &std::path::Path) -> Result<PathBuf, ErrOf> {
     fs::create_dir_all(&dir).map_err(io_write)?;
     let part_path = dir.join(format!("{name}.part"));
@@ -1430,7 +1429,10 @@ mod tests {
             .expect("last_purged persisted");
         let stored: LogIdOf = de(&raw).expect("last_purged 必须是完整 LogId 格式");
         assert_eq!(stored.index, 3);
-        assert_eq!(stored.leader_id.term, 1, "term 必须保留（index-only 会丢成 0）");
+        assert_eq!(
+            stored.leader_id.term, 1,
+            "term 必须保留（index-only 会丢成 0）"
+        );
         assert_eq!(stored.leader_id.node_id, 1, "node_id 必须保留");
         assert_eq!(indexes_of(&mut store, 1..=u64::MAX).await, vec![4, 5]);
 
@@ -1850,8 +1852,15 @@ mod tests {
             .unwrap()
             .map(|raw| de(&raw).unwrap())
             .expect("last_applied");
-        assert_eq!(purged, applied, "旧格式同 index 必须归一成 last_applied 的 LogId");
-        assert_eq!(st.last_log_id, Some(applied), "空日志回落值必须与 last_applied 同序");
+        assert_eq!(
+            purged, applied,
+            "旧格式同 index 必须归一成 last_applied 的 LogId"
+        );
+        assert_eq!(
+            st.last_log_id,
+            Some(applied),
+            "空日志回落值必须与 last_applied 同序"
+        );
 
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
         let sm_store = Arc::new(StateMachineStore::new(sm, db.clone(), dir.clone()));
@@ -1861,9 +1870,16 @@ mod tests {
             http_addr: "http://127.0.0.1:0".into(),
             raft_addr: "127.0.0.1:0".into(),
         };
-        let raft = crate::new_raft_node(1, info, LogStore::new(db), sm_store, &net, crate::dev_config())
-            .await
-            .expect("旧格式 purged + 空日志必须能在 0.10 上启动");
+        let raft = crate::new_raft_node(
+            1,
+            info,
+            LogStore::new(db),
+            sm_store,
+            &net,
+            crate::dev_config(),
+        )
+        .await
+        .expect("旧格式 purged + 空日志必须能在 0.10 上启动");
         let _ = raft.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
