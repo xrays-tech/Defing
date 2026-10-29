@@ -513,6 +513,16 @@ fn meta_get(db: &DbHandle, key: &[u8]) -> Result<Option<Vec<u8>>, ErrOf> {
 }
 
 /// 写 raft-meta 单键（单事务提交；Durability 默认 Immediate，commit 即 fsync）。
+/// 删除一个 meta 键（幂等）。P4-A 的 `META_RESTORE_BEGIN` 生命周期用得到。
+fn meta_del(db: &DbHandle, key: &[u8]) -> Result<(), ErrOf> {
+    let txn = db.begin_write().map_err(io_write)?;
+    {
+        let mut table = txn.open_table(TBL_RAFT_META).map_err(io_write)?;
+        table.remove(key).map_err(io_write)?;
+    }
+    txn.commit().map_err(io_write)
+}
+
 fn meta_put(db: &DbHandle, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
     let txn = db.begin_write().map_err(io_write)?;
     let mut table = txn.open_table(TBL_RAFT_META).map_err(io_write)?;
@@ -2192,6 +2202,21 @@ mod tests {
             .expect("snapshot");
         assert!(std::fs::exists(&snap.snapshot).unwrap());
         drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// meta_del：写后删必须读回 None，且重复删除幂等（P4-A marker 生命周期依赖它）。
+    #[tokio::test]
+    async fn meta_del_removes_key_and_is_idempotent() {
+        let dir = tmpdir("meta-del");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        meta_put(&db, b"k", b"v").unwrap();
+        assert_eq!(meta_get(&db, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        meta_del(&db, b"k").unwrap();
+        assert!(meta_get(&db, b"k").unwrap().is_none());
+        meta_del(&db, b"k").unwrap(); // 幂等
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
