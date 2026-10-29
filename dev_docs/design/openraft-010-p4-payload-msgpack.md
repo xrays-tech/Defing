@@ -168,6 +168,35 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
 - **v1 路径不变**：默认写端仍是无头 JSON（`serde_json::to_vec(&dump_all())`），回滚即关 flag。
 - **测试**：预算 1B 强制多页时，流式写出的字节与「整份编码」**逐字节一致**（同编码/同顺序）、
   头 total_len/crc 正确；写→读→install 闭环；空状态产出合法 `array(0)` payload。
-- **体积目标（§6 的 ≤0.75x）**：storm 数据是 60KB ASCII 长值，msgpack 省的是逐条头/引号开销，
-  预计远达不到 −25%——需要实测后按实测改写目标（体积收益主要在二进制/小值/结构化数据；
-  msgpack 的确定收益是解析速度与 RSS）。测量结论见下一轮（P4c storm A/B）。
+- **体积目标（§6 的 ≤0.75x）已远超**：实测 v1 JSON 386.0MB vs v2 msgpack 95.4MB = **0.25x**
+  （原因：serde_json 把 `Vec<u8>` 编成十进制数字数组，每字节 ≈4 字符；msgpack 用 bin）。详见 §12。
+
+## 12. 实测（P4c 12k storm A/B + 350MB 尺度探针，2026-10-29）
+
+**同一命令、同一 release 二进制，只差写端 flag**（`--profile storm --duration 25 --leader-kills 5
+--snapshot-writes 12000 --chaos-during-snapshot --catchup-timeout 120 --max-install-seconds 30`）：
+
+| 指标 | v1（默认，无头 JSON） | v2（msgpack） | 说明 |
+|---|---|---|---|
+| victim 快照 | **386.0MB** | **95.4MB（0.25x）** | JSON 把 `Vec<u8>` 序列化成**十进制数字数组**（每字节 "120," ≈4 字符）→ 4x 膨胀 |
+| install（release） | 3.67s（attempts=2，末次 2.70s） | **0.799s**（attempts=1） | 传输量 4x 之差 + 解析 |
+| catch-up | 8.33s | 5.62s | |
+| victim 峰值 RSS | 386.7MB | 306.2MB | |
+| victim 基线 RSS | 131.4MB | 126.5MB | |
+| 净增量 delta | 255.3MB | **179.8MB（−30%）** | |
+| delta / payload | 0.66x | 1.88x | **比值不可跨格式比较**（见下） |
+| 窗口内选举 / 无法解释选举 | 0 / 0 | 0 / 0 | |
+| kill 验证 / 换人 / 项目比对 | 5/5 / 5/5 / 8 | 5/5 / 5/5 / 8 | |
+| storm 判定 | `ok:true` | 仅 C4 `net 1.88x > 1.2x` 失败 | 见下 |
+
+**关键口径修正（P4 复核请注意）**：`net = delta / snapshot_bytes` 在格式变化后不再可比——
+v1 的 `snapshot_bytes` 被 JSON 数字数组放大了 ~4x，而 delta 主要由**解码后的状态**（≈ msgpack 体积）
++ 固定开销决定。绝对内存 v2 少 75MB；比值反而更高，纯属分母变化。格式无关的证据是：
+
+- **350MB 尺度探针**（`large_install_rss_probe`，流式生成 payload、单独进程语义、10ms 采样 VmRSS）：
+  payload **349MiB**、install 6.99s（debug；release 见上表）、baseline 11.4MiB、peak 169.6MiB、
+  delta 154MiB → **net 0.44x / raw 0.47x**（目标 net ≤1.2x、raw ≤2.0x 均大幅达标）。
+- 绝对 delta：v2 179.8MB < v1 255.3MB（−30%）。
+
+**建议 P4 gate 采纳的口径**：RSS 以「净增量 / **逻辑状态字节**」为准（逻辑状态可用 victim 落盘
+redb 尺寸或 msgpack payload 近似），不再用 v1-JSON payload 当分母；或直接改用绝对增量 + 探针曲线。
