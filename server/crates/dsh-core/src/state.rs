@@ -113,6 +113,44 @@ pub struct StateMachine {
     pending_ops: Vec<PendingOp>,
 }
 
+/// `StateMachine::dump_batches` 的分页迭代器（P4c0）。
+pub struct DumpBatches<'a> {
+    sm: &'a StateMachine,
+    budget: usize,
+    /// 上一次返回的最后一条 key（下一次从它之后开始）。
+    after: Option<Vec<u8>>,
+    done: bool,
+}
+
+impl Iterator for DumpBatches<'_> {
+    type Item = Result<crate::store::KeyValuePairs, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self
+            .sm
+            .store
+            .get_prefix_page(b"", self.after.as_deref(), self.budget)
+        {
+            Ok(page) if page.is_empty() => {
+                self.done = true;
+                None
+            }
+            Ok(page) => {
+                // 用最后一条 key 作为下一页游标（严格递增，必然前进）。
+                self.after = page.last().map(|(k, _)| k.clone());
+                Some(Ok(page))
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
 impl StateMachine {
     pub fn new(store: Box<dyn Store>) -> Self {
         Self {
@@ -612,6 +650,20 @@ impl StateMachine {
     /// 导出全部状态（快照构建用）。
     pub fn dump_all(&self) -> Result<crate::store::KeyValuePairs, Error> {
         self.get_prefix_merged(b"")
+    }
+
+    /// **分页导出**全部状态（P4c0）：内容与 `dump_all` 一致，但按 `budget` 字节分批返回，
+    /// 峰值内存 ≈ 一批 + 后端分页缓冲（不再一次性驻留整份状态）。快照写端用它流式写 payload。
+    ///
+    /// 前置假设与 `dump_all` 相同：调用方持有状态机读锁（`pending_ops` 只在写命令内部非空，
+    /// 此时拿不到读锁），因此这里只读 store，不合并 pending。
+    pub fn dump_batches(&self, budget: usize) -> DumpBatches<'_> {
+        DumpBatches {
+            sm: self,
+            budget: budget.max(1),
+            after: None,
+            done: false,
+        }
     }
 
     /// 清空并恢复全部状态（快照安装用）。
@@ -3809,5 +3861,61 @@ mod restore_batch_tests {
         for (k, v) in &b0 {
             assert_eq!(sm.store.get(k).unwrap().as_deref(), Some(v.as_slice()));
         }
+    }
+}
+
+#[cfg(test)]
+mod dump_batches_tests {
+    use super::*;
+    use crate::store::InMemoryStore;
+
+    fn sm_with(n: usize) -> StateMachine {
+        let sm = StateMachine::new(Box::new(InMemoryStore::new()));
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+            .map(|i| (format!("k{i:04}").into_bytes(), vec![b'v'; 50]))
+            .collect();
+        sm.restore_all(&pairs).unwrap();
+        sm
+    }
+
+    /// P4c0：分页 dump 的拼接必须与 `dump_all` 完全一致（同序、同内容）。
+    #[test]
+    fn dump_batches_concatenates_to_dump_all() {
+        let sm = sm_with(37);
+        let all = sm.dump_all().unwrap();
+        for budget in [1usize, 7, 64, 10_000] {
+            let pages: Vec<_> = sm.dump_batches(budget).map(|p| p.unwrap()).collect();
+            if budget <= 1_000 {
+                assert!(pages.len() >= 2, "budget={budget} 应切多页");
+            }
+            let flat: Vec<_> = pages.into_iter().flatten().collect();
+            assert_eq!(flat, all, "budget={budget} 拼接必须等于 dump_all");
+        }
+    }
+
+    /// 空状态 → 零页（不能返回一个空页导致调用方写出空快照头）。
+    #[test]
+    fn dump_batches_empty_state_yields_nothing() {
+        let sm = StateMachine::new(Box::new(InMemoryStore::new()));
+        assert_eq!(sm.dump_batches(1024).count(), 0);
+    }
+
+    /// 每页都前进（至少一条），且除最后一条外不超过预算——防「after 不前进」死循环。
+    #[test]
+    fn dump_batches_pages_advance_and_respect_budget() {
+        let sm = sm_with(20);
+        let mut seen = 0usize;
+        for page in sm.dump_batches(120) {
+            let page = page.unwrap();
+            assert!(!page.is_empty(), "不得产出空页");
+            let bytes: usize = page.iter().map(|(k, v)| k.len() + v.len()).sum();
+            let last = page.last().map(|(k, v)| k.len() + v.len()).unwrap_or(0);
+            assert!(
+                bytes.saturating_sub(last) < 120 || page.len() == 1,
+                "只允许最后一条越过预算: {bytes}"
+            );
+            seen += page.len();
+        }
+        assert_eq!(seen, 20, "分页不能漏/重 key");
     }
 }

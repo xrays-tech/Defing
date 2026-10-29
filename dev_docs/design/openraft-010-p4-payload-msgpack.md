@@ -54,9 +54,10 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
 
 ## 5. 未决（gate 决策）
 
-- **`dump_all()` 本身是否整份 Vec**：`StateMachine::dump_all` 当前返回 `KeyValuePairs`（整份）。
-  要真正做到「写端无整份驻留」，需要给状态机加前缀迭代/分页 dump（`dump_batches(prefix, budget)`）。
-  这是 P4c 的前置，可能牵动 `get_prefix_merged` 的调用点；建议 P4c 先做只读分页，不改 apply 路径。
+- ~~**`dump_all()` 本身是否整份 Vec**~~ → **P4c0 已落地**：`Store::get_prefix_page(prefix, after, budget)`
+  （redb 用 `range(after..)` 覆盖，不再物化整份前缀）+ `StateMachine::dump_batches(budget)`；
+  与 `dump_all` 拼接等价、空状态零页、每页前进且只允许最后一条越过预算。
+  P4c 的写端流式化依赖它（见 §8）。
 - **snapshot 文件的双写**：当前 HTTP 传输 + install 各落一份（P3 已用 rename→copy 折中）。P4 可让
   server 直接把流写进 `snapshots/<canonical>`，install 只做「认领 + 校验」，彻底去掉一份写。
   这会影响 `restore-in-progress` 标记里的 payload 指向（见该设计 §6）。
@@ -143,3 +144,15 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
   （P4-A 的 fail-stop 语义不变）。
 - **尚未做（P4c）**：写端仍整份 `dump_all()` → `Vec`（`restore_stream` 只解决读端）；`dump_all`
   分页属 P4c0。
+
+## 10. 实现落地（P4c0：只读分页 dump）
+
+- `Store::get_prefix_page(prefix, after, budget)`：默认实现基于 `get_prefix`（内存后端），
+  redb 覆盖为 `range(after..)` 分页扫描（只读、无整份物化）；`after` 独占、前缀边界即停、
+  至少前进一条。
+- `StateMachine::dump_batches(budget)`：与 `dump_all` 同序同内容的**分页**版本；空状态零页；
+  游标 = 上一页最后一条 key（严格递增）。前置假设与 `dump_all` 相同（持有读锁 → 无 pending_ops）。
+- 测试：拼接 == `dump_all`（4 档预算）、空状态零页、每页前进/预算、redb 分页 == 整份扫描
+  （跨前缀边界 + 游标严格递增）。
+- 尚未做（P4c）：`build_snapshot` 仍 `dump_all()` 整份 + 整份编码；P4c 改为
+  「dump_batches → 逐批 encode → seek-back 写 header(含 total_len/crc)」。

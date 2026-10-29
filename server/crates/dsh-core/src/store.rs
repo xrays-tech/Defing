@@ -27,6 +27,39 @@ pub trait Store: Send + Sync {
             .map(|(k, _)| k)
             .collect())
     }
+    /// 前缀分页扫描（P4c0：快照写端分页 dump 用）。
+    ///
+    /// 从 `after`（**不含**；`None` = 从 prefix 起点）开始，按 key 字典序最多累计 `budget`
+    /// 字节的 (k, v)。返回空 = 已到末尾。至少前进一条（单条超预算时单独返回），调用方靠
+    /// 「append 最后一条 key 作为下一次 after」推进，不会死循环。
+    ///
+    /// 默认实现基于 `get_prefix`（内存后端够用）；redb 覆盖为 `range(after..)` 扫描，
+    /// 不再每次物化整份前缀。
+    fn get_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> Result<KeyValuePairs, Error> {
+        let mut out = KeyValuePairs::new();
+        let mut bytes = 0usize;
+        let mut started = after.is_none();
+        for (k, v) in self.get_prefix(prefix)? {
+            if !started {
+                match after {
+                    Some(a) if k.as_slice() <= a => continue,
+                    _ => started = true,
+                }
+            }
+            bytes += k.len() + v.len();
+            out.push((k, v));
+            if bytes >= budget.max(1) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// 批量写（单次事务提交语义）。
     fn put_batch(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error>;
     /// 批量写 + 批量删（单事务，原子提交；redb 一次 fsync；内存实现先删后插）。

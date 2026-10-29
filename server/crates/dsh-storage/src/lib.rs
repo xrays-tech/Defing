@@ -228,6 +228,46 @@ impl Store for RedbStorage {
         Ok(rows)
     }
 
+    /// P4c0：前缀分页扫描（range(after..) 起扫，不再每次物化整份前缀）。
+    fn get_prefix_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| redb_error("begin read", e))?;
+        let table = txn
+            .open_table(TBL_STATE)
+            .map_err(|e| redb_error("open state table", e))?;
+        // `after` 是上一次返回的最后一条 key（不含）；None 时从 prefix 起点。
+        let start: &[u8] = after.unwrap_or(prefix);
+        let mut rows = Vec::new();
+        let mut bytes = 0usize;
+        let iter = table
+            .range::<&[u8]>(start..)
+            .map_err(|e| redb_error("prefix page range", e))?;
+        let budget = budget.max(1);
+        for entry in iter {
+            let (key, value) = entry.map_err(|e| redb_error("prefix page scan", e))?;
+            let k = key.value();
+            if !k.starts_with(prefix) {
+                break;
+            }
+            if after.is_some_and(|a| k <= a) {
+                continue; // range 含起点；跳过 after 自身
+            }
+            bytes += k.len() + value.value().len();
+            rows.push((k.to_vec(), value.value().to_vec()));
+            if bytes >= budget {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
     fn put_batch(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error> {
         let txn = self
             .db
@@ -431,6 +471,41 @@ mod tests {
         assert_eq!(store.get_prefix(b"").unwrap().len(), 4);
         // 空批不报错
         store.write_batch(&[], &[]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P4c0：分页扫描（redb range 覆盖）与整份前缀扫描同序同内容，`after` 独占、前缀边界正确。
+    #[test]
+    fn get_prefix_page_matches_full_scan_with_cursor() {
+        let dir = tmpdir("prefix-page");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RedbStorage::open(&dir.display().to_string()).unwrap();
+        // 跨前缀边界：p/ 前缀之外还有 q/ 与 z/，分页必须在 prefix 边界停下。
+        for k in ["p/a", "p/b", "p/c", "p/d", "p/e", "q/x", "z/y"] {
+            store.put(k.as_bytes(), b"v").unwrap();
+        }
+        let all = store.get_prefix(b"p/").unwrap();
+        assert_eq!(all.len(), 5);
+
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut flat: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        loop {
+            let page = store
+                .get_prefix_page(b"p/", cursor.as_deref(), 2 * 3)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.iter().all(|(k, _)| k.starts_with(b"p/")));
+            assert!(cursor
+                .as_deref()
+                .map(|c| page[0].0.as_slice() > c)
+                .unwrap_or(true));
+            cursor = page.last().map(|(k, _)| k.clone());
+            flat.extend(page);
+            assert!(flat.len() <= 5, "分页不得重复/越过前缀");
+        }
+        assert_eq!(flat, all, "分页拼接必须等于整份前缀扫描");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
