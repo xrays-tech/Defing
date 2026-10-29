@@ -1635,7 +1635,12 @@ impl StateMachineStore {
         }
         let reason = why.to_string();
         if let Err(e) = meta_put(&self.db, META_POISON, reason.as_bytes()) {
-            tracing::warn!("persist poison flag failed: {e}");
+            // 持久化失败 = 重启后不再 fail-stop（混合状态可能被当成可服务状态）。双故障
+            // （如 kill-switch 关了 marker + 这里写失败）时没有任何自动兜底 → 大声喊出来。
+            tracing::error!(
+                "durable poison flag NOT persisted ({e}); a restart may serve the mixed state. \
+                 Fix the disk / clear the data volume before restarting."
+            );
         }
     }
 
@@ -4841,6 +4846,39 @@ mod p5_registry_race_tests {
             .expect("registry");
         assert_eq!(reg_meta.last_log_id, snap_meta(7).last_log_id);
         assert_eq!(reg_file, built.snapshot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod p5_poison_edge_tests {
+    use super::tests::{open_storage, snap_meta, tmpdir};
+    use super::*;
+
+    /// P5（复核遗留）：poisoned + registry 里**有**快照时，`get_current_snapshot` 仍返回
+    /// `Ok(None)`（不能返回持久化快照——那会把混合状态当作可服务快照发给 follower）。
+    #[tokio::test]
+    async fn poisoned_store_with_registry_snapshot_returns_none() {
+        let dir = tmpdir("p5-poison-registry");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let meta = snap_meta(3);
+        let payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap(),
+        )
+        .unwrap();
+        persist_snapshot_registry(&db, &meta, payload).unwrap();
+        let mut store = StateMachineStore::new(sm, db, dir.clone());
+        store.poison("test: mixed state with registry snapshot");
+
+        assert!(
+            store.get_current_snapshot().await.unwrap().is_none(),
+            "poisoned 时既有 registry 快照也不能对外提供"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
