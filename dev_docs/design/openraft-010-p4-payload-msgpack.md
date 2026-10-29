@@ -1,6 +1,6 @@
 # P4 设计：快照 payload 的二进制化与流式恢复（msgpack）
 
-状态：草案（待 gate）。前置：P3 实测 release+btrfs、269MB 快照 install 端到端 1.78s、
+状态：APPROVE WITH CHANGES（gate attempt 2）。基线以 `P4base` 为准：358.2MB / episode 3.611s（末次 2.474s）/ net 1.00x、raw 1.31x。P3 实测 release+btrfs 历史：269MB 快照 install 端到端 1.78s、
 峰值 RSS 1.37x；payload 仍是 `serde_json` 的 `Vec<(Vec<u8>, Vec<u8>)>`。
 
 ## 1. 现状与代价
@@ -14,7 +14,7 @@
 ## 2. 目标（按收益排序）
 
 1. **有界内存恢复**：不再一次性 materialize 全部 `(k,v)`；按 64MiB 批次「解析一批 → 恢复一批」，
-   峰值 RSS 目标 ≤ 0.5x payload + redb 脏页。
+   峰值 RSS 目标：**net ≤ 1.2x payload**（P4base 基线 net 1.00x；旧「≤0.5x」不可达，作废）。
 2. **更小的 payload**：msgpack（binary）替代 JSON 文本；同类数据的经验值：体积 −30~40%、解析快 2–3x。
 3. **格式可演进**：带 magic + version，读端接受 v1(JSON) / v2(msgpack)，写端默认 v2；
    不做 0.9/0.10 混跑，但同一节点升级要能读旧文件。
@@ -60,11 +60,11 @@ VERSION 2: BODY = msgpack：数组 header(n) + 逐项 [bin(k), bin(v)]
 
 | 指标 | 现状（P3） | P4 目标 |
 |---|---|---|
-| payload 体积（同数据集） | 269MB（JSON） | ≤ 200MB（msgpack） |
-| install 端到端（269MB 档） | 1.78s | ≤ 1.78s（不退化） |
-| 峰值 RSS | 1.37x payload | ≤ 0.7x payload |
+| payload 体积（同数据集） | 384.2MB（JSON，P3m） | ≤ 280MB（msgpack，目标 −25%） |
+| install episode（358MB 档） | 3.611s（P4base） | ≤ 3.7s（不退化） |
+| 峰值 RSS | net 1.00x（P4base） | net ≤ 1.2x（有界化） |
 | 旧 v1 文件可读 | — | 必须（升级路径） |
-| 流式恢复多批边界 | 已测（64MiB 单测） | 保留并通过 |
+| 流式恢复多批边界 | 现有测试只注入 1/4 字节 chunk（无 64MiB 多批） | P4b 新增 ≥3 批流式测试 |
 
 功能回归：voter/learner 快照 e2e、`snapshot_persist`、`snapshot_sweep`、storm 断言与 P3 相同。
 

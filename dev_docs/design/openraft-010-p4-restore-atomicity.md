@@ -1,6 +1,6 @@
 # P4 设计：快照安装的崩溃原子性（restore-in-progress）
 
-状态：草案（待 gate）。前置：P3 已闭合 install 预算（269MB/1.78s、RSS 1.37x），
+状态：APPROVE WITH CHANGES（gate attempt 2）。基线以 `P4base` 为准：358.2MB / episode 3.611s（末次 2.474s）/ net 1.00x、raw 1.31x。
 但 `restore_all` 是**分块提交**的，崩溃点上是部分恢复。本文给出可施工方案与验收口径。
 
 ## 1. 问题（复核 major，P3 gate 明确要求 P4 处理）
@@ -77,13 +77,13 @@
 
 ## 5. 验收（P4 gate 用）
 
-1. **单测（必然覆盖）**：模拟「chunk 2 之后 abort」→ 重开 store → 自动重放 → 状态 == payload、
+1. **单测（必然覆盖）**：模拟「chunk 2 之后 abort」→ 走 dsh-cli 侧的 `recover_interrupted_restore()`（fallible）→ 重放 → 状态 == payload、
    `last_applied`/registry 一致、标记已清。
 2. **单测**：panic/abort 在 4（last_applied 已写）与 5 之间 → boot 重放后一致（幂等）。
 3. **单测**：BEGIN 标记存在但 payload 文件被删 → 启动返回明确错误（不静默继续）。
-4. **单测**：`DSH_RAFT_RESTORE_MARKER=0` 时行为与 P3 相同（不写标记、boot 不重放）。
+4. **单测**：`DSH_RAFT_RESTORE_MARKER=0` 只关闭「写标记」；**存在 marker 时仍必须重放**（忽略需显式 `DSH_RAFT_RESTORE_FORCE=1` 并大声 WARN）——见 §7 A2。
 5. **e2e（复用 `voter_catches_up_via_http_snapshot_after_being_down`）**：正常路径 marker 不残留。
-6. **storm 回归**：install 预算与 RSS 不得回退（269MB ≤ 1.8s、RSS ≤ 1.5x 作为回归线）。
+6. **storm 回归**：以 `P4base` 为回归线（episode ≤ 30s 预算；net ≤ 1.2x、raw ≤ 1.5x）。
 
 ## 6. 风险与未决
 
