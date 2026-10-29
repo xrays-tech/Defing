@@ -2780,7 +2780,7 @@ mod p4a_tests {
         let storage = open_storage(&dir);
         let db = storage.raw_db();
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
-        let mut store = StateMachineStore::new(sm, db.clone(), dir.clone());
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
         store.set_restore_marker(false);
         store.set_fail_last_applied(1);
 
@@ -2796,6 +2796,21 @@ mod p4a_tests {
             meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
             "关闭后不得写 marker"
         );
+
+        // A2 的另一半：开关只关「写」，**已存在**的 marker 仍必须重放——recover 不接
+        // store 句柄、也不读该开关，这里手工放一个 marker 验证它照样被重放。
+        let meta2 = snap_meta(16);
+        let pairs2 = pairs_of(&[("from", "marker")]);
+        let payload2 =
+            write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta2, &json_payload(&pairs2)).unwrap();
+        write_marker(&db, &meta2, &payload2);
+        let out = recover_interrupted_restore_with(&sm, &db, dir.clone(), false).unwrap();
+        assert_eq!(
+            out.expect("已有 marker 必须重放").last_log_id,
+            meta2.last_log_id
+        );
+        assert_eq!(state_pairs(&sm), pairs2);
+        assert!(meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
