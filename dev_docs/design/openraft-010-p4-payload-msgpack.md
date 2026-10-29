@@ -235,4 +235,8 @@ redb 尺寸或 msgpack payload 近似），不再用 v1-JSON payload 当分母�
 - **写端**：in-process RSS 探针受 allocator 保留影响，不能稳定区分「整份驻留」与「页缓冲」，
   故不作为断言；改为**结构性测试**（计数 Store）：v2 build 期间整前缀**取值**扫描 0 次、
   分页扫描 ≥1 次；v1 对照 ≥1 次（`v2_build_never_scans_whole_prefix`）。
-- 最终 12k gate 结果见 `evidence/p4-gate-final.log`。
+- **最终 12k v2 gate（c1d3041 干净树，`evidence/p4-gate-final.log`）**：`ok:true`、exit=0；
+  快照 91.2MB、install **0.911s**（attempts=1）、catch-up 4.60s；窗口 RSS 327,748KiB、
+  VmHWM 342,592KiB、基线 119,340KiB → **delta 228.6MB ≤ 320MiB**（观测：payload 2.51x、
+  db_file 0.48x）；5/5 kill 验证 + 5/5 换人、8 项目逐项相等、0 无法解释选举、churn 落在 episode、
+  心跳 228ms、provenance 干净（rev c1d3041 / 干净树 / bin>src）。
