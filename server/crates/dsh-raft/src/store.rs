@@ -2066,6 +2066,13 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // 快照点——与已 purge 的日志冲突（openraft 拒绝启动）或对已应用条目重复 apply。
         // 这里 fail-stop 并返回 Err：openraft 会重试安装，下一次成功安装会重写 marker 并在尾部
         // 清理，poison 也随之解除。
+        // 先清 durable poison，再清 marker：两步都失败即 fail-stop（marker 仍在 → boot 重放）。
+        // 顺序很重要：若先删 marker、再删 poison 失败，重启后会「无 marker 但 poison」→ 只能等
+        // leader 重发快照（可用性下降）；反过来失败时 marker 仍在，重放即可恢复。
+        if let Err(e) = meta_del(&self.db, META_POISON) {
+            self.poison(format!("clear durable poison flag failed: {e}"));
+            return Err(io_write(format!("clear durable poison flag: {e}")));
+        }
         let cleared = if self.fail_clear_marker.load(Ordering::Relaxed) {
             self.fail_clear_marker.store(false, Ordering::Relaxed);
             Err(io_write("injected restore-marker clear failure"))
@@ -2082,12 +2089,9 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             ));
             return Err(e);
         }
-        // 一次完整成功的 install 已经把状态机整体替换成 payload 内容 → 解除 fail-stop
-        // （进程内 + 持久化标记）。
+        // 一次完整成功的 install 已经把状态机整体替换成 payload 内容 → 解除进程内 fail-stop
+        // （持久化标记已在上面清除）。
         self.poisoned.store(false, Ordering::SeqCst);
-        if let Err(e) = meta_del(&self.db, META_POISON) {
-            tracing::warn!("clear durable poison flag failed: {e}");
-        }
         *self.current_snapshot.lock().await = Some((meta.clone(), path));
         Ok(())
     }
@@ -2245,11 +2249,10 @@ pub fn recover_interrupted_restore_with(
     if old.as_deref() != Some(marker.payload.as_path()) {
         delete_old_snapshot_file(old);
     }
+    // 先清 durable poison 再清 marker（理由同 install）：任何一步失败都 Err 并保留 marker，
+    // 下次 boot 重放仍是安全路径。
+    meta_del(db, META_POISON)?;
     meta_del(db, META_RESTORE_BEGIN)?;
-    // 重放成功 = 状态机已与 payload 一致 → 解除持久化 fail-stop（如果之前 FORCE 过）。
-    if let Err(e) = meta_del(db, META_POISON) {
-        tracing::warn!("clear durable poison flag after boot replay failed: {e}");
-    }
     store.poisoned.store(false, Ordering::SeqCst);
     tracing::warn!(
         "restore replayed on boot: last_log_id={:?} payload={} (streamed) elapsed={:?}",
@@ -4555,6 +4558,79 @@ mod p4_scale_tests {
             count,
             "恢复后的 key 数必须等于 payload 条数"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod p4a_initial_snapshot_tests {
+    use super::tests::{open_storage, snap_meta, tmpdir};
+    use super::*;
+
+    fn pairs_of(items: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn meta_none() -> SnapshotMetaOf<TypeConfig> {
+        SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+        }
+    }
+
+    /// attempt-3 复核要求的测试：**初始快照**（`last_log_id: None`）必须清除 last_applied，
+    /// 否则会留下「新状态 + 旧 last_applied」。覆盖 install 与 boot 重放两条路径。
+    #[tokio::test]
+    async fn initial_snapshot_clears_last_applied_on_install_and_replay() {
+        let dir = tmpdir("p4a-initial-snap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+        let meta = meta_none();
+        let pairs = pairs_of(&[("init", "1")]);
+
+        // 1) 先造出「旧 last_applied + 旧状态」，再装初始快照
+        let old_applied = snap_meta(7).last_log_id.unwrap();
+        put_last_applied(&db, &old_applied).unwrap();
+        let payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &serde_json::to_vec(&pairs).unwrap(),
+        )
+        .unwrap();
+        store.install_snapshot(&meta, payload).await.unwrap();
+        assert!(
+            meta_get(&db, META_LAST_APPLIED).unwrap().is_none(),
+            "初始快照必须清除 last_applied，否则会留下「新状态 + 旧 last_applied」"
+        );
+        assert_eq!(sm.read().unwrap().dump_all().unwrap(), pairs);
+
+        // 2) boot 重放路径：同样必须清 last_applied
+        put_last_applied(&db, &snap_meta(9).last_log_id.unwrap()).unwrap();
+        let payload2 = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &serde_json::to_vec(&pairs).unwrap(),
+        )
+        .unwrap();
+        let marker = RestoreBegin {
+            meta: meta.clone(),
+            payload: payload2,
+        };
+        meta_put(&db, META_RESTORE_BEGIN, &ser(&marker).unwrap()).unwrap();
+        let out = recover_interrupted_restore_with(&store, false).unwrap();
+        assert!(out.is_some());
+        assert!(
+            meta_get(&db, META_LAST_APPLIED).unwrap().is_none(),
+            "初始快照的 boot 重放也必须清除 last_applied"
+        );
+        assert_eq!(sm.read().unwrap().dump_all().unwrap(), pairs);
+        assert!(meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
