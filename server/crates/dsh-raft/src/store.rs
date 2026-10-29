@@ -493,12 +493,26 @@ fn meta_put(db: &DbHandle, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
 }
 
 /// 共享的日志读取逻辑（LogReader 与 LogStore 复用）：[start, end] 闭区间。
+/// 当前 last_purged 的 index（兼容完整 LogId 与旧 index-only 格式）—— 空洞检测的期望起点。
+fn last_purged_index(db: &DbHandle) -> Result<Option<u64>, ErrOf> {
+    match meta_get(db, META_LAST_PURGED)? {
+        None => Ok(None),
+        Some(raw) => match de::<LogIdOf>(&raw) {
+            Ok(id) => Ok(Some(id.index)),
+            Err(_) => Ok(Some(de::<u64>(&raw)?)),
+        },
+    }
+}
+
+
 fn read_entries(db: &DbHandle, start: u64, end: u64) -> Result<Vec<EntryOf>, ErrOf> {
     let txn = db.begin_read().map_err(io_read)?;
     let table = txn.open_table(TBL_RAFT_LOG).map_err(io_read)?;
     let start_key = log_key(start);
     let mut out: Vec<EntryOf> = Vec::new();
-    let mut expected: Option<u64> = None;
+    // 期望的首个 index：purged 前缀之后的第一个（调用方 start 可能落在已 purge 区间）。
+    let first_expected = last_purged_index(db)?.map(|p| p + 1).unwrap_or(start).max(start);
+    let mut expected: Option<u64> = Some(first_expected);
     for row in table.range(start_key.as_slice()..).map_err(io_read)? {
         let (k, v) = row.map_err(io_read)?;
         let idx = log_index_from_key(k.value());
@@ -506,7 +520,6 @@ fn read_entries(db: &DbHandle, start: u64, end: u64) -> Result<Vec<EntryOf>, Err
             break;
         }
         // P3f：openraft 契约要求中间空洞报错（只有 purge 造成的前缀缺失可容忍）。
-        // 旧实现静默跳过空洞，leader 会以为拿到的是从 start 起的连续前缀。
         if let Some(exp) = expected {
             if idx != exp {
                 return Err(io_read(format!(
@@ -536,7 +549,8 @@ fn read_entries_limited(
     let start_key = log_key(start);
     let mut out: Vec<EntryOf> = Vec::new();
     let mut acc = 0u64;
-    let mut expected: Option<u64> = None;
+    let first_expected = last_purged_index(db)?.map(|p| p + 1).unwrap_or(start).max(start);
+    let mut expected: Option<u64> = Some(first_expected);
     for row in table.range(start_key.as_slice()..).map_err(io_read)? {
         let (k, v) = row.map_err(io_read)?;
         let idx = log_index_from_key(k.value());
@@ -2050,6 +2064,33 @@ mod tests {
             "中间空洞必须报错，实际返回 {:?}",
             got.map(|v| v.len())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 复核 minor 回归：空洞检测必须把「purged 前缀」算进期望起点。
+    /// 调用方从已 purge 的 index 开始读是合法的；但 purged 之后一旦缺 index 就必须报错。
+    #[tokio::test]
+    async fn hole_detection_accounts_for_purged_prefix() {
+        let dir = tmpdir("hole-purged");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let mut store = LogStore::new(db.clone());
+        store.blocking_append((1..=5).map(blank)).await.unwrap();
+        store.purge(truncate_at(2)).await.unwrap();
+        // 从 1 开始读（1、2 已 purge）→ 合法，返回 3、4、5
+        assert_eq!(indexes_of(&mut store, 1..=5).await, vec![3, 4, 5]);
+        // 人为删掉 4 → 3 之后的空洞必须报错（不能因起点 1 != 3 而误报/漏报）
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(TBL_RAFT_LOG).unwrap();
+                t.remove(log_key(4).as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let r = store.try_get_log_entries(1..=5).await;
+        assert!(r.is_err(), "purged 前缀之后的空洞必须报错，实际 {:?}", r.map(|v| v.len()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

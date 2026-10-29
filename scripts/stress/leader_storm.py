@@ -232,7 +232,8 @@ GLOBAL = {}
 
 
 def repo_root(_bin_path=None):
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # scripts/stress/leader_storm.py → 仓库根（三层）
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def git_status(_bin_path=None):
