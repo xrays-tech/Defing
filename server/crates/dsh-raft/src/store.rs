@@ -682,16 +682,30 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     type LogReader = LogReader;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, ErrOf> {
-        let last_purged = meta_get(&self.db, META_LAST_PURGED)?
-            .map(|raw| de::<u64>(&raw))
-            .transpose()?
-            .map(|idx| LogId {
-                leader_id: LeaderId {
-                    term: 0,
-                    node_id: NodeId::MAX,
-                },
-                index: idx,
-            });
+        let last_applied: Option<LogIdOf> = meta_get(&self.db, META_LAST_APPLIED)?
+            .map(|raw| de(&raw))
+            .transpose()?;
+        let last_purged: Option<LogIdOf> = match meta_get(&self.db, META_LAST_PURGED)? {
+            None => None,
+            Some(raw) => match de::<LogIdOf>(&raw) {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    // 兼容旧格式（只存 index）：同 index 时直接用 last_applied 的 LogId，
+                    // 保证「日志清空 + purge 到 last_applied」这一生产状态在 0.10 下可启动。
+                    let idx = de::<u64>(&raw)?;
+                    match last_applied {
+                        Some(a) if a.index == idx => Some(a),
+                        _ => Some(LogId {
+                            leader_id: LeaderId {
+                                term: 0,
+                                node_id: NodeId::MAX,
+                            },
+                            index: idx,
+                        }),
+                    }
+                }
+            },
+        };
         let last_log = last_log_entry(&self.db)?.map(|e| e.log_id);
         Ok(LogState {
             // 0.10 契约（`storage/log_state.rs`）：日志为空时 `last_log_id` 必须等于
@@ -759,8 +773,12 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         remove_log_indexes(&txn, indexes)?;
         // 日志清理与 last_purged 同一事务原子提交（redb 多表事务原生支持）
         let mut meta_table = txn.open_table(TBL_RAFT_META).map_err(io_write)?;
+        // 存**完整 LogId**（旧格式只存 index）：openraft 的 get_initial_state 除了
+        // last_log_id >= last_purged_log_id，还比较 last_log_id 与 last_applied 的 LogId 顺序；
+        // 只存 index 会合成 T0-NMAX.N，与 install 写入的 last_applied=T4-N5.N 同 index 但更小
+        // → 仍判 "inverted log order"，快照追平后的节点重启起不来。
         meta_table
-            .insert(META_LAST_PURGED, ser(&log_id.index)?.as_slice())
+            .insert(META_LAST_PURGED, ser(&log_id)?.as_slice())
             .map_err(io_write)?;
         drop(meta_table); // 表句柄先于 commit 释放（commit 消费事务）
         txn.commit().map_err(io_write)
@@ -1381,6 +1399,15 @@ mod tests {
 
         // last_purged=3；日志仅剩 4、5
         assert_eq!(log_state_of(&mut store).await, (Some(3), Some(5)));
+        // 落盘格式必须是**完整 LogId**（term/node 不能丢）：只存 index 时，快照追平后的
+        // 空日志状态会合成 T0-NMAX.N，与 last_applied 同 index 但更小 → 0.10 判 inverted。
+        let raw = meta_get(&storage.raw_db(), META_LAST_PURGED)
+            .unwrap()
+            .expect("last_purged persisted");
+        let stored: LogIdOf = de(&raw).expect("last_purged 必须是完整 LogId 格式");
+        assert_eq!(stored.index, 3);
+        assert_eq!(stored.leader_id.term, 1, "term 必须保留（index-only 会丢成 0）");
+        assert_eq!(stored.leader_id.node_id, 1, "node_id 必须保留");
         assert_eq!(indexes_of(&mut store, 1..=u64::MAX).await, vec![4, 5]);
 
         // 重复 purge（空 range）幂等
@@ -1408,6 +1435,10 @@ mod tests {
                 .blocking_append([blank(1), blank(2), blank(3)])
                 .await
                 .unwrap();
+            // 生产状态是「install 设了 last_applied → openraft purge 到快照 index → 日志清空」。
+            // 复核 blocker：只断言 purge 而不设 last_applied 测不到 openraft 的第二个 inverted 检查
+            // （last_log_id 与 last_applied 的 LogId 顺序）。
+            meta_put(&store.db, META_LAST_APPLIED, &ser(&truncate_at(3)).unwrap()).unwrap();
             store.purge(truncate_at(3)).await.unwrap();
             assert!(indexes_of(&mut store, 1..=u64::MAX).await.is_empty());
             // 契约：日志空 + purged=3 ⇒ last_log_id 必须回落成 3
@@ -1760,6 +1791,57 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// 架构复核 blocker 的兼容面：旧数据目录里 `last_purged` 只存了 index（无 leader_id）。
+    /// 同 index 且已有 `last_applied` 时必须归一成 last_applied 的 LogId，否则 0.10 仍判
+    /// inverted（综合成 T0-NMAX.N < Tx-Ny.N）→ 节点重启起不来。
+    #[tokio::test]
+    async fn legacy_index_only_purged_normalizes_to_last_applied_and_boots() {
+        let dir = tmpdir("legacy-purged");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let storage = open_storage(&dir);
+            let db = storage.raw_db();
+            let mut store = LogStore::new(db.clone());
+            store
+                .blocking_append([blank(1), blank(2), blank(3)])
+                .await
+                .unwrap();
+            meta_put(&db, META_LAST_APPLIED, &ser(&truncate_at(3)).unwrap()).unwrap();
+            // 手工写回「旧格式：只有 index」
+            meta_put(&db, META_LAST_PURGED, &ser(&3u64).unwrap()).unwrap();
+            // 清空日志（模拟 purge 后的空日志）
+            store.purge(truncate_at(3)).await.unwrap();
+            // 再写回旧格式（purge 现在会写完整 LogId）
+            meta_put(&db, META_LAST_PURGED, &ser(&3u64).unwrap()).unwrap();
+        }
+
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let mut store = LogStore::new(db.clone());
+        let st = store.get_log_state().await.unwrap();
+        let purged = st.last_purged_log_id.expect("purged");
+        let applied: LogIdOf = meta_get(&db, META_LAST_APPLIED)
+            .unwrap()
+            .map(|raw| de(&raw).unwrap())
+            .expect("last_applied");
+        assert_eq!(purged, applied, "旧格式同 index 必须归一成 last_applied 的 LogId");
+        assert_eq!(st.last_log_id, Some(applied), "空日志回落值必须与 last_applied 同序");
+
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
+        let sm_store = Arc::new(StateMachineStore::new(sm, db.clone(), dir.clone()));
+        let net = crate::NetworkFactory::new();
+        let info = crate::NodeInfo {
+            grpc_addr: "127.0.0.1:0".into(),
+            http_addr: "http://127.0.0.1:0".into(),
+            raft_addr: "127.0.0.1:0".into(),
+        };
+        let raft = crate::new_raft_node(1, info, LogStore::new(db), sm_store, &net, crate::dev_config())
+            .await
+            .expect("旧格式 purged + 空日志必须能在 0.10 上启动");
+        let _ = raft.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// P3d 回归（架构复核 blocker）：输入路径本身就是 registry 登记的 payload

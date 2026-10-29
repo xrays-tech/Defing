@@ -40,7 +40,7 @@ import time
 import uuid
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 # module-level shared state (set in main(); helpers reference one instance)
@@ -228,6 +228,38 @@ def members(base, token=None):
     return None
 
 
+GLOBAL = {}
+
+
+def repo_root(_bin_path=None):
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def git_status(_bin_path=None):
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", repo_root(), "status", "--porcelain"],
+            stderr=subprocess.DEVNULL, timeout=5,
+        )
+        return out.decode().strip()
+    except Exception:
+        return None
+
+
+def source_newest_mtime(root):
+    newest = 0.0
+    base = os.path.join(root, "server")
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in ("target", ".git")]
+        for fn in filenames:
+            if fn.endswith(".rs") or fn == "Cargo.toml":
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(dirpath, fn)))
+                except OSError:
+                    pass
+    return newest
+
+
 def git_rev(bin_path):
     """worktree 的 git HEAD（能定位到被测源码版本）。"""
     try:
@@ -320,63 +352,11 @@ def latest_snapshot_bytes(node):
     return max(sizes) if sizes else None
 
 
-def install_windows(node):
-    """从 victim 日志解析 full-snapshot 窗口：transfer → install → done。
-
-    - `full-snapshot transfer start`：本仓库在收到 Header frame 时打印（含传输起点）；
-    - `install full snapshot,`：openraft 在整份 payload 收完后打印（install 起点）；
-    - `Done install complete snapshot`：状态机应用完成（窗口终点）。
-
-    为什么必须从 transfer 起算：openraft 的 install 标记在**传输结束之后**才出现，只测
-    install→done 会漏掉传输段——而 0.9 的失败模式（`Inflight::Snapshot` 抑制心跳导致选举）
-    正是发生在传输段。返回按时间排序的完整窗口列表（meta 相同的一对才算一个窗口）。
-    """
-    try:
-        with open(node.log_path, "r", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return []
-    windows = []
-    cur = None
-    for ln in lines:
-        low = ln.lower()
-        ts = _line_ts(ln)
-        if ts is None:
-            continue
-        if "full-snapshot transfer start" in low:
-            if cur is not None and cur.get("done") is not None:
-                windows.append(cur)
-            cur = {"transfer": ts, "install": None, "done": None}
-        elif cur is not None and cur.get("install") is None and "install full snapshot," in low:
-            cur["install"] = ts
-        elif cur is not None and cur.get("done") is None and "done install complete snapshot" in low:
-            cur["done"] = ts
-            windows.append(cur)
-            cur = None
-    return windows
-
-
-def install_window_stats(node):
-    """install 窗口统计：端到端（transfer→done）、传输段、apply 段。"""
-    ws = [w for w in install_windows(node) if w.get("done") is not None]
-    if not ws:
-        return {"windows": 0, "end_to_end_seconds": None,
-                "transfer_seconds": None, "apply_seconds": None}
-    w = ws[-1]
-    transfer = (w["install"] - w["transfer"]).total_seconds() if w.get("install") else None
-    apply_s = (w["done"] - w["install"]).total_seconds() if w.get("install") else None
-    return {
-        "windows": len(ws),
-        "end_to_end_seconds": round((w["done"] - w["transfer"]).total_seconds(), 3),
-        "transfer_seconds": round(transfer, 3) if transfer is not None else None,
-        "apply_seconds": round(apply_s, 3) if apply_s is not None else None,
-    }
-
-
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
 
 
 def _line_ts(line):
+    """从 tracing 日志行首解析 RFC3339 时间戳。"""
     m = _TS_RE.match(line)
     if not m:
         return None
@@ -386,74 +366,150 @@ def _line_ts(line):
         return None
 
 
-def election_attribution(log_path, offset):
-    """把 victim 重启后的选举按 **full-snapshot 窗口** 归属（transfer → done）。
+def snapshot_bytes_mtime(node):
+    """最新快照文件的 mtime（epoch 秒）——用于确认它属于本轮追赶，而不是历史残留。"""
+    try:
+        snap_dir = os.path.join(node.data_dir, "snapshots")
+        snaps = [
+            os.path.getmtime(os.path.join(snap_dir, f))
+            for f in os.listdir(snap_dir)
+            if f.endswith(".snap")
+        ]
+    except OSError:
+        return None
+    return max(snaps) if snaps else None
+
+
+def snapshot_episode(node, offset=0):
+    """解析 victim 日志，返回「快照追赶 episode」——**第一次 transfer 到最终 done，含 retry**。
+
+    为什么必须含 retry：churn 打断传输后 harness 会重试，openraft 只在最后一次 install 完成时
+    打印 `Done install complete snapshot`。只取「最后一个完整窗口」会把被打断的那次（以及发生在
+    其中的选举）整段丢掉 —— 复核 blocker 正是靠这个把真实 campaign 藏起来。
 
     返回 dict：
-      - `since_restart`：重启后全部选举/预投票次数（诊断，不判失败）
-      - `during`：落在窗口内的次数（判失败：0.10 独立心跳必须让 follower 在传输+安装期间保持 follower）
-      - `pre_votes`：窗口内的预投票次数（enable_pre_vote=true 时 victim 可能只 pre-vote，
-        旧实现只认 "trigger election" 会漏掉这类）
-      - `windows`：窗口数；`unclosed`：未闭合窗口数（安装被打断，保守把尾巴算进窗口）
-
-    窗口 = `full-snapshot transfer start` → `Done install complete snapshot`，即传输 + install +
-    状态机 apply 全程。openraft 自身的 `install full snapshot` 标记在传输结束之后才出现，
-    只用它会漏掉 0.9 那种「传输期间心跳被抑制」的失败模式。
+      transfer_ts / done_ts   episode 起止（datetime），缺任一则 None
+      attempts                transfer 出现次数（>=2 表示有 retry）
+      install_ts              最后一次 install 标记时间
+      episode_seconds         端到端（transfer→done，含 transfer+install+apply+retry 间隔）
+      last_attempt_seconds    最后一次完整窗口（transfer→done）
     """
     try:
-        with open(log_path, "rb") as f:
-            f.seek(offset)
-            blob = f.read().decode("utf-8", "replace")
+        with open(node.log_path, "r", errors="replace") as f:
+            if offset:
+                f.seek(offset)
+            lines = f.readlines()
     except OSError:
-        return {"since_restart": 0, "during": 0, "pre_votes": 0, "windows": 0, "unclosed": 0}
-    lines = blob.splitlines()
-    windows = []
-    cur = None
-    last_ts = None
-    for line in lines:
-        low = line.lower()
-        ts = _line_ts(line)
-        if ts is not None:
-            last_ts = ts
-        if "full-snapshot transfer start" in low:
-            if cur is not None and cur.get("done") is not None:
-                windows.append(cur)
-            cur = {"start": ts or last_ts, "done": None}
-        elif cur is not None and cur.get("done") is None and "done install complete snapshot" in low:
-            cur["done"] = ts or last_ts
-            windows.append(cur)
-            cur = None
-    unclosed = 0
-    if cur is not None:
-        unclosed = 1
-        if last_ts is not None and cur.get("start") is not None and last_ts >= cur["start"]:
-            windows.append({"start": cur["start"], "done": last_ts})
-
-    total = 0
-    during = 0
-    pre_votes = 0
-    for line in lines:
-        low = line.lower()
-        ts = _line_ts(line)
-        hit = any(tok in low for tok in ELECTION_MARKERS)
-        if not hit:
+        return {"transfer_ts": None, "done_ts": None, "attempts": 0, "install_ts": None,
+                "episode_seconds": None, "last_attempt_seconds": None}
+    first_transfer = None
+    last_done = None
+    last_install = None
+    last_attempt_start = None
+    attempts = 0
+    for ln in lines:
+        low = ln.lower()
+        ts = _line_ts(ln)
+        if ts is None:
             continue
-        total += 1
-        is_pre_vote = "pre-vote" in low or "pre_vote" in low
-        in_window = any(
-            w["done"] is not None and w["start"] is not None and w["start"] <= ts <= w["done"]
-            for w in windows
-        ) if ts is not None else False
-        if in_window:
-            during += 1
-            if is_pre_vote:
-                pre_votes += 1
+        if "full-snapshot transfer start" in low:
+            attempts += 1
+            if first_transfer is None:
+                first_transfer = ts
+            last_attempt_start = ts
+        elif "install full snapshot," in low:
+            last_install = ts
+        elif "done install complete snapshot" in low and last_attempt_start is not None:
+            last_done = ts
+    if first_transfer is None or last_done is None:
+        return {"transfer_ts": first_transfer, "done_ts": last_done, "attempts": attempts,
+                "install_ts": last_install, "episode_seconds": None,
+                "last_attempt_seconds": None}
     return {
-        "since_restart": total,
-        "during": during,
-        "pre_votes": pre_votes,
-        "windows": len([w for w in windows if w.get("done") is not None]),
-        "unclosed": unclosed,
+        "transfer_ts": first_transfer,
+        "done_ts": last_done,
+        "attempts": attempts,
+        "install_ts": last_install,
+        "episode_seconds": round((last_done - first_transfer).total_seconds(), 3),
+        "last_attempt_seconds": (
+            round((last_done - last_attempt_start).total_seconds(), 3)
+            if last_attempt_start is not None else None
+        ),
+    }
+
+
+# 同一次竞选会连续打印多行 marker（0.10：`election timeout expired, triggering election`
+# + `trigger pre-vote` + `trigger election`）。按时间聚类成「事件」，避免按行计数夸大。
+ELECTION_EVENT_GAP = timedelta(milliseconds=300)
+
+
+def election_events(node, offset=0):
+    """victim 重启后的竞选**事件**时间列表（marker 行按 300ms 聚类）。"""
+    try:
+        with open(node.log_path, "r", errors="replace") as f:
+            if offset:
+                f.seek(offset)
+            lines = f.readlines()
+    except OSError:
+        return []
+    ts_list = []
+    for ln in lines:
+        low = ln.lower()
+        if not any(tok in low for tok in ELECTION_MARKERS):
+            continue
+        ts = _line_ts(ln)
+        if ts is not None:
+            ts_list.append(ts)
+    ts_list.sort()
+    events = []
+    for ts in ts_list:
+        if not events or (ts - events[-1]) > ELECTION_EVENT_GAP:
+            events.append(ts)
+    return events
+
+
+def classify_elections(episode, events, chaos_windows, grace_ms=600):
+    """把竞选事件分成「episode 内」/「churn 解释得了的」/「无法解释的」。
+
+    - in_episode：落在 [transfer, done] 内（含被打断的 retry 段）
+    - during_chaos：落在某次 kill/freeze 的 [at, resumed_at + grace] 内 —— leader 不可达期间
+      follower 竞选是 Raft 的正常行为，不算失败；grace 覆盖「恢复后 follower 还没收到心跳」的窗口。
+    - unexplained：in_episode 且不属于任何 churn 窗口 → 0.9 的失败模式（install 期间心跳被抑制），
+      必须为 0。
+
+    `chaos_windows[*].at / resumed_at` 允许是 epoch 秒（harness 用 time.time()）或 datetime。
+    """
+
+    def _epoch(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return v.timestamp()
+
+    t0, t1 = _epoch(episode.get("transfer_ts")), _epoch(episode.get("done_ts"))
+    in_ep, during_chaos, unexplained = [], [], []
+    for ts in events:
+        e = _epoch(ts)
+        if t0 is None or t1 is None or not (t0 <= e <= t1):
+            continue
+        in_ep.append(ts)
+        explained = False
+        for w in chaos_windows:
+            ws, we = _epoch(w.get("at")), _epoch(w.get("resumed_at"))
+            if ws is None:
+                continue
+            if we is None:
+                we = ws
+            if ws <= e <= we + grace_ms / 1000.0:
+                explained = True
+                break
+        (during_chaos if explained else unexplained).append(ts)
+    return {
+        "in_episode": len(in_ep),
+        "during_chaos": len(during_chaos),
+        "unexplained": len(unexplained),
+        "since_restart": len(events),
     }
 
 
@@ -1211,6 +1267,8 @@ def snapshot_phase(args, stats, token, rng):
     log("  restarted victim node %d (catch-up must use full-snapshot)" % victim_id)
     if not wait_healthz(victim, 25):
         log("  WARN: victim healthz timeout after restart")
+    # RSS 基线：重启后、传输开始前采样（复核：窗口内首个采样可能已经在 install 中，会把 net 压成 0）
+    rss_baseline_kb = read_rss_kb(victim)
 
     # --chaos-during-snapshot (churn 并发): SIGKILL or SIGSTOP-freeze the CURRENT leader 1-2x
     # WHILE the victim is still behind. The victim must NEVER campaign (0 elections) and its
@@ -1261,6 +1319,7 @@ def snapshot_phase(args, stats, token, rng):
                 log("  snapshot chaos skipped (%s): 目标 %d 自认 follower"
                     % (kind_note, leader_n.node_id))
                 return None
+            at = time.time()
             with CLUSTER.lock:
                 leader_n.kill()
             stats.bump("leader_kills")
@@ -1284,17 +1343,21 @@ def snapshot_phase(args, stats, token, rng):
             with CLUSTER.lock:
                 leader_n.spawn(CLUSTER.seed_map)
             wait_healthz(leader_n, 25)
+            return {"kind": "kill", "target": leader_n.node_id, "at": at,
+                    "resumed_at": time.time()}
         else:
             with CLUSTER.lock:
                 leader_n.stop_freeze()
             stats.bump("freeze_count")
             stats.bump("snapshot_chaos_injections")
+            at = time.time()
             log("  snapshot chaos: leader %d SIGSTOP @ catchup+t%.1fs"
-                % (leader_n.node_id, time.time() - catchup_t0))
+                % (leader_n.node_id, at - catchup_t0))
             time.sleep(rng.uniform(1.0, 3.0))
             with CLUSTER.lock:
                 leader_n.resume_freeze()
-        return kind
+            return {"kind": "freeze", "target": leader_n.node_id, "at": at,
+                    "resumed_at": time.time()}
 
     # 5. poll leader members: victim lag → NUMERIC 0, AND snapshot project config == leader's.
     #    config-equal-but-lag-null is NOT catch-up: lag==null means the victim's matched index
@@ -1310,6 +1373,7 @@ def snapshot_phase(args, stats, token, rng):
     # 0.10 的独立 heartbeat worker 要证明的正是「快照 install 期间心跳不停」。
     rss_in_window_kb = None
     rss_baseline_kb = None
+    projects_compared = 0
     hb_samples = 0
     hb_max_ms = None
     hb_max_in_window_ms = None
@@ -1329,12 +1393,16 @@ def snapshot_phase(args, stats, token, rng):
                     transfer_seen_at = time.time()
                     log("  transfer window opened @ catchup+t%.1fs → 注入 churn"
                         % (transfer_seen_at - catchup_t0))
-                    chaos_done.append(snapshot_chaos_once("transfer-window"))
+                    c = snapshot_chaos_once("transfer-window")
+                    if c:
+                        chaos_done.append(c)
             except OSError:
                 pass
         if len(chaos_done) < chaos_target and chaos_schedule and time.time() - catchup_t0 >= chaos_schedule[0]:
             if catchup_seconds is None and (max_lag is None or max_lag > 0):
-                chaos_done.append(snapshot_chaos_once("scheduled"))
+                c = snapshot_chaos_once("scheduled")
+                if c:
+                    chaos_done.append(c)
             chaos_schedule.pop(0)
         victim_lag = None
         leader = current_leader_obj() or leader
@@ -1347,7 +1415,6 @@ def snapshot_phase(args, stats, token, rng):
                         rss_now = read_rss_kb(victim)
                         if isinstance(rss_now, int):
                             if rss_baseline_kb is None:
-                                # 窗口内第一个采样 ≈ 进程基线（传输刚起、状态机未 restore）
                                 rss_baseline_kb = rss_now
                             rss_in_window_kb = (
                                 rss_now if rss_in_window_kb is None
@@ -1386,6 +1453,7 @@ def snapshot_phase(args, stats, token, rng):
                     break
             if all_equal:
                 catchup_seconds = time.time() - catchup_t0
+                projects_compared = len(projects)
                 break
             elif cfg_gate_diag < 3:
                 cfg_gate_diag += 1
@@ -1407,46 +1475,43 @@ def snapshot_phase(args, stats, token, rng):
                        probe["status"], probe.get("err"), str(probe.get("data"))[:160]))
         time.sleep(0.4)
 
-    # C4 证据：victim 峰值 RSS（VmHWM）覆盖 restart → install full-snapshot → 追平窗口
+    # C4 证据：victim 峰值 RSS（VmHWM）+ 快照字节数 + 追赶 episode（含 retry）
     victim_peak_rss_kb = read_peak_rss_kb(victim)
-    # C4 证据：install 窗口（transfer→install→done）+ 快照字节数
     snapshot_bytes = latest_snapshot_bytes(victim)
-    win = install_window_stats(victim)
-
-    # 6. interrupted-by-election diagnostic (a failure EXPLANATION, not a FORBIDDEN token —
-    #    campaigning is normal chatter otherwise). If the victim repeatedly started an election
-    #    while a snapshot was arriving, the transfer was interrupted.
-    #    0.10 INFO markers: "trigger election" / "starting a real election" (raft_core/engine);
-    #    0.9 wording "election timeout passed" kept for back-compat. Snapshot arrival marker
-    #    0.10: "install full snapshot" (following_handler) / legacy "installsnapshot".
-    # 选举归属：只有落在 install 窗口内的选举才算「打断安装」；窗口外（重启后尚未收到首个
-    # snapshot frame）的选举单独计数、只做诊断，不判失败。
-    attr = election_attribution(victim.log_path, victim_restart_offset)
-    victim_elections = attr["during"]
+    episode = snapshot_episode(victim, victim_restart_offset)
+    events = election_events(victim, victim_restart_offset)
+    attr = classify_elections(episode, events, chaos_done)
+    victim_elections = attr["unexplained"]
     interrupted_by_election = victim_elections > 0
 
     return {"victim_id": victim_id, "catchup_seconds": catchup_seconds,
             "max_lag": max_lag, "lag_none_seen": lag_none_seen, "lag_values": lag_values,
             "victim_peak_rss_kb": victim_peak_rss_kb,
             "snapshot_bytes": snapshot_bytes,
-            "snapshot_install_seconds": win["end_to_end_seconds"],
-            "snapshot_transfer_seconds": win["transfer_seconds"],
-            "snapshot_apply_seconds": win["apply_seconds"],
-            "snapshot_elections_pre_vote": attr["pre_votes"],
+            "snapshot_bytes_mtime": snapshot_bytes_mtime(victim),
+            "snapshot_install_seconds": episode["episode_seconds"],
+            "snapshot_last_attempt_seconds": episode["last_attempt_seconds"],
+            "snapshot_attempts": episode["attempts"],
+            "snapshot_transfer_ts": episode["transfer_ts"],
+            "snapshot_done_ts": episode["done_ts"],
+            "snapshot_elections_in_episode": attr["in_episode"],
+            "snapshot_elections_during_chaos": attr["during_chaos"],
+            "snapshot_elections_unexplained": attr["unexplained"],
+            "snapshot_elections_since_restart": attr["since_restart"],
             "victim_rss_max_in_window_kb": rss_in_window_kb,
             "victim_rss_baseline_kb": rss_baseline_kb,
             "victim_heartbeat_samples": hb_samples,
             "victim_heartbeat_max_ms": hb_max_ms,
             "victim_heartbeat_max_in_window_ms": hb_max_in_window_ms,
-            "snapshot_elections_since_restart": attr["since_restart"],
-            "snapshot_windows_unclosed": attr["unclosed"],
             "lag_points": lag_points,
             "lag_trajectory": _sample_lag_points(lag_points),
             "interrupted_by_election": interrupted_by_election,
             "victim_elections": victim_elections,
             "victim_elections_since_restart": attr["since_restart"],
-            "install_windows": win["windows"],
+            "install_windows": 1 if episode["episode_seconds"] else 0,
             "snapshot_chaos_injections": len(chaos_done),
+            "snapshot_chaos_windows": chaos_done,
+            "snapshot_projects_compared": projects_compared,
             "bulk_seconds": bulk_seconds, "leader_node": leader,
             "projects": projects}, victim
 
@@ -1494,12 +1559,12 @@ def quiesce(timeout=30):
     return False
 
 
-def c3_errors(args, stats, heartbeat=None):
-    """C3（3+ 节点 HTTP leader kill / 换人 / 心跳不停）断言，纯函数便于单测。
+def c3_errors(args, stats):
+    """C3（3+ 节点 HTTP leader kill / 换人）断言，纯函数便于单测。
 
-    `heartbeat` = {"samples": int, "max_in_window_ms": int|None}：leader 视角 victim 心跳 age
-    在 install 窗口内的最大值。0.9 的失败模式正是「快照 offload 期间心跳被抑制」，所以
-    「窗口内出现过心跳采样且 age 不超预算」是 C3 的直接证据。
+    心跳 age 只作数据记录（leader 侧 ack age 会被 install 负载拉高，不能当通过/失败阈值；
+    复核指出 3s 预算 > election_timeout_max 600ms，证明不了任何东西）。真正的不变式是
+    「leader 可达期间 follower 不竞选」，由 C4 的 episode 选举归属断言负责。
     """
     errs = []
     if args.leader_kills > 0 and stats.leader_kills == 0:
@@ -1513,51 +1578,70 @@ def c3_errors(args, stats, heartbeat=None):
             errs.append("C3: %d 次 leader kill 但只观测到 %d 次 leader 变化（missing=%d）"
                         % (stats.leader_kills, stats.observed_leader_changes,
                            stats.leader_change_missing))
-    hb = heartbeat or {}
-    if hb.get("samples"):
-        age = hb.get("max_in_window_ms")
-        if age is None:
-            errs.append("C3: install 窗口内没有任何心跳采样（无法证明心跳未停）")
-        elif age > args.max_heartbeat_gap_ms:
-            errs.append("C3: install 窗口内 victim 心跳 age 最大 %sms 超过预算 %sms"
-                        "（0.9 失败模式：快照期间心跳被抑制）"
-                        % (age, args.max_heartbeat_gap_ms))
-    else:
-        errs.append("C3: 全程没有 last_heartbeat_ms_ago 采样（leader 心跳视图缺失）")
     return errs
 
 
 def c4_errors(args, snapshot_info, victim_is_voter):
-    """C4（voter 大快照 / transfer 窗口 churn / install 预算 / RSS 前提）断言，纯函数便于单测。
+    """C4（voter 大快照 / churn 在 episode 内 / install 预算 / 选举归属 / RSS）断言。
 
-    旧实现只把指标写进 summary、不做判定，样例里「日志追平、根本没走快照」也会绿；
-    这里把「必须真的走了 full-snapshot、且规模/耗时/身份达标」变成硬错误。
+    episode = 第一次 transfer → 最终 done（含 churn 打断后的 retry）。复核 blocker：只取
+    「最后一个完整窗口」会把被打断那段里的选举藏起来，所以所有判定都基于 episode。
     """
     errs = []
     info = snapshot_info or {}
     if info.get("install_windows", 0) < 1:
-        errs.append("C4: victim 没有走 full-snapshot（install_windows=0）——日志追平/learner 路径不算 C4")
-    end2end = info.get("snapshot_install_seconds")
-    if end2end is None:
-        errs.append("C4: 无法量测 install 端到端耗时（缺 transfer/install/done 标记）")
-    elif end2end > args.max_install_seconds:
-        errs.append("C4: install 端到端 %ss 超过预算 %ss（transfer=%ss apply=%ss）"
-                    % (end2end, args.max_install_seconds,
-                       info.get("snapshot_transfer_seconds"), info.get("snapshot_apply_seconds")))
+        errs.append("C4: victim 没有完成 full-snapshot（episode 缺 transfer 或 done）——"
+                    "日志追平/learner 路径不算 C4")
+        return errs
+    ep = info.get("snapshot_install_seconds")
+    if ep is None:
+        errs.append("C4: 无法量测 episode 端到端耗时")
+    elif ep > args.max_install_seconds:
+        errs.append("C4: episode 端到端 %ss 超过预算 %ss（attempts=%s，last_attempt=%ss）"
+                    % (ep, args.max_install_seconds, info.get("snapshot_attempts"),
+                       info.get("snapshot_last_attempt_seconds")))
     sb = info.get("snapshot_bytes")
     if sb is None:
         errs.append("C4: victim 没有落盘快照文件（snapshot_bytes=None）")
-    elif sb < args.min_snapshot_bytes:
-        errs.append("C4: 快照只有 %s 字节 < 下限 %s（规模不足以覆盖大快照场景）"
-                    % (sb, args.min_snapshot_bytes))
+    else:
+        if sb < args.min_snapshot_bytes:
+            errs.append("C4: 快照只有 %s 字节 < 下限 %s（规模不足以覆盖大快照场景）"
+                        % (sb, args.min_snapshot_bytes))
+        t0 = info.get("snapshot_transfer_ts")
+        mt = info.get("snapshot_bytes_mtime")
+        if t0 is not None and mt is not None and mt < t0.timestamp() - 1.0:
+            errs.append("C4: 快照文件 mtime 早于 episode transfer——可能是历史残留")
     if victim_is_voter is not True:
         errs.append("C4: victim node %s 不是 voter（is_voter=%s）——learner 追平不能算 C4"
                     % (info.get("victim_id"), victim_is_voter))
-    # 内存预算（§8.5）：install **窗口内** peak RSS（不是整段进程 VmHWM），
-    # 且按「扣除进程基线后的净增量」算 ratio —— 小快照时进程基线会主导原始比值。
+
+    if args.chaos_during_snapshot:
+        windows = info.get("snapshot_chaos_windows") or []
+        t0, t1 = info.get("snapshot_transfer_ts"), info.get("snapshot_done_ts")
+        inside = [
+            w for w in windows
+            if t0 is not None and t1 is not None and w.get("at") is not None
+            and t0.timestamp() <= w["at"] <= t1.timestamp()
+        ]
+        if not windows:
+            errs.append("C4: --chaos-during-snapshot 开了但一次注入都没发生")
+        elif not inside:
+            errs.append("C4: %d 次 churn 注入没有一次落在 episode 内" % len(windows))
+
+    unexplained = info.get("snapshot_elections_unexplained")
+    if unexplained is None:
+        errs.append("C4: 缺选举归属统计（snapshot_elections_unexplained=None）")
+    elif unexplained > 0:
+        errs.append("C4: episode 内出现 %d 次无法用 churn 解释的竞选（in_episode=%s, during_chaos=%s）"
+                    "——0.9 失败模式：install 期间心跳被抑制"
+                    % (unexplained, info.get("snapshot_elections_in_episode"),
+                       info.get("snapshot_elections_during_chaos")))
+
     rss_kb = info.get("victim_rss_max_in_window_kb")
     base_kb = info.get("victim_rss_baseline_kb") or 0
-    if isinstance(rss_kb, int) and sb:
+    if rss_kb is None:
+        errs.append("C4: 缺 install 窗口 RSS 采样（victim_rss_max_in_window_kb=None）")
+    elif sb:
         net_kb = max(0, rss_kb - int(base_kb))
         ratio = (net_kb * 1024.0) / float(sb)
         if ratio > args.max_rss_ratio:
@@ -1675,11 +1759,13 @@ def validate_final(args, token, writers, snapshot_info, errors):
             errors.append("catch_up_seconds %s >= timeout %s" % (cs, args.catchup_timeout))
         if snapshot_info.get("max_lag") is None and snapshot_info.get("lag_none_seen"):
             errors.append("victim lag stayed null throughout (InstallSnapshot never established)")
+        # ---- 溯源断言：--no-build 时二进制不得旧于源码
+        bm, sm = GLOBAL.get("bin_mtime"), GLOBAL.get("source_newest_mtime")
+        if bm and sm and bm < sm:
+            errors.append("provenance: 二进制 mtime 早于最新源码（陈旧 binary，先 rebuild）")
+
         # ---- C3/C4 断言（纯函数，单测覆盖 scripts/stress/test_leader_storm.py）----
-        errors.extend(c3_errors(args, STATS, {
-            "samples": snapshot_info.get("victim_heartbeat_samples"),
-            "max_in_window_ms": snapshot_info.get("victim_heartbeat_max_in_window_ms"),
-        }))
+        errors.extend(c3_errors(args, STATS))
         md = members(leader.http_base(), None) if leader else None
         voter_ok = None
         if md:
@@ -1692,18 +1778,17 @@ def validate_final(args, token, writers, snapshot_info, errors):
         # P3 churn 并发 invariant: 正在被 full-snapshot 追赶的 follower（含 leader kill/freeze
         # churn 期间）在 **transfer→install→done 窗口内** 必须一次选举/预投票都不发起。
         # 窗口外的选举（重启后尚未连上 leader）只做诊断输出。
-        log("  victim elections: inside_install=%s, since_restart=%s, install_windows=%s"
-            % (snapshot_info.get("victim_elections"),
+        log("  victim elections: in_episode=%s during_chaos=%s unexplained=%s since_restart=%s attempts=%s"
+            % (snapshot_info.get("snapshot_elections_in_episode"),
+               snapshot_info.get("snapshot_elections_during_chaos"),
+               snapshot_info.get("snapshot_elections_unexplained"),
                snapshot_info.get("victim_elections_since_restart"),
-               snapshot_info.get("install_windows")))
-        if snapshot_info.get("victim_elections", 0) > 0:
-            errors.append("victim node %s started %d election(s) INSIDE the InstallSnapshot window "
-                          "(expect 0 — 0.10 独立心跳必须让 follower 在安装期间保持 follower; "
-                          "since_restart=%s, windows=%s)"
+               snapshot_info.get("snapshot_attempts")))
+        if snapshot_info.get("snapshot_elections_unexplained", 0) > 0:
+            errors.append("victim node %s 在 episode（含 retry）内发起 %d 次无法用 churn 解释的竞选"
+                          "（0.9 失败模式：install 期间心跳被抑制）"
                           % (snapshot_info.get("victim_id"),
-                             snapshot_info.get("victim_elections"),
-                             snapshot_info.get("victim_elections_since_restart"),
-                             snapshot_info.get("install_windows")))
+                             snapshot_info.get("snapshot_elections_unexplained")))
         if snapshot_info["victim_id"] is not None:
             vid = snapshot_info["victim_id"]
             with open(CLUSTER.by_id(vid).log_path, "rb") as f:
@@ -1739,8 +1824,6 @@ def parse_args():
                    help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
     p.add_argument("--max-rss-ratio", type=float, default=2.0,
                    help="C4 内存预算：install 窗口内 victim 峰值 RSS / 快照字节数（§8.5 默认 2.0）")
-    p.add_argument("--max-heartbeat-gap-ms", type=int, default=3000,
-                   help="C3 心跳证据：install 窗口内 leader 观测到的 victim 心跳 age 上限（默认 3s）")
     p.add_argument("--min-snapshot-bytes", type=int, default=100_000_000,
                    help="C4 规模下限：victim 实际落盘快照字节数，默认 100MB（153MB/12k 目标的下限保护）")
     p.add_argument("--chaos-during-snapshot", action="store_true",
@@ -1752,6 +1835,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+    GLOBAL["git_rev"] = git_rev(args.bin)
+    GLOBAL["git_status"] = git_status(args.bin)
+    try:
+        GLOBAL["bin_mtime"] = os.path.getmtime(args.bin) if args.bin else None
+    except OSError:
+        GLOBAL["bin_mtime"] = None
+    GLOBAL["source_newest_mtime"] = source_newest_mtime(repo_root(args.bin))
     prof = dict(PROFILES[args.profile])
     for key in ("nodes", "workers", "duration", "leader_kills", "snapshot_writes"):
         v = getattr(args, key.replace("-", "_"))
@@ -1945,25 +2035,28 @@ def main():
             summary["snapshot_interrupted_by_election"] = bool(snapshot_info.get("interrupted_by_election"))
             # P3 churn 并发: victim must campaign 0x even under leader kill/freeze injections
             summary["chaos_during_snapshot"] = bool(args.chaos_during_snapshot)
-            summary["victim_elections_during_catchup"] = snapshot_info.get("victim_elections")
+            summary["victim_elections_in_episode"] = snapshot_info.get("snapshot_elections_in_episode")
+            summary["victim_elections_during_chaos"] = snapshot_info.get("snapshot_elections_during_chaos")
+            summary["victim_elections_unexplained"] = snapshot_info.get("snapshot_elections_unexplained")
             summary["victim_elections_since_restart"] = snapshot_info.get("victim_elections_since_restart")
-            summary["victim_pre_votes_during_install"] = snapshot_info.get("snapshot_elections_pre_vote")
             summary["victim_rss_max_in_window_kb"] = snapshot_info.get("victim_rss_max_in_window_kb")
             summary["victim_rss_baseline_kb"] = snapshot_info.get("victim_rss_baseline_kb")
             summary["victim_heartbeat_samples"] = snapshot_info.get("victim_heartbeat_samples")
-            summary["victim_heartbeat_max_ms"] = snapshot_info.get("victim_heartbeat_max_ms")
             summary["victim_heartbeat_max_in_window_ms"] = snapshot_info.get(
                 "victim_heartbeat_max_in_window_ms")
-            summary["max_heartbeat_gap_ms_budget"] = args.max_heartbeat_gap_ms
-            summary["snapshot_install_windows"] = snapshot_info.get("install_windows")
-            summary["snapshot_transfer_seconds"] = snapshot_info.get("snapshot_transfer_seconds")
-            summary["snapshot_apply_seconds"] = snapshot_info.get("snapshot_apply_seconds")
+            summary["max_rss_ratio_budget"] = args.max_rss_ratio
+            summary["snapshot_attempts"] = snapshot_info.get("snapshot_attempts")
+            summary["snapshot_last_attempt_seconds"] = snapshot_info.get("snapshot_last_attempt_seconds")
+            summary["snapshot_bytes_mtime"] = snapshot_info.get("snapshot_bytes_mtime")
             summary["max_install_seconds_budget"] = args.max_install_seconds
             summary["min_snapshot_bytes"] = args.min_snapshot_bytes
             summary["snapshot_chaos_injections"] = snapshot_info.get("snapshot_chaos_injections")
         # 证据溯源（复核要求：日志必须能定位到源码版本与二进制）
-        summary["git_rev"] = git_rev(args.bin)
+        summary["git_rev"] = GLOBAL.get("git_rev")
+        summary["git_status_porcelain"] = GLOBAL.get("git_status")
         summary["bin_sha256"] = sha256_of(args.bin)
+        summary["bin_mtime"] = GLOBAL.get("bin_mtime")
+        summary["source_newest_mtime"] = GLOBAL.get("source_newest_mtime")
         summary["tmpdir"] = os.environ.get("TMPDIR")
         summary["argv"] = sys.argv[1:]
         log("== SUMMARY ==")

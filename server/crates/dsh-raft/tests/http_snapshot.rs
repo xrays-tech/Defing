@@ -664,8 +664,47 @@ async fn voter_catches_up_via_http_snapshot_after_being_down() {
         voters
     );
 
-    // 7) cleanup
-    for n in [&n1, &n2, &n3] {
+    // 7) 生产状态回归：快照追平后的节点 = 空日志 + last_applied == purged == snapshot index。
+    //    openraft 0.10 的 get_initial_state 会做 LogId 顺序校验；这个状态重启必须能起来
+    //    （架构复核 blocker：只回落 index 时会被判 inverted log order，节点永久不可用）。
+    let victim_dir = n3.dir.clone();
+    let victim_info = n3.info.clone();
+    stop_serving(&mut n3);
+    let _ = n3.raft.shutdown().await;
+    drop(n3); // 释放 redb 文件句柄（新实例要重新 open 同一 data dir）
+    let mut reopened = None;
+    for _ in 0..40 {
+        match RedbStorage::open(&victim_dir.display().to_string()) {
+            Ok(s) => {
+                reopened = Some(s);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let storage2 = reopened.expect("重启时重新打开 data dir 失败（文件锁未释放？）");
+    let db2 = storage2.raw_db();
+    let sm2 = Arc::new(RwLock::new(StateMachine::new(Box::new(storage2))));
+    let sm_store2 = Arc::new(StateMachineStore::new(sm2.clone(), db2.clone(), victim_dir.clone()));
+    let rebooted = new_raft_node(
+        3,
+        victim_info,
+        LogStore::new(db2),
+        sm_store2,
+        &network,
+        isolated_voter_config(),
+    )
+    .await
+    .expect("快照追平后的 voter（空日志 + purged==last_applied）必须能在 openraft 0.10 上重启");
+    assert!(
+        sm_has_project(&sm2, PID),
+        "重启后状态机必须仍有快照恢复的数据"
+    );
+    let _ = rebooted.shutdown().await;
+    let _ = std::fs::remove_dir_all(&victim_dir);
+
+    // 8) cleanup
+    for n in [&n1, &n2] {
         let _ = n.raft.shutdown().await;
         let _ = std::fs::remove_dir_all(&n.dir);
     }
