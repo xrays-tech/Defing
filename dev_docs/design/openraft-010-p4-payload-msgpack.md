@@ -122,3 +122,24 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
 - **验收对照（§6）**：体积/install/RSS 三项要等 storm 重跑（P4c 用 `--snapshot-payload=msgpack`
   打开写端后才能测，P4base 是 v1 基线）；「旧 v1 文件可读」由 `default_writer_stays_headerless_json`
   + P4a1 用例覆盖；「多批流式」属于 P4b（`restore_stream`）。
+
+## 9. 实现落地（P4b：流式恢复）
+
+- **`StateMachine::restore_stream`（dsh-core，B1 blocker）**：按批消费，**只在第一批前清空一次**
+  （`get_prefix_keys(b"")` + 首批 `write_batch(batch, deletes)`），后续批只插入；空流等价于清空。
+  `restore_all` 保留为「切块 → `restore_stream`」，与流式路径共用同一份语义。
+  测试：3 批全存活 + 旧 key 被清（逐批清空的旧写法会立刻失败）、空流清空、批错误传播。
+- **`read_payload_batches(path, budget)`（dsh-raft）**：返回 `PayloadBatches` 迭代器。
+  - v2：打开时先 `verify_payload_file`（total_len + crc32，B2'）并校验文件长度，再**惰性**逐项
+    `rmp::decode`，按 64MiB 预算切批（批因最后一条略超预算；单条超预算单独成批）。
+  - v1（无头/带头 JSON）：整份解析后切批 —— 升级期一次性路径，设计 §3 已声明。
+  - 完整性校验**先于**状态机写入：坏 payload 在 copy/marker 之前失败（
+    `install_rejects_corrupt_v2_before_state_change`）。
+- **install / boot 重放都改走流式**：`install_snapshot` 打开批次 → copy canonical → marker →
+  `restore_stream`；`recover_interrupted_restore` 同样按批重放（boot 内存不再随 payload 线性增长，
+  回应 restore 设计 §8 残留 (b)）。
+- **验收口径**：≥3 批多批测试（`multi_batch_restore_realistic_size`，`DSH_TEST_LARGE_SNAPSHOT=1`
+  时为 3×45MiB >128MiB，本地实测通过并留证）；批错误 → restore Err → 调用方 poison + marker 兜底
+  （P4-A 的 fail-stop 语义不变）。
+- **尚未做（P4c）**：写端仍整份 `dump_all()` → `Vec`（`restore_stream` 只解决读端）；`dump_all`
+  分页属 P4c0。

@@ -151,7 +151,8 @@
   `recover_force_ignores_marker_without_replay`；#5 `install_snapshot_clears_restore_marker`
   （e2e 走同一 install 路径，未单独加键断言）；#6 storm 回归待 P4b/P4c 之后重跑。
 - **残留**：(a) 没有子进程 SIGKILL e2e —— 用「崩溃现场（marker + 混合状态）+ ctor 清扫 + recover」
-  等价模拟；(b) boot 重放仍把 payload 整份读成 `Vec`（P4b 的 `restore_stream` 改流式后同步调整）；
+  等价模拟；(b) ~~boot 重放整份读成 `Vec`~~ → **P4b 已改流式**（`read_payload_batches` +
+  `restore_stream`，v2 有界内存；v1 仍是整份解析的升级期路径）；
   (c) `restore_all` 分块语义未变：运行期错误由 poison 拦、崩溃由 marker 重放补；
   (d) gRPC 只有读接口（写走 HTTP），故只接 `linearized_read`。
 - 顺带修 `voter_catches_up_via_http_snapshot_after_being_down` 的读日志竞态：SM 里 value 可见时

@@ -436,36 +436,191 @@ fn encode_msgpack_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>, ErrOf> 
 /// P4a2 v2 body 解码（流式：逐项读 bin，不 materialize body 字节）。
 /// 单个 key/value 的长度来自不可信文件，用 `Read::take + read_to_end` 按实际数据增长，
 /// 不按声明长度预分配（防损坏头导致 OOM）。
-fn decode_msgpack_pairs<R: std::io::Read>(r: &mut R) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf> {
+fn decode_msgpack_pair<R: std::io::Read>(
+    r: &mut R,
+    item: u64,
+) -> Result<(Vec<u8>, Vec<u8>), ErrOf> {
     use std::io::Read as _;
+    let fields = rmp::decode::read_array_len(r)
+        .map_err(|e| io_read(format!("payload msgpack item {item} header: {e}")))?;
+    if fields != 2 {
+        return Err(io_read(format!(
+            "payload msgpack item {item}: expected [bin,bin] (2 fields), got {fields}"
+        )));
+    }
+    let mut kv = [Vec::new(), Vec::new()];
+    for slot in kv.iter_mut() {
+        let len = rmp::decode::read_bin_len(r)
+            .map_err(|e| io_read(format!("payload msgpack item {item} bin length: {e}")))?;
+        // 长度来自不可信文件：按实际读到的字节增长，不按声明长度预分配（防损坏头 OOM）。
+        r.take(u64::from(len)).read_to_end(slot).map_err(io_read)?;
+        if slot.len() as u64 != u64::from(len) {
+            return Err(io_read(format!(
+                "payload msgpack item {item}: truncated bin (declared {len}, got {})",
+                slot.len()
+            )));
+        }
+    }
+    let [k, v] = kv;
+    Ok((k, v))
+}
+
+fn decode_msgpack_pairs<R: std::io::Read>(r: &mut R) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf> {
     let n = rmp::decode::read_array_len(r)
         .map_err(|e| io_read(format!("payload msgpack array header: {e}")))?;
     // 预分配封顶：正常 payload 每项 ≥2B，恶意/损坏头不应直接放大成 GB 级分配。
     let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity((n as usize).min(65_536));
-    for i in 0..n {
-        let fields = rmp::decode::read_array_len(r)
-            .map_err(|e| io_read(format!("payload msgpack item {i} header: {e}")))?;
-        if fields != 2 {
-            return Err(io_read(format!(
-                "payload msgpack item {i}: expected [bin,bin] (2 fields), got {fields}"
-            )));
-        }
-        let mut kv = [Vec::new(), Vec::new()];
-        for slot in kv.iter_mut() {
-            let len = rmp::decode::read_bin_len(r)
-                .map_err(|e| io_read(format!("payload msgpack item {i} bin length: {e}")))?;
-            r.take(u64::from(len)).read_to_end(slot).map_err(io_read)?;
-            if slot.len() as u64 != u64::from(len) {
-                return Err(io_read(format!(
-                    "payload msgpack item {i}: truncated bin (declared {len}, got {})",
-                    slot.len()
-                )));
-            }
-        }
-        let [k, v] = kv;
-        out.push((k, v));
+    for i in 0..u64::from(n) {
+        out.push(decode_msgpack_pair(r, i)?);
     }
     Ok(out)
+}
+
+/// P4b（设计 §3 / §7 B1）：安装/重放时**按批流式**读 payload 的批预算（每批 ≤ 该字节数；
+/// 单条超预算时单独成批）。与 dsh-core `restore_stream` 配对使用。
+pub const RESTORE_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// 流式 payload 批次迭代器：v2（msgpack）逐项解码、按预算切批；v1（JSON，无头或带头）
+/// 先整份解析再切批（升级期一次性路径，设计 §3）。
+///
+/// 切批规则：一直取到累计字节 **≥ 预算** 为止（即批可能因最后一条而略超预算；单条超过
+/// 预算时它单独成批）。这样「至少前进一条」，也不会产生空批。
+///
+/// `read_payload_batches` 在返回前完成**完整性校验**（带头的 v2/v1 走 `verify_payload_file`
+/// 的 total_len + crc32；无头旧文件只能整份解析），因此调用方可以把批次直接喂给
+/// `restore_stream`，不必再单独校验。
+pub struct PayloadBatches {
+    source: PayloadSource,
+    budget: usize,
+}
+
+enum PayloadSource {
+    /// v2：惰性逐项解码（内存只驻留当前批）。
+    Msgpack {
+        r: std::io::BufReader<std::fs::File>,
+        remaining: u64,
+        next_item: u64,
+        path: PathBuf,
+    },
+    /// v1：已整份解析（升级期路径），按预算切批。
+    Whole(std::vec::IntoIter<(Vec<u8>, Vec<u8>)>),
+}
+
+impl Iterator for PayloadBatches {
+    type Item = Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.source {
+            PayloadSource::Whole(it) => {
+                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut bytes = 0usize;
+                for (k, v) in it.by_ref() {
+                    bytes += k.len() + v.len();
+                    batch.push((k, v));
+                    if bytes >= self.budget {
+                        break;
+                    }
+                }
+                if batch.is_empty() {
+                    None
+                } else {
+                    Some(Ok(batch))
+                }
+            }
+            PayloadSource::Msgpack {
+                r,
+                remaining,
+                next_item,
+                path,
+            } => {
+                if *remaining == 0 {
+                    return None;
+                }
+                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut bytes = 0usize;
+                while *remaining > 0 && (bytes < self.budget || batch.is_empty()) {
+                    match decode_msgpack_pair(r, *next_item) {
+                        Ok((k, v)) => {
+                            bytes += k.len() + v.len();
+                            batch.push((k, v));
+                            *remaining -= 1;
+                            *next_item += 1;
+                        }
+                        Err(e) => {
+                            return Some(Err(io_read(format!(
+                                "payload msgpack decode failed ({}): {e}",
+                                path.display()
+                            ))))
+                        }
+                    }
+                }
+                Some(Ok(batch))
+            }
+        }
+    }
+}
+
+/// 打开 payload 的流式批次（P4b）。带头的 v2/v1 先做完整性校验（total_len + crc32），
+/// 无头旧文件整份解析（无完整性头可校验）。未知 version / 非零 flags → Err。
+pub fn read_payload_batches(
+    path: &std::path::Path,
+    budget: usize,
+) -> Result<PayloadBatches, ErrOf> {
+    let budget = budget.max(1);
+    let mut f = fs::File::open(path).map_err(io_read)?;
+    let mut head = [0u8; PAYLOAD_HEADER_LEN];
+    let n = read_upto(&mut f, &mut head)?;
+    if n >= PAYLOAD_MAGIC.len() && &head[..PAYLOAD_MAGIC.len()] == PAYLOAD_MAGIC {
+        if n < PAYLOAD_HEADER_LEN {
+            return Err(io_read(format!(
+                "snapshot payload header truncated: {n}/{PAYLOAD_HEADER_LEN} bytes"
+            )));
+        }
+        let (version, flags, total_len, _crc) = decode_payload_header(&head)?;
+        if flags != 0 {
+            return Err(io_read(format!(
+                "unsupported snapshot payload flags {flags:#x} (this binary only knows flags=0)"
+            )));
+        }
+        match version {
+            PAYLOAD_VERSION_MSGPACK => {
+                // B2'：先校验整段 body（长度 + CRC），再流式应用——不能把损坏数据先写进状态机。
+                verify_payload_file(path)?;
+                let file_len = fs::metadata(path).map_err(io_read)?.len();
+                if file_len != PAYLOAD_HEADER_LEN as u64 + total_len {
+                    return Err(io_read(format!(
+                        "snapshot payload body length mismatch: header says {total_len}, file has {}",
+                        file_len.saturating_sub(PAYLOAD_HEADER_LEN as u64)
+                    )));
+                }
+                let mut r = std::io::BufReader::new(f);
+                let remaining = rmp::decode::read_array_len(&mut r)
+                    .map_err(|e| io_read(format!("payload msgpack array header: {e}")))?;
+                Ok(PayloadBatches {
+                    source: PayloadSource::Msgpack {
+                        r,
+                        remaining: u64::from(remaining),
+                        next_item: 0,
+                        path: path.to_path_buf(),
+                    },
+                    budget,
+                })
+            }
+            PAYLOAD_VERSION_JSON => Ok(PayloadBatches {
+                source: PayloadSource::Whole(read_payload_pairs(path)?.into_iter()),
+                budget,
+            }),
+            other => Err(io_read(format!(
+                "unsupported snapshot payload version {other}（本 binary 只认 v1=JSON / v2=msgpack）"
+            ))),
+        }
+    } else {
+        // 无头旧 payload：JSON 解析本身就是校验。
+        Ok(PayloadBatches {
+            source: PayloadSource::Whole(read_payload_pairs(path)?.into_iter()),
+            budget,
+        })
+    }
 }
 
 fn read_payload_pairs(path: &std::path::Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf> {
@@ -1326,12 +1481,17 @@ impl StateMachineStore {
     fn restore_and_persist_inner(
         &self,
         meta: &SnapshotMetaOf<TypeConfig>,
-        pairs: &[(Vec<u8>, Vec<u8>)],
+        batches: PayloadBatches,
         path: &std::path::Path,
     ) -> Result<Option<PathBuf>, ErrOf> {
         {
             let sm = self.sm.write().map_err(|e| io_write(e.to_string()))?;
-            sm.restore_all(pairs).map_err(storage_err)?;
+            // P4b：流式恢复（B1 —— 只在首批前清空一次）。批解码错误在这里发生 →
+            // 调用方 poison + marker 保留，boot 重放/fail-fast 兜底。
+            let mapped = batches.map(|b| {
+                b.map_err(|e| dsh_core::error::Error::internal(format!("snapshot payload: {e}")))
+            });
+            sm.restore_stream(mapped).map_err(storage_err)?;
         }
         if let Some(last_log_id) = &meta.last_log_id {
             self.write_last_applied(last_log_id)?;
@@ -1681,7 +1841,9 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // 顺序（P3d）：先把 payload 落成 canonical 文件 + 解析校验，**再**动状态机。
         // 这样 copy/解析失败时状态机和 last_applied 都没有前进（旧顺序先 restore 再落盘，
         // 落盘失败会留下「last_applied 已前进但没有 registry 快照」的窗口）。
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> = read_payload_pairs(&snapshot)?;
+        // P4b：打开流式批次（v2 = 头 total_len/CRC 校验 + 惰性逐项解码；v1 = 整份解析）。
+        // 这一步在 copy / 动状态机之前，坏 payload 不会被采纳。
+        let batches = read_payload_batches(&snapshot, RESTORE_BATCH_BYTES)?;
         let path = copy_payload_file(
             self.data_dir.join(SNAP_SUBDIR),
             snap_file_name(meta),
@@ -1699,7 +1861,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         }
         // 从这里开始状态机可能被改写：任何错误都必须 fail-stop（A3），
         // 带着「部分新 + 部分旧」继续 apply / 对外读会静默分叉。
-        let old = match self.restore_and_persist_inner(meta, &pairs, path.as_path()) {
+        let old = match self.restore_and_persist_inner(meta, batches, path.as_path()) {
             Ok(old) => old,
             Err(e) => {
                 self.poison(format!("install_snapshot restore failed: {e}"));
@@ -1808,7 +1970,7 @@ pub fn recover_interrupted_restore_with(
             marker.payload.display()
         )));
     }
-    let pairs = read_payload_pairs(&marker.payload).map_err(|e| {
+    let batches = read_payload_batches(&marker.payload, RESTORE_BATCH_BYTES).map_err(|e| {
         io_read(format!(
             "interrupted snapshot restore: payload {} is unreadable/corrupt ({e}); refusing to start.",
             marker.payload.display()
@@ -1819,7 +1981,11 @@ pub fn recover_interrupted_restore_with(
         let sm = sm
             .write()
             .map_err(|e| io_write(format!("state lock unavailable: {e}")))?;
-        sm.restore_all(&pairs).map_err(storage_err)?;
+        // P4b：boot 重放同样走流式（bounded memory + 只清空一次）。
+        let mapped = batches.map(|b| {
+            b.map_err(|e| dsh_core::error::Error::internal(format!("snapshot payload: {e}")))
+        });
+        sm.restore_stream(mapped).map_err(storage_err)?;
     }
     if let Some(last_log_id) = &marker.meta.last_log_id {
         put_last_applied(db, last_log_id)?;
@@ -1831,10 +1997,9 @@ pub fn recover_interrupted_restore_with(
     }
     meta_del(db, META_RESTORE_BEGIN)?;
     tracing::warn!(
-        "restore replayed on boot: last_log_id={:?} payload={} pairs={} elapsed={:?}",
+        "restore replayed on boot: last_log_id={:?} payload={} (streamed) elapsed={:?}",
         marker.meta.last_log_id,
         marker.payload.display(),
-        pairs.len(),
         started.elapsed()
     );
     // 设计 §7 A1 的最后一步：registry 已指向该 payload，清扫其余 canonical 残留。
@@ -3356,6 +3521,216 @@ mod p4a2_tests {
         std::fs::write(&ver_path, &ver_bad).unwrap();
         let e = read_payload_pairs(&ver_path).unwrap_err().to_string();
         assert!(e.contains("version"), "未知 version 必须报错：{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------- P4b：流式恢复（B1：只清空一次 + 多批） ----------------
+
+#[cfg(test)]
+mod p4b_tests {
+    use super::tests::{open_storage, snap_meta, tmpdir};
+    use super::*;
+
+    fn pairs_of(items: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn write_v2(path: &std::path::Path, pairs: &[(Vec<u8>, Vec<u8>)]) {
+        let body = encode_msgpack_pairs(pairs).unwrap();
+        let head =
+            encode_payload_header(PAYLOAD_VERSION_MSGPACK, 0, body.len() as u64, crc32(&body));
+        let mut all = Vec::new();
+        all.extend_from_slice(&head);
+        all.extend_from_slice(&body);
+        std::fs::write(path, &all).unwrap();
+    }
+
+    fn collect_batches(path: &std::path::Path, budget: usize) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        read_payload_batches(path, budget)
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect()
+    }
+
+    /// v2 流式读：预算切批（≥3 批）且内容与源一致；每批都不超过预算（除非单条超预算）。
+    #[test]
+    fn msgpack_batches_split_by_budget() {
+        let dir = tmpdir("p4b-batches");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..10)
+            .map(|i| (format!("k{i}").into_bytes(), vec![b'x'; 100]))
+            .collect();
+        let path = dir.join("payload.snap");
+        write_v2(&path, &pairs);
+
+        // 预算 150B，101B/条 → 每批 2 条（最后一条越过预算）→ 5 批
+        let batches = collect_batches(&path, 150);
+        assert!(
+            batches.len() >= 3,
+            "应按预算切成多批, got {}",
+            batches.len()
+        );
+        for b in &batches {
+            let bytes: usize = b.iter().map(|(k, v)| k.len() + v.len()).sum();
+            let last = b.last().map(|(k, v)| k.len() + v.len()).unwrap_or(0);
+            assert!(
+                bytes.saturating_sub(last) < 150 || b.len() == 1,
+                "只允许最后一条越过预算: {bytes} ({} 条)",
+                b.len()
+            );
+        }
+        let flat: Vec<_> = batches.into_iter().flatten().collect();
+        assert_eq!(flat, pairs, "多批拼接必须与源 pairs 完全一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无头旧 payload（v1）也走同一批次接口（整份解析后切批），保证两种格式共用恢复路径。
+    #[test]
+    fn legacy_headerless_payload_is_batched_too() {
+        let dir = tmpdir("p4b-legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pairs = pairs_of(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        let path = dir.join("legacy.json");
+        std::fs::write(&path, serde_json::to_vec(&pairs).unwrap()).unwrap();
+        let batches = collect_batches(&path, 1);
+        assert!(batches.len() >= 3, "v1 也必须切批, got {}", batches.len());
+        assert_eq!(batches.into_iter().flatten().collect::<Vec<_>>(), pairs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B1 回归（dsh-core 集成层）：流式恢复只在首批前清空——3 批全存活、旧 key 被清。
+    /// **关闭旧写法**：若逐批调用 `restore_all`（每批都重算 existing），第 0 批会被第 1 批删掉。
+    #[tokio::test]
+    async fn restore_stream_from_batches_keeps_every_batch() {
+        let dir = tmpdir("p4b-stream-restore");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        // 旧状态（必须被清）
+        sm.write()
+            .unwrap()
+            .restore_all(&pairs_of(&[("stale", "1")]))
+            .unwrap();
+
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..9)
+            .map(|i| (format!("k{i}").into_bytes(), vec![b'v'; 64]))
+            .collect();
+        let path = dir.join("payload.snap");
+        write_v2(&path, &pairs);
+
+        let batches = read_payload_batches(&path, 100).unwrap();
+        assert!(batches.count() >= 3);
+        let batches = read_payload_batches(&path, 100).unwrap();
+        let mapped = batches.map(|b| {
+            b.map_err(|e| dsh_core::error::Error::internal(format!("snapshot payload: {e}")))
+        });
+        sm.write().unwrap().restore_stream(mapped).unwrap();
+
+        let state = sm.read().unwrap().dump_all().unwrap();
+        assert_eq!(state, pairs, "多批恢复必须全部存活（B1 回归）");
+        assert!(!state.iter().any(|(k, _)| k == b"stale"), "旧 key 必须被清");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 损坏的 v2 payload：install 必须在写 marker / 动状态机之前失败（B2' 校验先于恢复）。
+    #[tokio::test]
+    async fn install_rejects_corrupt_v2_before_state_change() {
+        let dir = tmpdir("p4b-corrupt-install");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+        let old = pairs_of(&[("old", "1")]);
+        sm.write().unwrap().restore_all(&old).unwrap();
+
+        let pairs = pairs_of(&[("new", "2")]);
+        let good = dir.join("good.snap");
+        write_v2(&good, &pairs);
+        let mut bad = std::fs::read(&good).unwrap();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        let bad_path = dir.join("bad.snap");
+        std::fs::write(&bad_path, &bad).unwrap();
+
+        let r = store.install_snapshot(&snap_meta(41), bad_path).await;
+        assert!(r.is_err(), "CRC 不符的 payload 必须拒绝");
+        assert_eq!(
+            sm.read().unwrap().dump_all().unwrap(),
+            old,
+            "拒绝发生在动状态机之前"
+        );
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
+            "校验失败不得留下 marker"
+        );
+        assert!(
+            load_snapshot_registry(&db, dir.join(SNAP_SUBDIR))
+                .unwrap()
+                .is_none(),
+            "registry 不得指向坏 payload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ≥3 批的真实尺寸路径（P4b 验收）：默认小尺寸保证 CI 轻量；
+    /// `DSH_TEST_LARGE_SNAPSHOT=1` 切到 3×45MiB（>128MiB，等价 gate 口径），本地跑一次留证。
+    #[test]
+    fn multi_batch_restore_realistic_size() {
+        let large = std::env::var("DSH_TEST_LARGE_SNAPSHOT").is_ok_and(|v| v == "1");
+        let (per_batch, count) = if large {
+            (45usize << 20, 3usize)
+        } else {
+            (64usize << 10, 3usize)
+        };
+        println!(
+            "[diag] multi_batch mode={} per_batch={}MiB batches={}",
+            if large { "large" } else { "small" },
+            per_batch >> 20,
+            count
+        );
+        let dir = tmpdir("p4b-realistic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for b in 0..count {
+            for i in 0..8 {
+                pairs.push((format!("b{b}-k{i}").into_bytes(), vec![b'v'; per_batch / 8]));
+            }
+        }
+        let path = dir.join("payload.snap");
+        write_v2(&path, &pairs);
+
+        let batches = collect_batches(&path, per_batch);
+        assert!(
+            batches.len() >= count,
+            "应至少 {count} 批, got {}",
+            batches.len()
+        );
+        let flat: Vec<_> = batches.into_iter().flatten().collect();
+        assert_eq!(flat, pairs, "多批内容必须与源一致");
+
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        sm.write()
+            .unwrap()
+            .restore_all(&pairs_of(&[("stale", "1")]))
+            .unwrap();
+        let batches = read_payload_batches(&path, per_batch).unwrap();
+        let mapped = batches.map(|b| {
+            b.map_err(|e| dsh_core::error::Error::internal(format!("snapshot payload: {e}")))
+        });
+        sm.write().unwrap().restore_stream(mapped).unwrap();
+        let state = sm.read().unwrap().dump_all().unwrap();
+        assert_eq!(state.len(), pairs.len());
+        assert!(!state.iter().any(|(k, _)| k == b"stale"), "旧 key 必须被清");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

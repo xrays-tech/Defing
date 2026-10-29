@@ -628,35 +628,53 @@ impl StateMachine {
         self.restore_all_batched(pairs, RESTORE_CHUNK_BYTES)
     }
 
+    /// **流式恢复**（P4b，B1 blocker 的正确形态）：按批消费，**只在第一批之前清空一次**旧状态，
+    /// 后续批只做插入。
+    ///
+    /// 为什么需要独立入口：逐批调用 `restore_all` 会在每批开头重算 `existing` 并把前面已恢复的
+    /// 批删掉（`restore_all_batched` 就是「首批带 deletes」的写法）。流式读（P4b 的
+    /// `PayloadBatches`）必须配这个接口，否则安装大快照会只剩最后一批。
+    ///
+    /// `batches` 的 `Err` 原样向上传播（解析/IO 失败）。语义与 `restore_all` 相同：块之间
+    /// **没有原子性**，中途崩溃/出错是「部分新 + 部分旧」——由 dsh-raft 的 `RESTORE_BEGIN`
+    /// 标记 + boot 重放 或 fail-stop 兜底。
+    ///
+    /// 空流等价于「清空全部状态」（与 `restore_all(&[])` 一致）。
+    pub fn restore_stream<I>(&self, batches: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = Result<crate::store::KeyValuePairs, Error>>,
+    {
+        let mut first = true;
+        for batch in batches {
+            let batch = batch?;
+            if first {
+                // 只要 key（不 materialize value）：本来就有大状态时，旧写法会额外驻留一份 payload。
+                let existing: Vec<Vec<u8>> = self.store.get_prefix_keys(b"")?;
+                self.store.write_batch(&batch, &existing)?;
+                first = false;
+            } else if !batch.is_empty() {
+                self.store.write_batch(&batch, &[])?;
+            }
+        }
+        if first {
+            // 空流：批次从未落地，但「恢复成空状态」仍要清空旧 key。
+            let existing: Vec<Vec<u8>> = self.store.get_prefix_keys(b"")?;
+            if !existing.is_empty() {
+                self.store.write_batch(&[], &existing)?;
+            }
+        }
+        Ok(())
+    }
+
     /// `restore_all` 的分块实现；`chunk_bytes` 可注入（单测用小值验证多块语义）。
+    /// 内部改成「切块 → `restore_stream`」，与流式读路径共用同一份清空/插入语义。
     fn restore_all_batched(
         &self,
         pairs: &[(Vec<u8>, Vec<u8>)],
         chunk_bytes: usize,
     ) -> Result<(), Error> {
-        // 只要 key（不 materialize value）：本来就有大状态时，旧写法会额外驻留一份 payload。
-        let existing: Vec<Vec<u8>> = self.store.get_prefix_keys(b"")?;
-        if pairs.is_empty() {
-            if !existing.is_empty() {
-                self.store.write_batch(&[], &existing)?;
-            }
-            return Ok(());
-        }
-        let mut start = 0usize;
-        let mut first = true;
-        while start < pairs.len() {
-            let mut end = start;
-            let mut bytes = 0usize;
-            while end < pairs.len() && (bytes < chunk_bytes || end == start) {
-                bytes += pairs[end].0.len() + pairs[end].1.len();
-                end += 1;
-            }
-            let deletes: &[Vec<u8>] = if first { &existing } else { &[] };
-            self.store.write_batch(&pairs[start..end], deletes)?;
-            first = false;
-            start = end;
-        }
-        Ok(())
+        let batches = crate::state::chunk_pairs(pairs, chunk_bytes);
+        self.restore_stream(batches.into_iter().map(Ok))
     }
 
     /// 版本裁剪：保留活动版本 + 最近 keep 个版本，删除更早的历史（后台任务用）。
@@ -3669,6 +3687,28 @@ mod tests {
     }
 }
 
+/// 把整份 pairs 按字节预算切批（`restore_all` 用；流式读由 reader 自己控批）。
+/// 单条超过预算时单独成批（保证前进，不产生空批）。
+fn chunk_pairs(
+    pairs: &[(Vec<u8>, Vec<u8>)],
+    chunk_bytes: usize,
+) -> Vec<crate::store::KeyValuePairs> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let budget = chunk_bytes.max(1);
+    while start < pairs.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < pairs.len() && (bytes < budget || end == start) {
+            bytes += pairs[end].0.len() + pairs[end].1.len();
+            end += 1;
+        }
+        out.push(pairs[start..end].to_vec());
+        start = end;
+    }
+    out
+}
+
 #[cfg(test)]
 mod restore_batch_tests {
     use super::*;
@@ -3719,5 +3759,55 @@ mod restore_batch_tests {
         sm.restore_all_batched(&[], 4).unwrap();
         assert!(sm.store.get(b"k0").unwrap().is_none());
         assert!(sm.store.get(b"k1").unwrap().is_none());
+    }
+
+    /// P4b（B1 blocker）：流式恢复**只在第一批前清空一次**——3 批都要存活。
+    /// 若实现按批清空（旧 `restore_all` 逐批调用的写法），第 0 批的 key 会在第 1 批被删掉，
+    /// 这里会立即失败。
+    #[test]
+    fn restore_stream_clears_once_and_keeps_every_batch() {
+        let sm = sm();
+        sm.store.put(b"stale", b"x").unwrap();
+        let b0 = pairs(2, 8);
+        let b1: Vec<(Vec<u8>, Vec<u8>)> = (10..12)
+            .map(|i| (format!("k{i}").into_bytes(), b"v".to_vec()))
+            .collect();
+        let b2: Vec<(Vec<u8>, Vec<u8>)> = (20..22)
+            .map(|i| (format!("k{i}").into_bytes(), b"v".to_vec()))
+            .collect();
+        sm.restore_stream(vec![Ok(b0.clone()), Ok(b1.clone()), Ok(b2.clone())])
+            .unwrap();
+        for batch in [&b0, &b1, &b2] {
+            for (k, v) in batch {
+                assert_eq!(
+                    sm.store.get(k).unwrap().as_deref(),
+                    Some(v.as_slice()),
+                    "第 0 批之后的清空会把前批 key 删掉（B1 回归）"
+                );
+            }
+        }
+        assert!(sm.store.get(b"stale").unwrap().is_none(), "旧 key 必须被清");
+    }
+
+    /// 空流 → 清空全部状态（不能因为「一批都没来」就跳过清空）。
+    #[test]
+    fn restore_stream_empty_clears_state() {
+        let sm = sm();
+        sm.store.put(b"stale", b"x").unwrap();
+        sm.restore_stream(std::iter::empty()).unwrap();
+        assert!(sm.store.get(b"stale").unwrap().is_none());
+    }
+
+    /// 批次错误原样传播；语义如实记录：前面已应用的批不会回滚（由 RESTORE_BEGIN 兜底）。
+    #[test]
+    fn restore_stream_propagates_batch_error() {
+        let sm = sm();
+        let b0 = pairs(2, 4);
+        let err = || Error::internal("payload decode failed");
+        let r = sm.restore_stream(vec![Ok(b0.clone()), Err(err())]);
+        assert!(r.is_err());
+        for (k, v) in &b0 {
+            assert_eq!(sm.store.get(k).unwrap().as_deref(), Some(v.as_slice()));
+        }
     }
 }
