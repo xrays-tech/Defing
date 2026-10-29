@@ -156,3 +156,18 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
   （跨前缀边界 + 游标严格递增）。
 - 尚未做（P4c）：`build_snapshot` 仍 `dump_all()` 整份 + 整份编码；P4c 改为
   「dump_batches → 逐批 encode → seek-back 写 header(含 total_len/crc)」。
+
+## 11. 实现落地（P4c：写端流式 msgpack）
+
+- **`build_snapshot`（v2 路径）不再整份驻留**：`count_prefix_keys`（msgpack 数组头要总数）→
+  `dump_batches(64MiB)` 逐页 → 逐项 `rmp::encode::write_bin` 直接写 `.part` →
+  `CountingCrcWriter` 边写边算 CRC/长度 → **seek 回 0 回填 20B 头** → fsync → rename。
+  头里 `total_len`/`crc32` 仍由创建方写入（B2'），发送前 `verify_payload_file` 复核。
+- **一致性/代价**：读锁贯穿「计数 + 流式写」，保证数组条数与内容来自同一状态视图；
+  代价是快照构建期间写命令要等一次写盘时间（构建是低频事件）。锁内无 await。
+- **v1 路径不变**：默认写端仍是无头 JSON（`serde_json::to_vec(&dump_all())`），回滚即关 flag。
+- **测试**：预算 1B 强制多页时，流式写出的字节与「整份编码」**逐字节一致**（同编码/同顺序）、
+  头 total_len/crc 正确；写→读→install 闭环；空状态产出合法 `array(0)` payload。
+- **体积目标（§6 的 ≤0.75x）**：storm 数据是 60KB ASCII 长值，msgpack 省的是逐条头/引号开销，
+  预计远达不到 −25%——需要实测后按实测改写目标（体积收益主要在二进制/小值/结构化数据；
+  msgpack 的确定收益是解析速度与 RSS）。测量结论见下一轮（P4c storm A/B）。

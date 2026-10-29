@@ -657,6 +657,11 @@ impl StateMachine {
     ///
     /// 前置假设与 `dump_all` 相同：调用方持有状态机读锁（`pending_ops` 只在写命令内部非空，
     /// 此时拿不到读锁），因此这里只读 store，不合并 pending。
+    /// 前缀 key 数量（P4c：msgpack 数组头需要先知道总数）。只扫 key，不取 value。
+    pub fn count_prefix_keys(&self, prefix: &[u8]) -> Result<usize, Error> {
+        Ok(self.store.get_prefix_keys(prefix)?.len())
+    }
+
     pub fn dump_batches(&self, budget: usize) -> DumpBatches<'_> {
         DumpBatches {
             sm: self,

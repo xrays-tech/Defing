@@ -5,7 +5,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dsh_core::error::Error as DshError;
@@ -310,6 +310,67 @@ fn write_payload_file_chunks(
     Ok(final_path)
 }
 
+/// P4c：边写边算 CRC/字节数的 writer（流式写 v2 body 用）。
+struct CountingCrcWriter<W> {
+    inner: W,
+    crc: crate::snapshot_stream::Crc32,
+    n: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for CountingCrcWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let k = self.inner.write(buf)?;
+        self.crc.update(&buf[..k]);
+        self.n += k as u64;
+        Ok(k)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// P4c：流式写 v2 payload —— body 由 `write_body` 边取页边写，**不把整份 payload 构造出来**。
+///
+/// 头部（20B 的 total_len/crc32）在 body 之前，但长度/CRC 只有写完才知道：
+/// 先写 20B 占位 → 流式写 body（同时算 CRC/长度）→ **seek 回 0 回填头部** → fsync → rename。
+/// 掉电安全与 `write_payload_file_chunks` 相同（`.part` + rename + 目录 fsync，失败清理）。
+fn write_payload_v2_streamed<F>(dir: PathBuf, name: String, write_body: F) -> Result<PathBuf, ErrOf>
+where
+    F: FnOnce(&mut CountingCrcWriter<&mut fs::File>) -> Result<(), ErrOf>,
+{
+    use std::io::{Seek, SeekFrom, Write as _};
+    fs::create_dir_all(&dir).map_err(io_write)?;
+    let part_path = dir.join(format!("{}.part", name));
+    let final_path = dir.join(name);
+    let _ = fs::remove_file(&part_path);
+    let done = (|| -> Result<(), ErrOf> {
+        let mut f = fs::File::create(&part_path).map_err(io_write)?;
+        f.write_all(&[0u8; PAYLOAD_HEADER_LEN]).map_err(io_write)?;
+        let (len, crc) = {
+            let mut w = CountingCrcWriter {
+                inner: &mut f,
+                crc: crate::snapshot_stream::Crc32::init(),
+                n: 0,
+            };
+            write_body(&mut w)?;
+            w.flush().map_err(io_write)?;
+            (w.n, w.crc.finish())
+        };
+        let header = encode_payload_header(PAYLOAD_VERSION_MSGPACK, 0, len, crc);
+        f.seek(SeekFrom::Start(0)).map_err(io_write)?;
+        f.write_all(&header).map_err(io_write)?;
+        f.sync_all().map_err(io_write)?;
+        drop(f);
+        fs::rename(&part_path, &final_path).map_err(io_write)?;
+        fsync_dir(&dir)
+    })();
+    if done.is_err() {
+        let _ = fs::remove_file(&part_path);
+    }
+    done?;
+    Ok(final_path)
+}
+
 /// Read a payload file (install-side validation happens in the caller before any state change).
 fn read_payload_file(path: PathBuf) -> Result<Vec<u8>, ErrOf> {
     fs::read(path).map_err(io_read)
@@ -368,6 +429,7 @@ fn decode_payload_header(head: &[u8; PAYLOAD_HEADER_LEN]) -> Result<(u8, u8, u64
     ))
 }
 
+#[cfg(test)]
 fn crc32(bytes: &[u8]) -> u32 {
     let mut c = crate::snapshot_stream::Crc32::init();
     c.update(bytes);
@@ -416,6 +478,7 @@ impl<R: std::io::Read> std::io::Read for CountingCrcReader<R> {
 
 /// P4a2 v2 body 编码：`array(n) of [bin(k), bin(v)]`。
 /// 直接走 `rmp::encode::write_bin` —— `rmp_serde` 会把 `Vec<u8>` 编成 int 序列（体积翻倍）。
+#[cfg(test)]
 fn encode_msgpack_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>, ErrOf> {
     let mut out = Vec::new();
     let n = u32::try_from(pairs.len())
@@ -1375,6 +1438,8 @@ pub struct StateMachineStore {
     /// P4a2 写端格式：`PAYLOAD_FORMAT_JSON`（默认，无头 JSON）/
     /// `PAYLOAD_FORMAT_MSGPACK`（v2：带头 msgpack）。读端两种都认。
     payload_format: Arc<AtomicU8>,
+    /// P4c：写端分页预算（`dump_batches` 每页字节数；默认 64MiB，测试可调小以强制多页）。
+    payload_batch_bytes: Arc<AtomicUsize>,
     /// P4-A A3 fail-stop：restore 失败（非进程死亡）后置位。置位期间 apply / 快照构建 /
     /// `get_current_snapshot` 全部拒绝，dsh-api 据此对 HTTP 读写返回 503——不能带着
     /// 「部分新 + 部分旧」的混合状态继续服务。解除方式：一次完整成功的 install_snapshot，
@@ -1433,6 +1498,7 @@ impl StateMachineStore {
             last_applied_calls: Arc::new(AtomicU64::new(0)),
             restore_marker: Arc::new(AtomicBool::new(restore_marker)),
             payload_format: Arc::new(AtomicU8::new(payload_format)),
+            payload_batch_bytes: Arc::new(AtomicUsize::new(RESTORE_BATCH_BYTES)),
             poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1441,6 +1507,13 @@ impl StateMachineStore {
     #[doc(hidden)]
     pub fn set_restore_marker(&self, enabled: bool) {
         self.restore_marker.store(enabled, Ordering::Relaxed);
+    }
+
+    /// P4c：写端分页预算覆盖（测试用，强制多页；0/未设置 = 64MiB）。
+    #[doc(hidden)]
+    pub fn set_payload_batch_bytes(&self, bytes: usize) {
+        self.payload_batch_bytes
+            .store(bytes.max(1), Ordering::Relaxed);
     }
 
     /// P4a2：写端格式的进程内覆盖（测试用；生产走 `DSH_RAFT_SNAPSHOT_PAYLOAD=msgpack`）。
@@ -1688,10 +1761,30 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
         // P4a2 写端：v2 = 20B 头（total_len + crc32）+ msgpack body；v1 = 无头 JSON（P3 原样）。
         // 头与 body 分两段写（`write_payload_file_chunks`），不为拼「头 + 体」再复制一份 payload。
         let path = if self.inner.payload_format.load(Ordering::Relaxed) == PAYLOAD_FORMAT_MSGPACK {
-            let body = encode_msgpack_pairs(&pairs)?;
-            let header =
-                encode_payload_header(PAYLOAD_VERSION_MSGPACK, 0, body.len() as u64, crc32(&body));
-            write_payload_file_chunks(dir, name, &[&header, &body])?
+            // P4c：写端流式 —— dump 分页（P4c0）→ 逐页编码 → 直接落 .part，body 不整份驻留。
+            // 读锁贯穿「计数 + 流式写」：msgpack 数组头需要总数，且计数与内容必须同一状态视图
+            // （锁内无 await，不会挂住 reactor）。代价是快照构建期间写命令等待更久（一次写盘时间）。
+            let sm = self.inner.sm.read().map_err(|e| io_read(e.to_string()))?;
+            let total = sm.count_prefix_keys(b"").map_err(storage_err)?;
+            let budget = self.inner.payload_batch_bytes.load(Ordering::Relaxed);
+            write_payload_v2_streamed(dir, name, |w| {
+                let n = u32::try_from(total)
+                    .map_err(|_| io_write("snapshot too many pairs for msgpack array length"))?;
+                rmp::encode::write_array_len(w, n)
+                    .map_err(|e| io_write(format!("payload msgpack array header: {e}")))?;
+                for page in sm.dump_batches(budget) {
+                    let page = page.map_err(storage_err)?;
+                    for (k, v) in page {
+                        rmp::encode::write_array_len(w, 2)
+                            .map_err(|e| io_write(format!("payload msgpack item header: {e}")))?;
+                        rmp::encode::write_bin(w, &k)
+                            .map_err(|e| io_write(format!("payload msgpack key: {e}")))?;
+                        rmp::encode::write_bin(w, &v)
+                            .map_err(|e| io_write(format!("payload msgpack value: {e}")))?;
+                    }
+                }
+                Ok(())
+            })?
         } else {
             let data = serde_json::to_vec(&pairs).map_err(|e| io_write(e.to_string()))?;
             write_payload_file(dir, name, &data)?
@@ -1826,6 +1919,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 last_applied_calls: self.last_applied_calls.clone(),
                 restore_marker: self.restore_marker.clone(),
                 payload_format: self.payload_format.clone(),
+                payload_batch_bytes: self.payload_batch_bytes.clone(),
                 poisoned: self.poisoned.clone(),
             }),
         }
@@ -3731,6 +3825,103 @@ mod p4b_tests {
         let state = sm.read().unwrap().dump_all().unwrap();
         assert_eq!(state.len(), pairs.len());
         assert!(!state.iter().any(|(k, _)| k == b"stale"), "旧 key 必须被清");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------- P4c：写端流式 msgpack（dump 分页 → 直接落盘） ----------------
+
+#[cfg(test)]
+mod p4c_tests {
+    use super::tests::{open_storage, tmpdir};
+    use super::*;
+
+    async fn msgpack_store_with_budget(
+        tag: &str,
+        budget: usize,
+    ) -> (
+        std::path::PathBuf,
+        Arc<RwLock<StateMachine>>,
+        StateMachineStore,
+    ) {
+        let dir = tmpdir(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let store = StateMachineStore::new(sm.clone(), storage.raw_db(), dir.clone());
+        store.set_msgpack_payload(true);
+        store.set_payload_batch_bytes(budget);
+        (dir, sm, store)
+    }
+
+    fn seed(sm: &Arc<RwLock<StateMachine>>, n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+            .map(|i| (format!("k{i:03}").into_bytes(), vec![b'v'; 40]))
+            .collect();
+        sm.write().unwrap().restore_all(&pairs).unwrap();
+        pairs
+    }
+
+    /// P4c：流式写的字节必须与「整份编码」逐字节一致（同一编码器、同一顺序）。
+    /// 预算 1 字节 → `dump_batches` 每页一条（强制多页），验证分页不影响内容。
+    #[tokio::test]
+    async fn streamed_write_is_byte_identical_and_multi_page() {
+        let (dir, sm, mut store) = msgpack_store_with_budget("p4c-identical", 1).await;
+        let pairs = seed(&sm, 25);
+        let expected_body = encode_msgpack_pairs(&pairs).unwrap();
+
+        let mut builder = store.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let raw = std::fs::read(&snap.snapshot).unwrap();
+        let mut head = [0u8; PAYLOAD_HEADER_LEN];
+        head.copy_from_slice(&raw[..PAYLOAD_HEADER_LEN]);
+        let (version, flags, total_len, crc) = decode_payload_header(&head).unwrap();
+        assert_eq!((version, flags), (PAYLOAD_VERSION_MSGPACK, 0));
+        assert_eq!(total_len as usize, expected_body.len());
+        assert_eq!(crc, crc32(&expected_body));
+        assert_eq!(
+            &raw[PAYLOAD_HEADER_LEN..],
+            expected_body.as_slice(),
+            "流式写必须与整份编码逐字节一致"
+        );
+        // 多页路径也确实被走到了（预算 1B → 每页 1 条，25 页）
+        let pages = sm.read().unwrap().dump_batches(1).count();
+        assert!(pages >= 25, "应为多页 dump, got {pages}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P4c：流式写出的 payload 能被流式读 + 恢复（端到端闭环：write → read → restore）。
+    #[tokio::test]
+    async fn streamed_payload_roundtrips_through_install() {
+        let (dir, sm, mut store) = msgpack_store_with_budget("p4c-roundtrip", 200).await;
+        let pairs = seed(&sm, 17);
+        let mut builder = store.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        // 新节点：把 leader 的 payload 当 incoming 装进去
+        let n2 = dir.join("n2");
+        let storage2 = open_storage(&n2);
+        let sm2 = Arc::new(RwLock::new(StateMachine::new(Box::new(storage2.clone()))));
+        let mut store2 = StateMachineStore::new(sm2.clone(), storage2.raw_db(), n2);
+        store2
+            .install_snapshot(&snap.meta, snap.snapshot.clone())
+            .await
+            .unwrap();
+        assert_eq!(sm2.read().unwrap().dump_all().unwrap(), pairs);
+        assert!(verify_payload_file(&snap.snapshot).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空状态：流式写也要产出合法 payload（array(0) + 正确头），读端得到空状态。
+    #[tokio::test]
+    async fn streamed_write_handles_empty_state() {
+        let (dir, sm, mut store) = msgpack_store_with_budget("p4c-empty", 64).await;
+        assert!(sm.read().unwrap().dump_all().unwrap().is_empty());
+        let mut builder = store.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let raw = std::fs::read(&snap.snapshot).unwrap();
+        assert_eq!(raw[PAYLOAD_HEADER_LEN], 0x90, "空 msgpack 数组头 = 0x90");
+        assert!(read_payload_pairs(&snap.snapshot).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
