@@ -424,6 +424,7 @@ install 窗口 = `full-snapshot transfer start` → `install full snapshot` → 
 | 整改后（6k 写，`p3d-storm4`） | 269.5MB | **1.779s**（transfer 0.747 + apply 1.031） | 10.2s | 368MB (1.37x) | C3/C4 断言全开 |
 | 整改后（12k 写，`p3g-gate`，全项目比对判据） | 397.4MB | **2.727s** | 10.2s | 483.5MB (1.22x) | 5/5 kill 验证+换人，8 项目逐项相等 |
 | 整改后（12k 写，`p3l-gate`，episode 口径含 retry） | 389.8MB | **3.859s**（attempts=2，最后一次 2.673s） | 9.6s | 482.7MB，净增量 0.55x | 5/5 kill 验证+换人；episode 内 0 次无法解释竞选 |
+| **验收用**（12k 写，`p3m-gate`，rebuild 后 provenance 生效） | 384.2MB | **3.739s**（attempts=2，末次 2.53s） | 8.0s | 474.8MB，净增量 0.62x | git_rev=b75f6e5 + 干净工作树 + bin_mtime>源码 mtime；5/5 kill 验证+换人；无法解释竞选 0 |
 
 **C3/C4 证据口径**（harness 现在会断言，不再只报告）：
 - C3：每次 leader kill（load 与 snapshot 阶段都算）都先确认目标**自认 leader**（`members[].is_leader`），
