@@ -4717,9 +4717,11 @@ mod p4a_force_boot_tests {
             crate::dev_config(),
         )
         .await;
+        let err = r.expect_err("poisoned + purged 日志必须 fail-fast（不能拿混合状态重建快照）");
+        let msg = format!("{err:?}");
         assert!(
-            r.is_err(),
-            "poisoned + purged 日志必须 fail-fast（不能拿混合状态重建快照）"
+            msg.contains("poisoned") || msg.contains("mixed state"),
+            "fail-fast 的原因必须是「拒绝从混合状态构建快照」，实际：{msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

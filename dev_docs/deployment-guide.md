@@ -380,7 +380,9 @@ msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / 
   - 该 fail-stop 是**持久化**的（raft-meta 的 `restore_poison` 键）：重启后仍是 503；FORCE 会
     **保留** restore 标记——下次不带 FORCE 启动时走正常重放（安全路径）并自动解除 poison。
   - 已 poison 启动的节点若 leader 先给它发的是普通日志（而不是快照），openraft 会把 apply 的
-    Err 当 fatal，节点会退出；即「等 leader 重发快照自愈」只在 leader 的下一条消息是快照时成立。
+    Err 当 fatal：**Raft core 停止、进程仍在**（`/healthz` 仍 200、`/readyz` 与 API 503，
+    k8s 不会因此重启 pod）→ 需要人工重启/清卷重建；「等 leader 重发快照自愈」只在 leader 的
+    下一条消息是快照时成立。
 
 **恢复失败后的 fail-stop（poison）**：非崩溃型 restore 错误（如磁盘 IO）会让节点进入 fail-stop：
 
