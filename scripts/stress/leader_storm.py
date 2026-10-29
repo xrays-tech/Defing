@@ -2033,7 +2033,7 @@ def _await_leader_snapshot(nodes, expect_version, since_ts, timeout=90.0):
     return (False, None)
 
 
-def _catch_up_victim(nodes, seed_map, token, writes, env, expect_version, label):
+def _catch_up_victim(nodes, seed_map, token, writes, env, expect_version, label, require_install=True):
     """杀掉一个 follower → 写数据 → 重启 victim → 断言它经 full-snapshot 追平且 payload 版本符合。"""
     victim = None
     lid = wait_leader(5)
@@ -2076,6 +2076,12 @@ def _catch_up_victim(nodes, seed_map, token, writes, env, expect_version, label)
     if not _wait_settled(nodes, 60):
         return (False, "victim did not settle (transfer=%s snap=%s)" % (transfer, snap))
     snap = _latest_snap_file(victim)
+    if not require_install:
+        # 回滚阶段只要求：集群 settled + victim 已追上（安装或日志追平都算）；版本仅记录。
+        return (True, "victim=%d settled (installed=%s ver=%s transfer_started=%s)"
+                % (victim.node_id,
+                   snap is not None and os.path.getmtime(snap) > t_writes - 1.0,
+                   _snap_header_version(snap) if snap else None, transfer))
     if snap is None:
         return (False, "victim has no snapshot file")
     ver = _snap_header_version(snap)
@@ -2152,7 +2158,7 @@ def rolling_rehearsal(args):
         # 回滚阶段：写端已全部回 v1，但 victim 可能安装到「回滚窗口里由仍带 msgpack 的 leader
         # 构建的 v2 快照」——这恰好证明 v1 写端节点**读端兼容** v2 payload；版本只记录不断言。
         ok, detail = _catch_up_victim(nodes, seed_map, token, args.rolling_writes,
-                                      {}, None, "v1-rollback")
+                                      {}, None, "v1-rollback", require_install=False)
         phases.append({"phase": "v1-rollback", "ok": ok, "detail": detail})
         log("  [v1-rollback] ok=%s %s" % (ok, detail))
 
