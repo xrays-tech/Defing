@@ -92,6 +92,8 @@ jobs:
   #   1) 二进制 + harness 在 runner 上能端到端跑通；
   #   2) 判定逻辑（C3/C4 断言、install 窗口、选举归属、心跳采样）在真实数据上成立。
   # runner 比本地慢且抖动大，预算放宽到 120s / 快照下限 20MB，避免 flaky。
+  # P4：1500 写在本机只到 ~17MB（低于 20MB 下限）→ 提到 2500 写留出规模余量（多出的 bulk
+  # 时间约 1 分钟，远低于本 job 的 25min 超时）。完整 100MB+/30s 预算的 gate 仍本地跑。
   storm:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -117,7 +119,7 @@ jobs:
         run: |
           ./scripts/stress-leader-storm.sh --no-build \
             --bin server/target/release/defing \
-            --profile storm --duration 8 --leader-kills 2 --snapshot-writes 1500 \
+            --profile storm --duration 8 --leader-kills 2 --snapshot-writes 2500 \
             --chaos-during-snapshot --catchup-timeout 90 \
             --max-install-seconds 120 --min-snapshot-bytes 20000000 --keep
 

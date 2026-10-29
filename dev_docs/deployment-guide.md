@@ -344,6 +344,43 @@ curl -s -H "$AUTH" -X POST http://127.0.0.1:8384/api/v1/cluster/promote \
   body limit 裕头；P3a-C1 also caps log-reader batches at `MAX_BATCH_BYTES` = 6MiB stored
   bytes — that bounds AppendEntries RPC size, not snapshot frames).
 
+### 6.6 快照 payload v2（msgpack）发布与「恢复中断」运维语义（P4）
+
+**两阶段发布（不要跳步）**：新格式（v2：20B 头 `DSHSNP | version | flags | total_len | crc32` +
+msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / v2 都认），**写端默认仍是 v1**。
+
+1. 先滚动升级到「读端双兼容」的版本（本文对应的版本），确认全集群无旧二进制；
+2. 再给**所有节点**加 `DSH_RAFT_SNAPSHOT_PAYLOAD=msgpack` 并滚动重启（写端 v2）；启动日志会打印
+   `snapshot payload writer: v2 (msgpack + total_len/crc32 header)`；
+3. **回滚**：去掉该环境变量并重启即可（写端回到无头 JSON）；已落盘的 v2 payload 仍可被读/安装，
+   不需要回滚数据。**不要**让旧于「读端双兼容」的二进制去读 v2 payload（会报
+   `unsupported snapshot payload version 2`，该节点无法经快照追平）。
+
+**payload 完整性**：带头的 payload 在**发送前**（`verify_payload_file`）、**安装时**、**boot 重放时**
+三处都校验 `total_len + crc32`；校验失败报错并**保留文件**（不静默删除）。无头旧文件没有完整性头，
+只能靠帧级 CRC 与传输层。
+
+**恢复中断（restore-in-progress）语义**：安装快照的 restore 是分块写（无单事务原子性）。安装开始时
+在 raft-meta 写 `restore_begin{meta, payload}`，registry 提交后清除；重启若见到该标记：
+
+- 用同一 payload **重放一次全量 restore**（幂等）后才继续启动 → 异常重启可能多花一次 restore 时间
+  （400MB 级别约 1–2s），运维手册按此预留启动探针的 `initialDelaySeconds`；
+- payload 缺失/损坏、标记损坏 → **拒绝启动**（日志给出 payload 路径 + 从备份恢复或清卷重建的指引），
+  不会带着「部分新 + 部分旧」的混合状态起来；
+- `DSH_RAFT_RESTORE_MARKER=0` **只关闭写标记**（发布期兜底；崩溃窗口重新变大），已有的标记
+  **仍会被重放**；`DSH_RAFT_RESTORE_FORCE=1` 才是「忽略标记、允许混合状态启动」的逃生门
+  （ERROR 日志，需人工确认数据一致性后使用）。
+
+**恢复失败后的 fail-stop（poison）**：非崩溃型 restore 错误（如磁盘 IO）会让节点进入 fail-stop：
+
+- HTTP 管理面/数据面（除 `/healthz`、`/metrics`、`/admin*`）返回 **503 `ERR_RESTORE_POISONED`**，
+  `/readyz` 503（LB 摘除），gRPC 数据面 UNAVAILABLE；日志有 `state machine POISONED (fail-stop)`；
+- 处置：**重启该节点**（带标记 → boot 重放；无标记 → 需要重装快照/重建）。不要直接放流量。
+
+**内存/磁盘**：v2 的读端按 64MiB 分批恢复、写端按 64MiB 分页 dump（写端不再整份驻留）；v1（默认）
+仍是整份 JSON 解析路径（升级期），追平期 RSS 规划不变（net ≤ 2x）；磁盘峰值仍是快照的约 3 倍
+（旧 canonical + 收到的 payload + install 的 canonical 副本）。
+
 ---
 
 ## 7. 部署方式三：Docker / docker-compose

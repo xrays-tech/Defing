@@ -541,7 +541,14 @@ fn decode_msgpack_pairs<R: std::io::Read>(r: &mut R) -> Result<Vec<(Vec<u8>, Vec
 
 /// P4b（设计 §3 / §7 B1）：安装/重放时**按批流式**读 payload 的批预算（每批 ≤ 该字节数；
 /// 单条超预算时单独成批）。与 dsh-core `restore_stream` 配对使用。
-pub const RESTORE_BATCH_BYTES: usize = 64 * 1024 * 1024;
+///
+/// 16MiB 而不是 64MiB：每批的峰值 ≈ 批 pairs（堆）+ redb `write_batch` 事务缓冲（≈1–2x），
+/// 64MiB 批在 99MB 快照上实测把 install 窗口净增量推到 3.15x（P4c 12k storm），低于 16MiB 后
+/// 每批固定开销被压到 ~50MB。批数变多（358MB → 22 批）只多 20 来次 fsync，对 install 时间无感。
+pub const RESTORE_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+/// P4c 写端分页预算（`dump_batches` 每页字节数）：写端峰值 ≈ 一页 + 编码缓冲，64MiB 合理。
+pub const DUMP_PAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// 流式 payload 批次迭代器：v2（msgpack）逐项解码、按预算切批；v1（JSON，无头或带头）
 /// 先整份解析再切批（升级期一次性路径，设计 §3）。
@@ -1498,7 +1505,7 @@ impl StateMachineStore {
             last_applied_calls: Arc::new(AtomicU64::new(0)),
             restore_marker: Arc::new(AtomicBool::new(restore_marker)),
             payload_format: Arc::new(AtomicU8::new(payload_format)),
-            payload_batch_bytes: Arc::new(AtomicUsize::new(RESTORE_BATCH_BYTES)),
+            payload_batch_bytes: Arc::new(AtomicUsize::new(DUMP_PAGE_BYTES)),
             poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
