@@ -3932,3 +3932,117 @@ mod p4c_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ---------------- P4 gate：大快照安装的 RSS/时间尺度探针 ----------------
+
+#[cfg(test)]
+mod p4_scale_tests {
+    use super::tests::{open_storage, snap_meta, tmpdir};
+    use super::*;
+
+    fn rss_kb() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                return rest
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    /// 大快照安装的「净增量 RSS / 快照字节」与 install 耗时（P4 gate 尺度证据）。
+    ///
+    /// 默认 `#[ignore]`（~350MB payload、~10s、~700MB 磁盘）；显式运行：
+    /// ```bash
+    /// DSH_TEST_LARGE_INSTALL=1 cargo test -p dsh-raft --lib large_install_rss_probe \
+    ///   -- --ignored --nocapture --test-threads=1
+    /// ```
+    /// payload 用**流式写**生成（不整份驻留），baseline 在生成之后采样 → delta 反映安装路径本身。
+    #[ignore = "尺度探针：~350MB payload；gate 时显式运行（见注释）"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_install_rss_probe() {
+        let total: u64 = std::env::var("DSH_TEST_LARGE_INSTALL_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(350 * 1024 * 1024);
+        let value_bytes = 58 * 1024usize;
+        let count = (total as usize / (value_bytes + 32)).max(1);
+        let dir = tmpdir("p4-scale");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let gen_dir = dir.join("gen");
+        let t0 = std::time::Instant::now();
+        let path = write_payload_v2_streamed(gen_dir, "incoming.snap".to_string(), |w| {
+            let n = u32::try_from(count).map_err(|_| io_write("too many pairs"))?;
+            rmp::encode::write_array_len(w, n)
+                .map_err(|e| io_write(format!("array header: {e}")))?;
+            let mut i = 0usize;
+            while i < count {
+                let end = (i + 64).min(count);
+                for j in i..end {
+                    let k = format!("k{j:07}");
+                    let v = vec![b'v'; value_bytes];
+                    rmp::encode::write_array_len(w, 2)
+                        .map_err(|e| io_write(format!("item header: {e}")))?;
+                    rmp::encode::write_bin(w, k.as_bytes())
+                        .map_err(|e| io_write(format!("key: {e}")))?;
+                    rmp::encode::write_bin(w, &v).map_err(|e| io_write(format!("value: {e}")))?;
+                }
+                i = end;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let gen_secs = t0.elapsed().as_secs_f64();
+        let snapshot = std::fs::metadata(&path).unwrap().len();
+        assert!(verify_payload_file(&path).is_ok());
+
+        let storage = open_storage(&dir.join("victim"));
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), storage.raw_db(), dir.join("victim"));
+        let meta = snap_meta(9_000);
+        let baseline = rss_kb();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(baseline));
+        let sampler = {
+            let stop = stop.clone();
+            let peak = peak.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let r = rss_kb();
+                    peak.fetch_max(r, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            })
+        };
+        let t1 = std::time::Instant::now();
+        store.install_snapshot(&meta, path).await.unwrap();
+        let install_secs = t1.elapsed().as_secs_f64();
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap();
+        let peak = peak.load(Ordering::Relaxed);
+
+        let delta_kib = peak.saturating_sub(baseline);
+        let net = (delta_kib as f64 * 1024.0) / snapshot as f64;
+        let raw = (peak as f64 * 1024.0) / snapshot as f64;
+        println!(
+            "[p4-scale] payload={}MiB count={count} gen={gen_secs:.2}s install={install_secs:.2}s \
+             baseline={baseline}KiB peak={peak}KiB delta={}MiB net={net:.2}x raw={raw:.2}x",
+            snapshot >> 20,
+            delta_kib >> 10
+        );
+        assert_eq!(
+            sm.read().unwrap().dump_all().unwrap().len(),
+            count,
+            "恢复后的 key 数必须等于 payload 条数"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
