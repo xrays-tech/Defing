@@ -85,6 +85,10 @@ VERSION 2: BODY = msgpack：数组 header(n) + 逐项 [bin(k), bin(v)]
   混跑矩阵与「协调重启」作为备选写进 runbook。
 - **B2'（major）payload 级完整性**：头部补 `total_len` + body 的 `CRC32`（帧 CRC 只保护 wire，
   且由发送方对可能已损坏的文件计算）；install、boot replay、发送前都校验；加截断/损坏测试。
+- **B3 基线更正（P4base 重跑，2026-10-29）**：修正 harness 基线采样后重跑 12k gate：
+  snapshot 358.2MB、episode 3.611s（attempts=2，末次 2.474s）、窗口 RSS 468.0MB / 基线 118.9MB
+  → **net ≈ 1.00x、raw ≈ 1.31x**。此前 0.62/0.64 是「用 transfer 后采样当基线」的虚低值，作废。
+  P4b 目标据此改为 `net <= 1.2x`（有界内存的相对改进），不再沿用 0.7x。
 - **B3（major）口径统一**：只认两个指标 —— `net = (window_max - baseline)/snapshot`（1024 换算）
   与 `raw = window_max/snapshot`。P3m 基线：net 0.64x / raw 1.24x；目标写成 `net <= 0.7x`。
 - **B4（major）撤回错误声明**：现有测试只注入 1/4 字节 chunk 的**分块**测试，没有 64MiB 多批流式
