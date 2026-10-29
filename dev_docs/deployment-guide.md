@@ -329,8 +329,10 @@ curl -s -H "$AUTH" -X POST http://127.0.0.1:8384/api/v1/cluster/promote \
   `DefaultBodyLimit::disable()`，其余 `/raft/*` RPC 仍是 **32MiB**。因此反向代理/网关
   （nginx `client_max_body_size`、ingress、ALB 等）必须按**最大快照尺寸**配置
   （design §8.4：上限 ≥ 最大快照，且建议 `proxy_request_buffering off` 以流式转发），
-  只按「per-frame ~2MiB」配置会让 snapshot POST 恒 HTTP 413 `length limit exceeded`，
-  follower 经 snapshot 路径无法追平。
+  只按「per-frame ~1MiB+4KiB」配置会让 snapshot POST 恒 HTTP 413 `length limit exceeded`，
+  follower 经 snapshot 路径无法追平。服务端 `snapshot_stream` 的 `MAX_SNAPSHOT_BYTES = 640MiB`
+  是单次 in-flight 快照的硬上限；追平期间磁盘峰值约为**快照的 3 倍**（旧 canonical + 收到的
+  payload + install 的 canonical 副本），规划 data 分区时按此预留。
 - **follower 长期落后，排查顺序**：
   1. `GET /api/v1/cluster/members` 看 per-member `lag`（= `last_log_index` − `last_applied`；
      恒 `null` 时查询非 leader 节点——leader 观察的 replication 数据只在 leader）；

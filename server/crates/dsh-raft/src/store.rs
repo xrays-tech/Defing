@@ -203,9 +203,12 @@ fn write_payload_file(dir: PathBuf, name: String, bytes: &[u8]) -> Result<PathBu
     let _ = fs::remove_file(&part_path);
     let done = match fs::write(&part_path, bytes) {
         Err(e) => Err(io_write(e)),
-        Ok(()) => match fs::rename(&part_path, &final_path) {
+        Ok(()) => match fs::File::open(&part_path).and_then(|f| f.sync_all()) {
             Err(e) => Err(io_write(e)),
-            Ok(()) => Ok(()),
+            Ok(()) => match fs::rename(&part_path, &final_path) {
+                Err(e) => Err(io_write(e)),
+                Ok(()) => fsync_dir(&dir),
+            },
         },
     };
     if done.is_err() {
@@ -236,6 +239,19 @@ fn read_payload_pairs(path: &std::path::Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
 /// 文件移走，再叠加 `delete_old_snapshot_file` 就直接删掉刚登记的快照；copy 失败时输入
 /// 保持原样，registry 仍指向可用文件。名字带进程 nonce + 自增 seq（见 `snap_file_name`），
 /// 不会覆盖既有 canonical 文件。
+/// rename 之后 fsync 目录，保证「registry 指向新文件」在掉电后仍成立。
+/// 某些平台/文件系统不允许打开目录：降级为 warn（不阻断安装），但记录。
+fn fsync_dir(dir: &std::path::Path) -> Result<(), ErrOf> {
+    match fs::File::open(dir) {
+        Ok(f) => f.sync_all().map_err(io_write),
+        Err(e) => {
+            tracing::warn!("fsync snapshots dir {}: {e}", dir.display());
+            Ok(())
+        }
+    }
+}
+
+
 fn copy_payload_file(dir: PathBuf, name: String, src: &std::path::Path) -> Result<PathBuf, ErrOf> {
     fs::create_dir_all(&dir).map_err(io_write)?;
     let part_path = dir.join(format!("{name}.part"));
@@ -245,8 +261,16 @@ fn copy_payload_file(dir: PathBuf, name: String, src: &std::path::Path) -> Resul
         let _ = fs::remove_file(&part_path);
         return Err(io_read(e));
     }
+    // 先 fsync 数据再 rename，最后 fsync 目录：避免「registry 已提交、payload 却是截断/未落盘」
+    // （复核 major：power loss 下 registry→truncated payload）。
+    fs::File::open(&part_path)
+        .and_then(|f| f.sync_all())
+        .map_err(io_write)?;
     match fs::rename(&part_path, &final_path) {
-        Ok(()) => Ok(final_path),
+        Ok(()) => {
+            fsync_dir(&dir)?;
+            Ok(final_path)
+        }
         Err(e) => {
             let _ = fs::remove_file(&part_path);
             Err(io_write(e))
