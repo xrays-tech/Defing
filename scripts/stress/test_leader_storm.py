@@ -232,20 +232,41 @@ class C4AssertionsTest(unittest.TestCase):
         info["victim_db_file_bytes"] = None
         self.assertTrue(any("redb 尺寸" in e for e in ls.c4_errors(args(), info, True)))
 
-    def test_rss_delta_absolute_budget_not_payload(self):
-        """同一净增量：payload 386MB（v1 JSON 4x 膨胀）与 95MB（v2）都不影响判定。"""
+    def test_rss_budget_scales_with_payload(self):
+        """预算 = min(320MiB, 192 + payload)：
+        - payload 386MB（v1）→ 预算 320MiB；delta 350MiB 超预算 → 失败
+        - payload 95MB（v2）→ 预算 ~283MiB；同一 delta 350MiB → 失败
+        - payload 95MB、delta 300MiB > 283 → 仍然失败（不再被大上限放过）
+        - payload 95MB、delta 250MiB → 通过
+        """
         info = good_info()
-        info["snapshot_bytes"] = 386_000_000   # v1 的膨胀 payload
         info["victim_rss_baseline_kb"] = 100_000
-        info["victim_rss_max_in_window_kb"] = 450_000  # delta 350MiB > 320MiB 预算 → 失败
+        # v1 payload
+        info["snapshot_bytes"] = 386_000_000
+        info["victim_rss_max_in_window_kb"] = 450_000  # 350MiB
         self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(args(), info, True)))
-        # 同一 delta，payload 缩到 v2 尺寸 → 判定不变
+        # v2 payload，同一 delta
         info["snapshot_bytes"] = 95_000_000
         self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(
             args(min_snapshot_bytes=0), info, True)))
-        # 预算内（delta 300MiB）；payload 仍是 95MB，用 min_snapshot_bytes=0 排除规模下限干扰
+        # v2 payload，delta 300MiB > 283 预算
         info["victim_rss_max_in_window_kb"] = 400_000
+        self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(
+            args(min_snapshot_bytes=0), info, True)))
+        # v2 payload，delta 250MiB → 通过（VmHWM 也要一起降，否则 max() 取到旧峰值）
+        info["victim_rss_max_in_window_kb"] = 350_000
+        info["victim_peak_rss_kb"] = 350_000
         self.assertEqual(ls.c4_errors(args(min_snapshot_bytes=0), info, True), [])
+
+    def test_rss_budget_catches_whole_payload_residency(self):
+        """整份 payload 额外驻留（+1x payload）必须超预算——这是预算公式的核心目的。"""
+        info = good_info()
+        info["snapshot_bytes"] = 95_000_000          # ~90.6MiB
+        info["victim_rss_baseline_kb"] = 100_000
+        # 合法增量 200MiB + 额外一份 90.6MiB ≈ 291MiB > min(320, 192+90.6=282.6)
+        info["victim_rss_max_in_window_kb"] = 100_000 + 291 * 1024
+        self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(
+            args(min_snapshot_bytes=0), info, True)))
 
     def test_rss_uses_vmhwm_when_window_sample_lower(self):
         """窗口采样漏采峰值时用 VmHWM：window 150MiB 但 VmHWM 350MiB → 超预算判失败。"""

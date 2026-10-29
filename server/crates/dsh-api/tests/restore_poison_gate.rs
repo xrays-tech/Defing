@@ -109,6 +109,24 @@ async fn poisoned_node_returns_503_but_stays_live() {
         "gRPC 读取入口在 poison 时必须拒绝"
     );
 
+    // gRPC `watch`：版本历史重放不走 linearized_read，必须自己门控（不做任何鉴权之前就拒绝）
+    {
+        use dsh_api::grpc::config_service_server::ConfigService;
+        use dsh_api::grpc::{ConfigGrpcService, WatchRequest};
+        let svc = ConfigGrpcService {
+            state: s.state.clone(),
+        };
+        let req = tonic::Request::new(WatchRequest {
+            project: "p".into(),
+            branch: "main".into(),
+            after_version: 1,
+        });
+        match svc.watch(req).await {
+            Err(e) => assert_eq!(e.code(), tonic::Code::Unavailable),
+            Ok(_) => panic!("poisoned gRPC watch 必须拒绝"),
+        }
+    }
+
     // 解除后语义恢复：未鉴权 → 401（说明请求已到达鉴权层，不再被 fail-stop 门拦截）
     s.poison.store(false, Ordering::SeqCst);
     let (code, body) = req(&s.base, "GET", "/api/v1/projects", None).await;

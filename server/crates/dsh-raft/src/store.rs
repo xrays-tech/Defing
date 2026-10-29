@@ -70,6 +70,10 @@ const META_MEMBERSHIP: &[u8] = b"membership";
 //   - 标记指向的 payload 就是 registry 即将指向的路径（同一个 `path`）；
 //   - 启动清扫必须把 marker payload 并入 keep-set，否则会在重放前把它当 orphan 删掉（A1 blocker）。
 const META_RESTORE_BEGIN: &[u8] = b"restore_begin";
+/// 持久化 fail-stop 标记：restore 失败 / FORCE 忽略 marker 后写一次。进程内 `poisoned`
+/// 是 AtomicBool，重启会丢；这个键保证「混合状态」不会因为重启而变成可服务状态。
+/// 只有一次完整成功的快照安装（或 boot 重放成功）才清除它。
+const META_POISON: &[u8] = b"restore_poison";
 
 /// `META_RESTORE_BEGIN` 的值（raft-meta 表，JSON；与 registry 同库同事务语义）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1464,6 +1468,8 @@ pub struct StateMachineStore {
     payload_batch_bytes: Arc<AtomicUsize>,
     /// P4b 读端分批预算（install/boot 重放；默认 16MiB，测试可调小以强制多批）。
     restore_batch_bytes: Arc<AtomicUsize>,
+    /// 测试注入：模拟 `meta_del(META_RESTORE_BEGIN)` 失败（R2 的 fail-stop 路径）。
+    fail_clear_marker: Arc<AtomicBool>,
     /// P4-A A3 fail-stop：restore 失败（非进程死亡）后置位。置位期间 apply / 快照构建 /
     /// `get_current_snapshot` 全部拒绝，dsh-api 据此对 HTTP 读写返回 503——不能带着
     /// 「部分新 + 部分旧」的混合状态继续服务。解除方式：一次完整成功的 install_snapshot，
@@ -1511,7 +1517,7 @@ impl StateMachineStore {
                  (release-period escape hatch only). Existing markers are still replayed on boot."
             );
         }
-        Self {
+        let store = Self {
             sm,
             db,
             data_dir,
@@ -1524,8 +1530,19 @@ impl StateMachineStore {
             payload_format: Arc::new(AtomicU8::new(payload_format)),
             payload_batch_bytes: Arc::new(AtomicUsize::new(DUMP_PAGE_BYTES)),
             restore_batch_bytes: Arc::new(AtomicUsize::new(RESTORE_BATCH_BYTES)),
+            fail_clear_marker: Arc::new(AtomicBool::new(false)),
             poisoned: Arc::new(AtomicBool::new(false)),
+        };
+        // 持久化 fail-stop：上一次运行 restore 失败/FORCE 过 → 启动即 poison，拒绝服务直到
+        // 一次完整快照安装成功（boot 重放成功也会清除该键）。
+        if let Ok(Some(raw)) = meta_get(&store.db, META_POISON) {
+            store.poisoned.store(true, Ordering::SeqCst);
+            tracing::error!(
+                "state machine is POISONED (durable flag from a previous run): {}",
+                String::from_utf8_lossy(&raw)
+            );
         }
+        store
     }
 
     /// P4-A kill-switch 的进程内覆盖（测试用；生产走 `DSH_RAFT_RESTORE_MARKER`）。
@@ -1546,6 +1563,12 @@ impl StateMachineStore {
     pub fn set_restore_batch_bytes(&self, bytes: usize) {
         self.restore_batch_bytes
             .store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    /// 测试注入：下一次 install 的 marker 清理失败（验证 fail-stop + Err）。
+    #[doc(hidden)]
+    pub fn set_fail_clear_marker(&self, on: bool) {
+        self.fail_clear_marker.store(on, Ordering::Relaxed);
     }
 
     /// P4a2：写端格式的进程内覆盖（测试用；生产走 `DSH_RAFT_SNAPSHOT_PAYLOAD=msgpack`）。
@@ -1572,12 +1595,19 @@ impl StateMachineStore {
     }
 
     /// P4-A A3：restore 错误 → 进入 fail-stop（只记第一次，避免刷日志）。
+    /// **持久化**（复核 blocker R2）：进程内 AtomicBool 重启即丢，混合状态会重新变成可服务；
+    /// 这里同时写 `restore_poison` 键，`new_with_rotation` 启动时据此恢复 poison。
+    /// 写键失败只 warn（进程内 fail-stop 仍然生效，最坏情况是重启后不再 fail-stop）。
     fn poison(&self, why: impl std::fmt::Display) {
         if !self.poisoned.swap(true, Ordering::SeqCst) {
             tracing::error!(
                 "state machine POISONED (fail-stop): {why}. Refusing apply/snapshot/read paths \
                  until a full snapshot install succeeds or the node restarts (boot replay)."
             );
+        }
+        let reason = why.to_string();
+        if let Err(e) = meta_put(&self.db, META_POISON, reason.as_bytes()) {
+            tracing::warn!("persist poison flag failed: {e}");
         }
     }
 
@@ -1589,15 +1619,19 @@ impl StateMachineStore {
         batches: PayloadBatches,
         path: &std::path::Path,
     ) -> Result<Option<PathBuf>, ErrOf> {
-        {
-            let sm = self.sm.write().map_err(|e| io_write(e.to_string()))?;
-            // P4b：流式恢复（B1 —— 只在首批前清空一次）。批解码错误在这里发生 →
-            // 调用方 poison + marker 保留，boot 重放/fail-fast 兜底。
-            let mapped = batches.map(|b| {
-                b.map_err(|e| dsh_core::error::Error::internal(format!("snapshot payload: {e}")))
-            });
-            sm.restore_stream(mapped).map_err(storage_err)?;
-        }
+        // **写锁必须覆盖 restore + last_applied + membership + registry（复核 blocker R1）**：
+        // snapshot builder 在 `sm.read()` 内读 meta 与 body；install 是**第二个写者**，若在
+        // 释放写锁后才写 last_applied/membership，builder 可以在「写锁已放、meta 未写」的窗口里
+        // 拿到「新状态 + 旧 meta」→ 生成 meta=N/body=S(N') 的快照，follower 装上后重复 apply。
+        // 把 meta/registry 写入放进同一把写锁：builder 要么在 install 之前（旧状态+旧 meta），
+        // 要么在之后（新状态+新 meta），不存在中间视图。
+        let sm = self.sm.write().map_err(|e| io_write(e.to_string()))?;
+        // P4b：流式恢复（B1 —— 只在首批前清空一次）。批解码错误在这里发生 →
+        // 调用方 poison + marker 保留，boot 重放/fail-fast 兜底。
+        let mapped = batches.map(|b| {
+            b.map_err(|e| dsh_core::error::Error::internal(format!("snapshot payload: {e}")))
+        });
+        sm.restore_stream(mapped).map_err(storage_err)?;
         match &meta.last_log_id {
             Some(last_log_id) => self.write_last_applied(last_log_id)?,
             // 初始快照（无 last_log_id）：状态被清空后 last_applied 也必须归零（删键），
@@ -1605,7 +1639,9 @@ impl StateMachineStore {
             None => meta_del(&self.db, META_LAST_APPLIED)?,
         }
         self.write_membership(&meta.last_membership)?;
-        persist_snapshot_registry(&self.db, meta, path.to_path_buf())
+        let old = persist_snapshot_registry(&self.db, meta, path.to_path_buf())?;
+        drop(sm);
+        Ok(old)
     }
 
     /// P1 测试注入开关（doc-hidden）：第 `n`（≥1）write_last_applied 调用 IO-fail；`0`/`NO_FAULT` 关闭。
@@ -1820,8 +1856,10 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
                     Ok(())
                 })?
             } else {
-                // v1（默认，无头 JSON）：整份 dump（升级期路径；v2 不再走这里，见 MAJOR 1 修复）
+                // v1（默认，无头 JSON）：dump 在锁内（与 meta 同一视图），**序列化 + 写盘放到锁外**
+                // ——默认格式不应为一致性多占写锁时间（复核 R3：P4c 重构把这个锁范围放大了）。
                 let pairs = sm.dump_all().map_err(storage_err)?;
+                drop(sm);
                 let data = serde_json::to_vec(&pairs).map_err(|e| io_write(e.to_string()))?;
                 write_payload_file(dir, name, &data)?
             };
@@ -1972,6 +2010,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 payload_format: self.payload_format.clone(),
                 payload_batch_bytes: self.payload_batch_bytes.clone(),
                 restore_batch_bytes: self.restore_batch_bytes.clone(),
+                fail_clear_marker: self.fail_clear_marker.clone(),
                 poisoned: self.poisoned.clone(),
             }),
         }
@@ -2027,14 +2066,28 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // 快照点——与已 purge 的日志冲突（openraft 拒绝启动）或对已应用条目重复 apply。
         // 这里 fail-stop 并返回 Err：openraft 会重试安装，下一次成功安装会重写 marker 并在尾部
         // 清理，poison 也随之解除。
-        if let Err(e) = meta_del(&self.db, META_RESTORE_BEGIN) {
+        let cleared = if self.fail_clear_marker.load(Ordering::Relaxed) {
+            self.fail_clear_marker.store(false, Ordering::Relaxed);
+            Err(io_write("injected restore-marker clear failure"))
+        } else {
+            meta_del(&self.db, META_RESTORE_BEGIN)
+                .map_err(|e| io_write(format!("clear restore marker: {e}")))
+        };
+        if let Err(e) = cleared {
+            // 不能只 warn（复核 blocker）：残留 marker + 继续 apply，会在下次崩溃时把
+            // last_applied 回滚到快照点。这里 fail-stop；openraft 会把 Err 视为 fatal，
+            // 节点重启后走 boot 重放（marker 仍在）——这是安全路径。
             self.poison(format!(
                 "clear restore marker after successful install failed: {e}"
             ));
-            return Err(io_write(format!("clear restore marker: {e}")));
+            return Err(e);
         }
-        // 一次完整成功的 install 已经把状态机整体替换成 payload 内容 → 解除 fail-stop。
+        // 一次完整成功的 install 已经把状态机整体替换成 payload 内容 → 解除 fail-stop
+        // （进程内 + 持久化标记）。
         self.poisoned.store(false, Ordering::SeqCst);
+        if let Err(e) = meta_del(&self.db, META_POISON) {
+            tracing::warn!("clear durable poison flag failed: {e}");
+        }
         *self.current_snapshot.lock().await = Some((meta.clone(), path));
         Ok(())
     }
@@ -2043,9 +2096,14 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         &mut self,
     ) -> Result<Option<SnapshotOf<TypeConfig, PathBuf>>, ErrOf> {
         if self.is_poisoned() {
-            return Err(io_read(
-                "state machine poisoned: snapshot restore failed; restart to replay",
-            ));
+            // 不能返回 Err：openraft `Raft::new` → `get_initial_state` → `get_current_snapshot`
+            // 会在启动期调用它；Err 会让节点根本起不来（复核 blocker R2），反而无法观测/自愈。
+            // 返回 None = 「本节点暂时没有可提供的快照」，raft 仍可启动；节点保持 503，
+            // 直到 leader 重发一次完整快照（install 成功会解除 poison）。
+            tracing::warn!(
+                "state machine poisoned: get_current_snapshot returns None (node boots but                  serves 503 until a full snapshot install succeeds)"
+            );
+            return Ok(None);
         }
         let guard = self.current_snapshot.lock().await;
         if let Some((meta, path)) = guard.as_ref() {
@@ -2138,7 +2196,8 @@ pub fn recover_interrupted_restore_with(
             marker.meta.last_log_id,
             marker.payload.display()
         );
-        meta_del(db, META_RESTORE_BEGIN)?;
+        // **保留 marker**（durable fail-stop）：不带 FORCE 的下一次启动会走正常重放（安全），
+        // 带 FORCE 则继续 poison；一次完整 install 成功会清 marker + poison。
         store.poison(format!(
             "DSH_RAFT_RESTORE_FORCE ignored marker for payload {} (mixed state)",
             marker.payload.display()
@@ -2164,6 +2223,8 @@ pub fn recover_interrupted_restore_with(
     })?;
     let started = std::time::Instant::now();
     {
+        // 同一把写锁覆盖 restore + meta 写入（与 install 相同的理由：builder 不能在
+        // 「状态已换、meta 未写」的窗口里拿到不一致视图）。
         let sm = store
             .sm
             .write()
@@ -2173,18 +2234,23 @@ pub fn recover_interrupted_restore_with(
             b.map_err(|e| dsh_core::error::Error::internal(format!("snapshot payload: {e}")))
         });
         sm.restore_stream(mapped).map_err(storage_err)?;
+        match &marker.meta.last_log_id {
+            Some(last_log_id) => put_last_applied(db, last_log_id)?,
+            // 初始快照（无 last_log_id）：状态被清空，last_applied 必须一并归零/清除。
+            None => meta_del(db, META_LAST_APPLIED)?,
+        }
+        put_membership(db, &marker.meta.last_membership)?;
     }
-    match &marker.meta.last_log_id {
-        Some(last_log_id) => put_last_applied(db, last_log_id)?,
-        // 初始快照（无 last_log_id）：状态被清空，last_applied 必须一并归零/清除。
-        None => meta_del(db, META_LAST_APPLIED)?,
-    }
-    put_membership(db, &marker.meta.last_membership)?;
     let old = persist_snapshot_registry(db, &marker.meta, marker.payload.clone())?;
     if old.as_deref() != Some(marker.payload.as_path()) {
         delete_old_snapshot_file(old);
     }
     meta_del(db, META_RESTORE_BEGIN)?;
+    // 重放成功 = 状态机已与 payload 一致 → 解除持久化 fail-stop（如果之前 FORCE 过）。
+    if let Err(e) = meta_del(db, META_POISON) {
+        tracing::warn!("clear durable poison flag after boot replay failed: {e}");
+    }
+    store.poisoned.store(false, Ordering::SeqCst);
     tracing::warn!(
         "restore replayed on boot: last_log_id={:?} payload={} (streamed) elapsed={:?}",
         marker.meta.last_log_id,
@@ -3414,10 +3480,161 @@ mod p4a_tests {
             "状态机保持原样"
         );
         assert!(
-            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
-            "force 清 marker"
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_some(),
+            "force 保留 marker（durable fail-stop；不带 FORCE 的下次启动走正常重放）"
+        );
+        assert!(
+            meta_get(&db, META_POISON).unwrap().is_some(),
+            "force 的 fail-stop 必须持久化（重启后仍 poison）"
         );
         assert!(fs::exists(&payload).unwrap(), "payload 不被 force 删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 复核 R2：install 成功后 **marker 清理失败** → poison + Err（不能只 warn），
+    /// 且重试安装（下一次成功）会恢复。用注入开关模拟清理失败。
+    #[tokio::test]
+    async fn marker_clear_failure_fail_stops_until_next_install() {
+        let dir = tmpdir("p4a-clear-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+
+        let meta = snap_meta(19);
+        let payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &json_payload(&pairs_of(&[("k", "v")])),
+        )
+        .unwrap();
+        store.set_fail_clear_marker(true);
+        let r = store.install_snapshot(&meta, payload.clone()).await;
+        assert!(r.is_err(), "清理 marker 失败必须返回 Err（不能当成成功）");
+        assert!(store.is_poisoned(), "清理失败必须 fail-stop");
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_some(),
+            "清理失败时 marker 必须仍在（供 boot 重放）"
+        );
+        // 重启语义：durable poison 也写下了
+        assert!(
+            meta_get(&db, META_POISON).unwrap().is_some(),
+            "fail-stop 必须持久化（重启后仍 poison）"
+        );
+
+        // 重试一次成功安装 → 清 marker + 清 durable poison + 解除 fail-stop
+        store.set_fail_clear_marker(false);
+        store.install_snapshot(&meta, payload).await.unwrap();
+        assert!(!store.is_poisoned());
+        assert!(meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none());
+        assert!(meta_get(&db, META_POISON).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 复核 R2：FORCE 的 fail-stop 必须**跨重启**（durable poison）；且 poisoned 时
+    /// `get_current_snapshot` 返回 Ok(None)，openraft 才能启动（否则进程根本起不来）。
+    #[tokio::test]
+    async fn force_poison_survives_restart() {
+        let dir = tmpdir("p4a-force-restart");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        sm.write()
+            .unwrap()
+            .restore_all(&pairs_of(&[("mixed", "1")]))
+            .unwrap();
+        let meta = snap_meta(33);
+        let payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &json_payload(&pairs_of(&[("new", "2")])),
+        )
+        .unwrap();
+        write_marker(&db, &meta, &payload);
+        let store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+        let out = recover_interrupted_restore_with(&store, true).unwrap();
+        assert!(out.is_none());
+        assert!(store.is_poisoned());
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_some(),
+            "FORCE 保留 marker（下一次不带 FORCE 的启动走重放）"
+        );
+        assert!(meta_get(&db, META_POISON).unwrap().is_some());
+
+        // 「重启」：丢掉旧 store / SM / DbHandle（释放 redb 文件锁）后在同一 data dir 新建
+        drop(store);
+        drop(sm);
+        drop(db);
+        drop(storage);
+        let storage2 = open_storage(&dir);
+        let sm2 = Arc::new(RwLock::new(StateMachine::new(Box::new(storage2.clone()))));
+        let mut store2 = StateMachineStore::new(sm2.clone(), storage2.raw_db(), dir.clone());
+        assert!(
+            store2.is_poisoned(),
+            "重启后必须仍然是 poison（durable），否则会以混合状态服务"
+        );
+        assert!(
+            store2.get_current_snapshot().await.unwrap().is_none(),
+            "poisoned 时 get_current_snapshot 必须返回 Ok(None)（Raft::new 才能启动）"
+        );
+        // 不带 FORCE 的正常重放 → 状态一致 + 解除 poison
+        let out2 = recover_interrupted_restore(&store2).unwrap();
+        assert!(out2.is_some(), "不带 FORCE 时应重放 marker");
+        assert!(!store2.is_poisoned());
+        assert_eq!(
+            sm2.read().unwrap().dump_all().unwrap(),
+            pairs_of(&[("new", "2")])
+        );
+        assert!(meta_get(&store2.db, META_POISON).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 复核 T1：过期 marker（marker 快照点 < last_applied）⇒ 安装已完成、只清 marker，
+    /// **不重放、不回滚 last_applied、不改状态**。
+    #[tokio::test]
+    async fn stale_marker_is_cleared_without_replay() {
+        let dir = tmpdir("p4a-stale-marker");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        // 当前状态：比 marker 的 snapshot 点更新（模拟 install 后继续 apply 过）
+        sm.write()
+            .unwrap()
+            .restore_all(&pairs_of(&[("live", "9")]))
+            .unwrap();
+        let applied = snap_meta(30).last_log_id.unwrap();
+        put_last_applied(&db, &applied).unwrap();
+        // marker 指向更旧的快照 N=20（payload 里是别的 key）
+        let meta = snap_meta(20);
+        let payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &json_payload(&pairs_of(&[("old", "1")])),
+        )
+        .unwrap();
+        write_marker(&db, &meta, &payload);
+        let store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+
+        let out = recover_interrupted_restore(&store).unwrap();
+        assert!(out.is_none(), "过期 marker 不得重放");
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
+            "过期 marker 应被清掉"
+        );
+        assert_eq!(
+            sm.read().unwrap().dump_all().unwrap(),
+            pairs_of(&[("live", "9")]),
+            "不得回滚/重放覆盖当前状态"
+        );
+        let last = meta_get(&db, META_LAST_APPLIED).unwrap().unwrap();
+        assert_eq!(
+            de::<LogIdOf>(&last).unwrap().index,
+            applied.index,
+            "last_applied 不得回滚"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3551,14 +3768,22 @@ mod p4a_tests {
             store.apply(stream::iter(items)).await.is_err(),
             "poisoned apply 必须返回 Err"
         );
-        // 快照构建 / 读取拒绝
+        // 快照构建拒绝；get_current_snapshot 返回 Ok(None)（openraft 启动期要能调用，不能 Err）
         assert!(store
             .get_snapshot_builder()
             .await
             .build_snapshot()
             .await
             .is_err());
-        assert!(store.get_current_snapshot().await.is_err());
+        assert!(
+            store.get_current_snapshot().await.unwrap().is_none(),
+            "poisoned 时 get_current_snapshot 返回 None（节点可启动但 503）"
+        );
+        // durable poison：新 store 实例（模拟重启）仍然是 poison
+        assert!(
+            meta_get(&db, META_POISON).unwrap().is_some(),
+            "fail-stop 必须持久化"
+        );
 
         // 解除注入后重试同一 payload → 成功即解除 fail-stop、清 marker
         store.set_fail_last_applied(0);

@@ -1674,12 +1674,16 @@ def c4_errors(args, snapshot_info, victim_is_voter):
         # - `rss_delta_vs_payload` / `rss_delta_vs_db_file` 只入 summary 供对照。
         peak_kb = max(int(rss_kb), int(vhm_kb or 0))
         delta_kb = max(0, peak_kb - int(base_kb))
-        budget_kb = int(args.max_rss_delta_mb * 1024)
+        # 预算 = min(上限, 固定开销 192MiB + 一份 payload 大小)。这样既吸收固定开销，又能在
+        # 「整份 payload 被额外驻留」的回归上失败（回归 ≈ +1x payload），且 P5 可随规模放大。
+        payload_mb = (float(sb) / (1024.0 * 1024.0)) if sb else 0.0
+        budget_mb = min(float(args.max_rss_delta_mb), 192.0 + payload_mb)
+        budget_kb = int(budget_mb * 1024)
         if delta_kb > budget_kb:
-            errs.append("C4: install 窗口净增量 RSS %dMiB > 预算 %dMiB"
+            errs.append("C4: install 窗口净增量 RSS %dMiB > 预算 %.0fMiB（= min(%.0f, 192+payload %.0f)）"
                         "（window=%dKiB vmhwm=%sKiB baseline=%dKiB payload=%sB db_file=%dB）"
-                        % (delta_kb // 1024, int(args.max_rss_delta_mb), rss_kb, vhm_kb,
-                           int(base_kb), sb, state_b))
+                        % (delta_kb // 1024, budget_mb, float(args.max_rss_delta_mb), payload_mb,
+                           rss_kb, vhm_kb, int(base_kb), sb, state_b))
     return errs
 
 
@@ -1855,9 +1859,10 @@ def parse_args():
     p.add_argument("--max-install-seconds", type=float, default=30.0,
                    help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
     p.add_argument("--max-rss-delta-mb", type=float, default=320.0,
-                   help="C4 内存预算：install 窗口**净增量 RSS**（max(窗口采样, VmHWM) - 重启基线）"
-                        "的绝对上限，默认 320MiB。payload/redb 比值只入 summary 供对照"
-                        "（payload 受 JSON 编码膨胀影响，redb 含 raft 表/free page，均不适合当断言基准）")
+                   help="C4 内存预算上限：实际预算 = min(该值, 192MiB + payload 大小)。"
+                        "install 窗口净增量 RSS = max(窗口采样 0.4s, VmHWM) - 重启基线；"
+                        "192MiB 吸收固定开销，+payload 允许一份副本，整份额外驻留（≈+1x payload）"
+                        "会超预算。payload/redb 比值只入 summary 供对照")
     p.add_argument("--min-snapshot-bytes", type=int, default=100_000_000,
                    help="C4 规模下限：victim 实际落盘快照字节数，默认 100MB（153MB/12k 目标的下限保护）")
     p.add_argument("--chaos-during-snapshot", action="store_true",
@@ -2089,9 +2094,13 @@ def main():
                     summary["rss_delta_vs_payload"] = round(_delta / float(_sb), 2)
                 if _db:
                     summary["rss_delta_vs_db_file"] = round(_delta / float(_db), 2)
+                _pmb = (float(_sb) / (1024.0 * 1024.0)) if _sb else 0.0
+                summary["rss_delta_budget_mb"] = round(
+                    min(float(args.max_rss_delta_mb), 192.0 + _pmb), 1)
                 summary["rss_ratio_note"] = (
-                    "断言=绝对净增量（--max-rss-delta-mb）；payload/db_file 比值仅供对照——"
-                    "v1 JSON payload 是 Vec<u8> 的十进制数字数组（≈4x），dsh.redb 含 raft 表/free page")
+                    "断言=绝对净增量（预算 = min(--max-rss-delta-mb, 192MiB + payload)）；"
+                    "payload/db_file 比值仅供对照——v1 JSON payload 是 Vec<u8> 的十进制数字数组（≈4x），"
+                    "dsh.redb 含 raft 表/free page；窗口 RSS 采样 0.4s + VmHWM")
             summary["victim_heartbeat_samples"] = snapshot_info.get("victim_heartbeat_samples")
             summary["victim_heartbeat_max_in_window_ms"] = snapshot_info.get(
                 "victim_heartbeat_max_in_window_ms")
@@ -2104,6 +2113,7 @@ def main():
             summary["min_snapshot_bytes"] = args.min_snapshot_bytes
             summary["snapshot_chaos_injections"] = snapshot_info.get("snapshot_chaos_injections")
         # 证据溯源（复核要求：日志必须能定位到源码版本与二进制）
+        summary["snapshot_payload_env"] = os.environ.get("DSH_RAFT_SNAPSHOT_PAYLOAD")
         summary["git_rev"] = GLOBAL.get("git_rev")
         summary["git_status_porcelain"] = GLOBAL.get("git_status")
         summary["bin_sha256"] = sha256_of(args.bin)
