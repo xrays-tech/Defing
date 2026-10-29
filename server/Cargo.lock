@@ -678,6 +678,7 @@ dependencies = [
  "pin-project",
  "redb",
  "reqwest",
+ "rmp",
  "rmp-serde",
  "serde",
  "serde_json",

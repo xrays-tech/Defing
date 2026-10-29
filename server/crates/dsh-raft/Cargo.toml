@@ -12,6 +12,9 @@ dsh-storage = { path = "../dsh-storage" }
 openraft = { version = "=0.10.0-alpha.37", features = ["serde"] }
 # P0 实验依赖（AppendEntries 预算测量）+ P2b1 MessagePack RPC wire
 rmp-serde = "1"
+# P4a2: snapshot payload v2 的 bin/array 级编解码（rmp_serde 会把 Vec<u8> 编成 int 序列，
+# 必须直接用 rmp::encode::write_bin 才能得到 bin 类型）
+rmp = "0.8"
 # axum Bytes body extractor 的 (P2b1 msgpack 服务端端点)
 bytes = "1"
 # 0.10 apply() 是 futures Stream 消费

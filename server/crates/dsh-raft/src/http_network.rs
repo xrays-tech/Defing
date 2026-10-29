@@ -168,6 +168,11 @@ impl RaftNetworkV2<TypeConfig> for HttpNetwork {
             Some(c) => c,
             None => MAX_CHUNK_BYTES,
         };
+        // P4a2（B2'）：发送前校验 payload 完整性（header 的 total_len + crc32）；无头旧 payload
+        // 直接放行。这是流式的一次额外读（不整份驻留），抓「落盘后损坏被当正常 payload 转发」。
+        if let Err(e) = crate::store::verify_payload_file(&snapshot.snapshot) {
+            return Err(StreamingError::Network(NetworkError::new(&e)));
+        }
         let opened = FrameEmitter::open(snapshot.snapshot, vote, snapshot.meta.clone(), chunk);
         let emitter = match opened.await {
             Ok(e) => Ok(e),

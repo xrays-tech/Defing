@@ -22,18 +22,24 @@
 ## 3. 格式
 
 ```
-payload := MAGIC(8B "DSHSNP\x01\x00") || VERSION(u8) || BODY
-VERSION 1: BODY = JSON 文本（`Vec<(Vec<u8>,Vec<u8>)>`，即现状）
-VERSION 2: BODY = msgpack：数组 header(n) + 逐项 [bin(k), bin(v)]
+payload := MAGIC(6B "DSHSNP") || VERSION(u8) || FLAGS(u8) || TOTAL_LEN(u64 LE) || CRC32(u32 LE) || BODY
+VERSION 1: BODY = JSON 文本（`Vec<(Vec<u8>,Vec<u8>)>`，P3 布局；头部可选，见下）
+VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 KAT）
 ```
+- **头布局定稿（P4a2 实现）**：20B as above。P4a1 的读端兼容层先落成 8B
+  （`MAGIC|VERSION|FLAGS`），P4a2 补齐 `TOTAL_LEN + CRC32`（B2'）——P4a1 写端从未写头，
+  因此没有旧带头文件需要兼容，布局可直接定稿。
+- **无头 payload**：P3 及更早写的 JSON 没有头（写端默认仍是它），读端按「MAGIC 不匹配 → v1」处理。
+- `TOTAL_LEN`/`CRC32` 覆盖 **BODY**（不含头），由 payload 创建方在落盘时写入（头与 body 分两段
+  写，不为拼「头+体」再复制一份 payload）；install、boot 重放、发送前（`verify_payload_file`）
+  三处同口径校验。无头旧文件没有完整性头，`verify_payload_file` 直接放行。
 
-- 写 v2：手工写数组头 + 逐项 `rmp_serde::to_vec_named`（或 `rmp::encode`），**不构造整份 Vec**：
-  `dump_all()` 已是 Vec，但可用迭代器分批写；若 dump 本身是整份 Vec，则先解决 dump 的分页
-  （见 §5 未决）。
-- 读 v2：`rmp` 流式解码器读数组长度，循环读 `(bin, bin)`，按字节预算组装 batch（64MiB）→
-  `restore_all_batched(batch, chunk_bytes)`。
-- 读 v1：保持现状 `serde_json::from_reader`（升级期一次性路径即可）。
-- 兼容：`MAGIC` 不匹配 → 视为 v1（旧文件没有头），但若解析失败则报错并保留文件（不删）。
+- 写 v2（P4a2 已落地）：`rmp::encode::write_array_len` + `write_bin` 逐项编码，body 目前仍整份
+  `Vec`（`dump_all()` 返回整份）。**流式写**（dump 分页 → 边 dump 边写）属 P4c，前置是 P4c0。
+- 读 v2（P4b）：`rmp::decode::read_array_len` / `read_bin_len` 逐项解码，按字节预算组装 batch
+  （64MiB）→ `restore_stream`（B1：只清空一次 + ≥3 批）。P4a2 只提供整份解码的单测路径。
+- 读 v1：保持 `serde_json::from_reader`（升级期一次性路径，P4d 后按发布周期下线）。
+- 兼容：`MAGIC` 不匹配 → 视为 v1（旧文件没有头），解析失败报错并保留文件（不删）。
 
 ## 4. 施工顺序（每步可独立合并、可回滚）
 
@@ -96,3 +102,23 @@ VERSION 2: BODY = msgpack：数组 header(n) + 逐项 [bin(k), bin(v)]
 - **B5（major）顺序**：`dump_all()` 分页拆成 **P4c0**（只读分页 dump + 验收），P4c 依赖它。
 - minors：tuple 用 positional 编码 + KAT（避免 §13.5 同类）；MAGIC 不匹配走**有界嗅探**（读头部
   再判），加 v2 截断测试；明确 v1 读路径下线条件；P4d 触发条件写清。
+
+## 8. 实现落地（P4a2，2026-10-29）
+
+- **写端 flag**：`DSH_RAFT_SNAPSHOT_PAYLOAD=msgpack`（`v2`/`2` 同义）→ `build_snapshot` 写
+  v2（20B 头 + msgpack body）；未设置/其它 → **无头 JSON**（与 P3 逐字节一致，回滚即关变量）。
+  运行期可覆盖：`StateMachineStore::set_msgpack_payload(bool)`（doc-hidden，测试/运维用）。
+- **编码**：`rmp::encode::write_array_len` + `write_bin` 逐项写 —— 直接 `rmp_serde` 会把
+  `Vec<u8>` 编成 int 序列（体积翻倍），所以不用它。KAT 锁定 body 字节形状：
+  `[("k","v")]` → `91 92 c4 01 6b c4 01 76`。
+- **解码**：`rmp::decode::read_array_len` / `read_bin_len` + `take(len).read_to_end`
+  （不按声明长度预分配，防损坏头 OOM）；单次遍历同时算 CRC 与字节数（`CountingCrcReader`）。
+- **校验点**：`read_payload_pairs`（install / boot 重放共用）与 `verify_payload_file`
+  （发送前，`http_network::full_snapshot` 调用）→ total_len 不符 / CRC 不符 / 非零 flags /
+  未知 version / 头截断 全部 Err 并保留文件。
+- **e2e**：`learner_catches_up_via_http_snapshot` 在 leader 打开 msgpack → 断言 learner 落盘
+  payload 带 `DSHSNP` 头、version=2、CRC 自洽（v2 真的过了 wire）；voter 用例保持 v1
+  （无头 JSON）→ 两种格式都有端到端证据。
+- **验收对照（§6）**：体积/install/RSS 三项要等 storm 重跑（P4c 用 `--snapshot-payload=msgpack`
+  打开写端后才能测，P4base 是 v1 基线）；「旧 v1 文件可读」由 `default_writer_stays_headerless_json`
+  + P4a1 用例覆盖；「多批流式」属于 P4b（`restore_stream`）。

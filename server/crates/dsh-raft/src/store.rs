@@ -5,7 +5,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dsh_core::error::Error as DshError;
@@ -86,6 +86,11 @@ const ENV_RESTORE_MARKER: &str = "DSH_RAFT_RESTORE_MARKER";
 /// 唯一的「忽略已有 marker」逃生门，必须显式 `=1`/`true`（大声 WARN），供运维在 payload
 /// 确认不可用时人工放行；默认关闭。
 const ENV_RESTORE_FORCE: &str = "DSH_RAFT_RESTORE_FORCE";
+/// P4a2 写端格式开关：`DSH_RAFT_SNAPSHOT_PAYLOAD=msgpack` → 写 v2（带头的 msgpack body）；
+/// 其它/未设置 → v1（**无头** JSON，与 P3 一致）。回滚 = 关掉该变量。
+const ENV_SNAPSHOT_PAYLOAD: &str = "DSH_RAFT_SNAPSHOT_PAYLOAD";
+const PAYLOAD_FORMAT_JSON: u8 = 1;
+const PAYLOAD_FORMAT_MSGPACK: u8 = 2;
 
 fn env_true(name: &str) -> bool {
     matches!(
@@ -99,6 +104,13 @@ fn restore_marker_enabled_from_env() -> bool {
         std::env::var(ENV_RESTORE_MARKER).as_deref(),
         Ok("0") | Ok("false") | Ok("off") | Ok("no")
     )
+}
+
+fn payload_format_from_env() -> u8 {
+    match std::env::var(ENV_SNAPSHOT_PAYLOAD).as_deref() {
+        Ok("msgpack") | Ok("v2") | Ok("2") => PAYLOAD_FORMAT_MSGPACK,
+        _ => PAYLOAD_FORMAT_JSON,
+    }
 }
 
 // ---------------- snapshot persistence (snapshots table registry; B5; P2a file-backed) ----------------
@@ -265,21 +277,31 @@ pub fn sweep_snapshot_payloads(db: &DbHandle, dir: PathBuf) -> Result<(u64, u64)
 /// Atomic payload file write: bytes → `{name}.part`, then rename → `{name}`.
 /// Any failure path removes the `.part` (never leaves a half-written file).
 fn write_payload_file(dir: PathBuf, name: String, bytes: &[u8]) -> Result<PathBuf, ErrOf> {
+    write_payload_file_chunks(dir, name, &[bytes])
+}
+
+/// 多段原子写（P4a2）：header 与 body 分开写，避免为拼「头 + 体」再复制一份 4xx MB。
+fn write_payload_file_chunks(
+    dir: PathBuf,
+    name: String,
+    chunks: &[&[u8]],
+) -> Result<PathBuf, ErrOf> {
+    use std::io::Write as _;
     fs::create_dir_all(&dir).map_err(io_write)?;
     let part_path = dir.join(format!("{}.part", name));
     let final_path = dir.join(name);
     // Clear a stale temp for this name before starting (crashed earlier write of same name).
     let _ = fs::remove_file(&part_path);
-    let done = match fs::write(&part_path, bytes) {
-        Err(e) => Err(io_write(e)),
-        Ok(()) => match fs::File::open(&part_path).and_then(|f| f.sync_all()) {
-            Err(e) => Err(io_write(e)),
-            Ok(()) => match fs::rename(&part_path, &final_path) {
-                Err(e) => Err(io_write(e)),
-                Ok(()) => fsync_dir(&dir),
-            },
-        },
-    };
+    let done = (|| -> Result<(), ErrOf> {
+        let mut f = fs::File::create(&part_path).map_err(io_write)?;
+        for c in chunks {
+            f.write_all(c).map_err(io_write)?;
+        }
+        f.sync_all().map_err(io_write)?;
+        drop(f);
+        fs::rename(&part_path, &final_path).map_err(io_write)?;
+        fsync_dir(&dir)
+    })();
     if done.is_err() {
         // failed write/rename: the (possibly half-written) temp must not linger
         let _ = fs::remove_file(&part_path);
@@ -295,38 +317,254 @@ fn read_payload_file(path: PathBuf) -> Result<Vec<u8>, ErrOf> {
 
 /// P3c：流式解析 payload 文件成 `(key, value)` 列表 —— 只驻留解析结果一份；
 /// 与 `read_payload_file` 的「整份读 + 再解析」相比，省掉一份 4xx MB 的全量拷贝。
-/// P4a1：payload 头（读端兼容层）。
-/// 布局（8B）：`MAGIC(6B)="DSHSNP" | version(u8) | flags(u8)`。
-/// version=1 表示 body 仍是 JSON（即现状）；写端在 P4a2 之前**不写头**，读端两者都接受。
-/// P4a2 起 version=2 = msgpack body（见 dev_docs/design/openraft-010-p4-payload-msgpack.md §7）。
+///
+/// ## P4a1/P4a2 payload 头（读端兼容层）
+/// 布局（20B，全部 little-endian）：
+/// ```text
+/// MAGIC(6B)="DSHSNP" | version(u8) | flags(u8) | total_len(u64) | crc32(u32)
+/// ```
+/// - `version=1`：body = JSON（`Vec<(Vec<u8>,Vec<u8>)>`，P3 布局）；
+/// - `version=2`：body = msgpack（array(n) of `[bin(k), bin(v)]`，P4a2 写端）；
+/// - **无头 payload**（P3 及更早写的 JSON）仍按 JSON 读 —— 升级期兼容，回滚也靠它；
+/// - `total_len` / `crc32` 覆盖 body（不含头），由 payload 创建方写入（P4a2）；install、
+///   boot 重放、发送前（`verify_payload_file`）都校验（B2'：帧 CRC 只保护 wire）。
+///
+/// 未知 version / 非零 flags / 长度或 CRC 不符一律报错并保留文件（不删）。
 pub const PAYLOAD_MAGIC: &[u8; 6] = b"DSHSNP";
-pub const PAYLOAD_HEADER_LEN: usize = 8;
-const PAYLOAD_VERSION_JSON: u8 = 1;
+pub const PAYLOAD_HEADER_LEN: usize = 20;
+pub const PAYLOAD_VERSION_JSON: u8 = 1;
+pub const PAYLOAD_VERSION_MSGPACK: u8 = 2;
 
-fn read_payload_pairs(path: &std::path::Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf> {
-    use std::io::Read as _;
-    let mut f = fs::File::open(path).map_err(io_read)?;
-    let mut head = [0u8; PAYLOAD_HEADER_LEN];
+fn encode_payload_header(
+    version: u8,
+    flags: u8,
+    total_len: u64,
+    crc: u32,
+) -> [u8; PAYLOAD_HEADER_LEN] {
+    let mut out = [0u8; PAYLOAD_HEADER_LEN];
+    out[..PAYLOAD_MAGIC.len()].copy_from_slice(PAYLOAD_MAGIC);
+    out[PAYLOAD_MAGIC.len()] = version;
+    out[PAYLOAD_MAGIC.len() + 1] = flags;
+    out[8..16].copy_from_slice(&total_len.to_le_bytes());
+    out[16..20].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+fn decode_payload_header(head: &[u8; PAYLOAD_HEADER_LEN]) -> Result<(u8, u8, u64, u32), ErrOf> {
+    if &head[..PAYLOAD_MAGIC.len()] != PAYLOAD_MAGIC {
+        return Err(io_read("snapshot payload header: bad magic"));
+    }
+    let version = head[PAYLOAD_MAGIC.len()];
+    let flags = head[PAYLOAD_MAGIC.len() + 1];
+    let mut len = [0u8; 8];
+    len.copy_from_slice(&head[8..16]);
+    let mut crc = [0u8; 4];
+    crc.copy_from_slice(&head[16..20]);
+    Ok((
+        version,
+        flags,
+        u64::from_le_bytes(len),
+        u32::from_le_bytes(crc),
+    ))
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut c = crate::snapshot_stream::Crc32::init();
+    c.update(bytes);
+    c.finish()
+}
+
+/// 读满 buf（或到 EOF），返回实际字节数。用于头嗅探（<header 长度的文件不是错误，
+/// 只是旧的无头 payload）。
+fn read_upto<R: std::io::Read>(r: &mut R, buf: &mut [u8]) -> Result<usize, ErrOf> {
     let mut n = 0usize;
-    while n < head.len() {
-        match f.read(&mut head[n..]) {
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
             Ok(0) => break,
             Ok(k) => n += k,
             Err(e) => return Err(io_read(e)),
         }
     }
-    if n == PAYLOAD_HEADER_LEN && &head[..PAYLOAD_MAGIC.len()] == PAYLOAD_MAGIC {
-        let version = head[PAYLOAD_MAGIC.len()];
-        if version != PAYLOAD_VERSION_JSON {
+    Ok(n)
+}
+
+/// 边读边算 CRC + 计数的 `Read` 包装（B2'：解析同时完成完整性校验，不多读一遍）。
+struct CountingCrcReader<R> {
+    inner: R,
+    crc: crate::snapshot_stream::Crc32,
+    n: u64,
+}
+
+impl<R: std::io::Read> CountingCrcReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            crc: crate::snapshot_stream::Crc32::init(),
+            n: 0,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CountingCrcReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let k = self.inner.read(buf)?;
+        self.crc.update(&buf[..k]);
+        self.n += k as u64;
+        Ok(k)
+    }
+}
+
+/// P4a2 v2 body 编码：`array(n) of [bin(k), bin(v)]`。
+/// 直接走 `rmp::encode::write_bin` —— `rmp_serde` 会把 `Vec<u8>` 编成 int 序列（体积翻倍）。
+fn encode_msgpack_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>, ErrOf> {
+    let mut out = Vec::new();
+    let n = u32::try_from(pairs.len())
+        .map_err(|_| io_write("snapshot too many pairs for msgpack array length"))?;
+    rmp::encode::write_array_len(&mut out, n)
+        .map_err(|e| io_write(format!("payload msgpack array header: {e}")))?;
+    for (k, v) in pairs {
+        rmp::encode::write_array_len(&mut out, 2)
+            .map_err(|e| io_write(format!("payload msgpack item header: {e}")))?;
+        rmp::encode::write_bin(&mut out, k)
+            .map_err(|e| io_write(format!("payload msgpack key: {e}")))?;
+        rmp::encode::write_bin(&mut out, v)
+            .map_err(|e| io_write(format!("payload msgpack value: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// P4a2 v2 body 解码（流式：逐项读 bin，不 materialize body 字节）。
+/// 单个 key/value 的长度来自不可信文件，用 `Read::take + read_to_end` 按实际数据增长，
+/// 不按声明长度预分配（防损坏头导致 OOM）。
+fn decode_msgpack_pairs<R: std::io::Read>(r: &mut R) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf> {
+    use std::io::Read as _;
+    let n = rmp::decode::read_array_len(r)
+        .map_err(|e| io_read(format!("payload msgpack array header: {e}")))?;
+    // 预分配封顶：正常 payload 每项 ≥2B，恶意/损坏头不应直接放大成 GB 级分配。
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity((n as usize).min(65_536));
+    for i in 0..n {
+        let fields = rmp::decode::read_array_len(r)
+            .map_err(|e| io_read(format!("payload msgpack item {i} header: {e}")))?;
+        if fields != 2 {
             return Err(io_read(format!(
-                "unsupported snapshot payload version {version}（本 binary 只认 v1=JSON；P4a2 才写 v2）"
+                "payload msgpack item {i}: expected [bin,bin] (2 fields), got {fields}"
             )));
         }
-        return serde_json::from_reader(std::io::BufReader::new(f)).map_err(io_read);
+        let mut kv = [Vec::new(), Vec::new()];
+        for slot in kv.iter_mut() {
+            let len = rmp::decode::read_bin_len(r)
+                .map_err(|e| io_read(format!("payload msgpack item {i} bin length: {e}")))?;
+            r.take(u64::from(len)).read_to_end(slot).map_err(io_read)?;
+            if slot.len() as u64 != u64::from(len) {
+                return Err(io_read(format!(
+                    "payload msgpack item {i}: truncated bin (declared {len}, got {})",
+                    slot.len()
+                )));
+            }
+        }
+        let [k, v] = kv;
+        out.push((k, v));
+    }
+    Ok(out)
+}
+
+fn read_payload_pairs(path: &std::path::Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf> {
+    use std::io::Read as _; // 无头路径的 prefix.chain(f)
+    let mut f = fs::File::open(path).map_err(io_read)?;
+    let mut head = [0u8; PAYLOAD_HEADER_LEN];
+    let n = read_upto(&mut f, &mut head)?;
+    if n >= PAYLOAD_MAGIC.len() && &head[..PAYLOAD_MAGIC.len()] == PAYLOAD_MAGIC {
+        if n < PAYLOAD_HEADER_LEN {
+            return Err(io_read(format!(
+                "snapshot payload header truncated: {n}/{PAYLOAD_HEADER_LEN} bytes"
+            )));
+        }
+        let (version, flags, total_len, crc) = decode_payload_header(&head)?;
+        if flags != 0 {
+            return Err(io_read(format!(
+                "unsupported snapshot payload flags {flags:#x} (this binary only knows flags=0)"
+            )));
+        }
+        let mut cr = CountingCrcReader::new(f);
+        let pairs = match version {
+            PAYLOAD_VERSION_JSON => {
+                let mut br = std::io::BufReader::new(&mut cr);
+                let v = serde_json::from_reader(&mut br).map_err(io_read)?;
+                drop(br);
+                v
+            }
+            PAYLOAD_VERSION_MSGPACK => {
+                let mut br = std::io::BufReader::new(&mut cr);
+                let v = decode_msgpack_pairs(&mut br)?;
+                drop(br);
+                v
+            }
+            other => {
+                return Err(io_read(format!(
+                    "unsupported snapshot payload version {other}（本 binary 只认 v1=JSON / v2=msgpack）"
+                )))
+            }
+        };
+        // 解析器停在值末尾；把剩余 body 读完，保证 CRC/长度覆盖整段 body。
+        std::io::copy(&mut cr, &mut std::io::sink()).map_err(io_read)?;
+        if cr.n != total_len {
+            return Err(io_read(format!(
+                "snapshot payload body length mismatch: header says {total_len}, file has {}",
+                cr.n
+            )));
+        }
+        if cr.crc.finish() != crc {
+            return Err(io_read(format!(
+                "snapshot payload CRC mismatch: header {crc:#010x}, body {:#010x}",
+                cr.crc.finish()
+            )));
+        }
+        return Ok(pairs);
     }
     // 无头（旧 payload）：把已读到的前缀接回去，从字节 0 解析。
     let prefix = std::io::Cursor::new(head[..n].to_vec());
     serde_json::from_reader(std::io::BufReader::new(prefix.chain(f))).map_err(io_read)
+}
+
+/// P4a2（B2'）：发送前 / 运维校验 payload 完整性。无头旧文件直接 Ok（没有完整性头）；
+/// 带头文件按 header 的 total_len + crc32 流式校验 body（不整份读入内存）。
+pub fn verify_payload_file(path: &std::path::Path) -> Result<(), ErrOf> {
+    let mut f = fs::File::open(path).map_err(io_read)?;
+    let mut head = [0u8; PAYLOAD_HEADER_LEN];
+    let n = read_upto(&mut f, &mut head)?;
+    if n < PAYLOAD_MAGIC.len() || &head[..PAYLOAD_MAGIC.len()] != PAYLOAD_MAGIC {
+        return Ok(()); // 旧的无头 payload：无完整性头可校验
+    }
+    if n < PAYLOAD_HEADER_LEN {
+        return Err(io_read(format!(
+            "snapshot payload header truncated: {n}/{PAYLOAD_HEADER_LEN} bytes ({})",
+            path.display()
+        )));
+    }
+    let (version, _flags, total_len, crc) = decode_payload_header(&head)?;
+    if !matches!(version, PAYLOAD_VERSION_JSON | PAYLOAD_VERSION_MSGPACK) {
+        return Err(io_read(format!(
+            "unsupported snapshot payload version {version} ({})",
+            path.display()
+        )));
+    }
+    let mut cr = CountingCrcReader::new(f);
+    std::io::copy(&mut cr, &mut std::io::sink()).map_err(io_read)?;
+    if cr.n != total_len {
+        return Err(io_read(format!(
+            "snapshot payload body length mismatch: header says {total_len}, file has {} ({})",
+            cr.n,
+            path.display()
+        )));
+    }
+    if cr.crc.finish() != crc {
+        return Err(io_read(format!(
+            "snapshot payload CRC mismatch: header {crc:#010x}, body {:#010x} ({})",
+            cr.crc.finish(),
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// P3c：把收到的 payload 落成本节点 canonical snapshot 文件。
@@ -979,6 +1217,9 @@ pub struct StateMachineStore {
     last_applied_calls: Arc<AtomicU64>,
     /// P4-A kill-switch：是否写 `META_RESTORE_BEGIN`（`DSH_RAFT_RESTORE_MARKER=0` 只关写）。
     restore_marker: Arc<AtomicBool>,
+    /// P4a2 写端格式：`PAYLOAD_FORMAT_JSON`（默认，无头 JSON）/
+    /// `PAYLOAD_FORMAT_MSGPACK`（v2：带头 msgpack）。读端两种都认。
+    payload_format: Arc<AtomicU8>,
     /// P4-A A3 fail-stop：restore 失败（非进程死亡）后置位。置位期间 apply / 快照构建 /
     /// `get_current_snapshot` 全部拒绝，dsh-api 据此对 HTTP 读写返回 503——不能带着
     /// 「部分新 + 部分旧」的混合状态继续服务。解除方式：一次完整成功的 install_snapshot，
@@ -1011,6 +1252,14 @@ impl StateMachineStore {
             Err(e) => tracing::warn!("snapshots dir startup sweep skipped: {e}"),
         };
         let restore_marker = restore_marker_enabled_from_env();
+        let payload_format = payload_format_from_env();
+        if payload_format == PAYLOAD_FORMAT_MSGPACK {
+            tracing::info!("snapshot payload writer: v2 (msgpack + total_len/crc32 header)");
+        } else {
+            tracing::info!(
+                "snapshot payload writer: v1 (headerless JSON); set DSH_RAFT_SNAPSHOT_PAYLOAD=msgpack to write v2"
+            );
+        }
         if !restore_marker {
             tracing::warn!(
                 "DSH_RAFT_RESTORE_MARKER disabled: snapshot installs will NOT write the \
@@ -1028,6 +1277,7 @@ impl StateMachineStore {
             fail_last_applied_at: Arc::new(AtomicU64::new(NO_FAULT)),
             last_applied_calls: Arc::new(AtomicU64::new(0)),
             restore_marker: Arc::new(AtomicBool::new(restore_marker)),
+            payload_format: Arc::new(AtomicU8::new(payload_format)),
             poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1036,6 +1286,19 @@ impl StateMachineStore {
     #[doc(hidden)]
     pub fn set_restore_marker(&self, enabled: bool) {
         self.restore_marker.store(enabled, Ordering::Relaxed);
+    }
+
+    /// P4a2：写端格式的进程内覆盖（测试用；生产走 `DSH_RAFT_SNAPSHOT_PAYLOAD=msgpack`）。
+    #[doc(hidden)]
+    pub fn set_msgpack_payload(&self, enabled: bool) {
+        self.payload_format.store(
+            if enabled {
+                PAYLOAD_FORMAT_MSGPACK
+            } else {
+                PAYLOAD_FORMAT_JSON
+            },
+            Ordering::Relaxed,
+        );
     }
 
     /// P4-A：fail-stop 标记句柄（dsh-cli 交给 dsh-api，置位后 HTTP 读写 503）。
@@ -1254,18 +1517,25 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
         };
         let last_applied = self.inner.read_last_applied()?;
         let membership = self.inner.read_membership()?;
-        let data = serde_json::to_vec(&pairs).map_err(|e| io_write(e.to_string()))?;
         // 0.10：SnapshotMeta.snapshot_id 已 gone（wire 兼容 slot 保留 but always empty，see compat doc）
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
         };
         // P2a: payload 落盘文件（`{name}.part` + rename，失败清理）——Snapshot 只 ever carries PathBuf
-        let path = write_payload_file(
-            self.inner.data_dir.join(SNAP_SUBDIR),
-            snap_file_name(&meta),
-            &data,
-        )?;
+        let dir = self.inner.data_dir.join(SNAP_SUBDIR);
+        let name = snap_file_name(&meta);
+        // P4a2 写端：v2 = 20B 头（total_len + crc32）+ msgpack body；v1 = 无头 JSON（P3 原样）。
+        // 头与 body 分两段写（`write_payload_file_chunks`），不为拼「头 + 体」再复制一份 payload。
+        let path = if self.inner.payload_format.load(Ordering::Relaxed) == PAYLOAD_FORMAT_MSGPACK {
+            let body = encode_msgpack_pairs(&pairs)?;
+            let header =
+                encode_payload_header(PAYLOAD_VERSION_MSGPACK, 0, body.len() as u64, crc32(&body));
+            write_payload_file_chunks(dir, name, &[&header, &body])?
+        } else {
+            let data = serde_json::to_vec(&pairs).map_err(|e| io_write(e.to_string()))?;
+            write_payload_file(dir, name, &data)?
+        };
         // registry 落盘（meta + file key；同事务 removes legacy inline data key）；旧文件清理 after commit
         let old = persist_snapshot_registry(&self.inner.db, &meta, path.clone())?;
         delete_old_snapshot_file(old);
@@ -1395,6 +1665,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 fail_last_applied_at: self.fail_last_applied_at.clone(),
                 last_applied_calls: self.last_applied_calls.clone(),
                 restore_marker: self.restore_marker.clone(),
+                payload_format: self.payload_format.clone(),
                 poisoned: self.poisoned.clone(),
             }),
         }
@@ -2453,11 +2724,10 @@ mod tests {
         std::fs::write(&legacy, &body).unwrap();
         assert_eq!(read_payload_pairs(&legacy).unwrap(), pairs);
 
-        // 2) 带 MAGIC 头 + version=1 可读
+        // 2) 带 20B 头 + version=1(JSON) + 正确 total_len/crc 可读
+        let head = encode_payload_header(PAYLOAD_VERSION_JSON, 0, body.len() as u64, crc32(&body));
         let mut framed = Vec::new();
-        framed.extend_from_slice(PAYLOAD_MAGIC);
-        framed.push(PAYLOAD_VERSION_JSON);
-        framed.push(0);
+        framed.extend_from_slice(&head);
         framed.extend_from_slice(&body);
         let with_head = dir.join("framed.bin");
         std::fs::write(&with_head, &framed).unwrap();
@@ -2865,6 +3135,227 @@ mod p4a_tests {
         assert!(meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none());
         assert_eq!(state_pairs(&sm), pairs);
         assert!(store.write_last_applied(&meta.last_log_id.unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------- P4a2：payload v2（msgpack + total_len/crc32 头） ----------------
+
+#[cfg(test)]
+mod p4a2_tests {
+    use super::tests::{open_storage, snap_meta, tmpdir};
+    use super::*;
+
+    fn pairs_of(items: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    }
+
+    /// 把 pairs 编成一份 v2 payload 文件（与写端同布局，但允许注入坏值）。
+    fn write_v2(path: &std::path::Path, pairs: &[(Vec<u8>, Vec<u8>)]) {
+        let body = encode_msgpack_pairs(pairs).unwrap();
+        let head =
+            encode_payload_header(PAYLOAD_VERSION_MSGPACK, 0, body.len() as u64, crc32(&body));
+        let mut all = Vec::new();
+        all.extend_from_slice(&head);
+        all.extend_from_slice(&body);
+        std::fs::write(path, &all).unwrap();
+    }
+
+    async fn msgpack_store(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        Arc<RwLock<StateMachine>>,
+        StateMachineStore,
+    ) {
+        let dir = tmpdir(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let store = StateMachineStore::new(sm.clone(), storage.raw_db(), dir.clone());
+        store.set_msgpack_payload(true);
+        (dir, sm, store)
+    }
+
+    /// KAT：v2 body 的字节形状（array(n) of [bin,bin]）。锁定 §13.5 那类 positional 错位回归。
+    #[test]
+    fn msgpack_body_wire_shape_kat() {
+        let body = encode_msgpack_pairs(&pairs_of(&[("k", "v")])).unwrap();
+        assert_eq!(
+            body,
+            vec![
+                0x91, // array(1)
+                0x92, // array(2)
+                0xc4, 0x01, b'k', // bin(1) "k"
+                0xc4, 0x01, b'v', // bin(1) "v"
+            ],
+            "v2 body 必须是 array(n) of [bin,bin]"
+        );
+        assert_eq!(
+            decode_msgpack_pairs(&mut body.as_slice()).unwrap(),
+            pairs_of(&[("k", "v")])
+        );
+    }
+
+    /// 写端 flag → 落盘文件带 20B 头（version=2 + total_len + crc32），读端 roundtrip 一致。
+    #[tokio::test]
+    async fn msgpack_writer_roundtrip_via_build_snapshot() {
+        let (dir, sm, mut store) = msgpack_store("p4a2-writer").await;
+        let expected = {
+            let g = sm.write().unwrap();
+            g.restore_all(&pairs_of(&[("a", "1"), ("b", "2")])).unwrap();
+            g.dump_all().unwrap()
+        };
+        let mut builder = store.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let raw = std::fs::read(&snap.snapshot).unwrap();
+        assert_eq!(&raw[..PAYLOAD_MAGIC.len()], PAYLOAD_MAGIC);
+        let mut head = [0u8; PAYLOAD_HEADER_LEN];
+        head.copy_from_slice(&raw[..PAYLOAD_HEADER_LEN]);
+        let (version, flags, total_len, crc) = decode_payload_header(&head).unwrap();
+        assert_eq!((version, flags), (PAYLOAD_VERSION_MSGPACK, 0));
+        assert_eq!(total_len, (raw.len() - PAYLOAD_HEADER_LEN) as u64);
+        assert_eq!(crc, crc32(&raw[PAYLOAD_HEADER_LEN..]));
+        assert_eq!(read_payload_pairs(&snap.snapshot).unwrap(), expected);
+        assert!(verify_payload_file(&snap.snapshot).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 默认（flag 关闭）写端必须与 P3 完全一致：无头 JSON。
+    #[tokio::test]
+    async fn default_writer_stays_headerless_json() {
+        let dir = tmpdir("p4a2-default");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), storage.raw_db(), dir.clone());
+        sm.write()
+            .unwrap()
+            .restore_all(&pairs_of(&[("a", "1")]))
+            .unwrap();
+        let mut builder = store.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+        let raw = std::fs::read(&snap.snapshot).unwrap();
+        assert_eq!(raw[0], b'[', "默认写端必须是 JSON（无头）");
+        assert_ne!(&raw[..PAYLOAD_MAGIC.len()], PAYLOAD_MAGIC);
+        assert_eq!(
+            read_payload_pairs(&snap.snapshot).unwrap(),
+            pairs_of(&[("a", "1")])
+        );
+        assert!(
+            verify_payload_file(&snap.snapshot).is_ok(),
+            "无头旧文件校验直接放行"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2 payload 走完整 install：状态、registry、marker 清理都成立。
+    #[tokio::test]
+    async fn install_msgpack_payload_restores_state_and_registry() {
+        let (dir, sm, mut store) = msgpack_store("p4a2-install").await;
+        let meta = snap_meta(31);
+        let pairs = pairs_of(&[("x", "9"), ("y", "8")]);
+        let incoming = dir.join("incoming.snap");
+        write_v2(&incoming, &pairs);
+        store.install_snapshot(&meta, incoming).await.unwrap();
+        assert_eq!(sm.read().unwrap().dump_all().unwrap(), pairs);
+        let (reg_meta, reg_file) = load_snapshot_registry(&store.db, dir.join(SNAP_SUBDIR))
+            .unwrap()
+            .expect("registry");
+        assert_eq!(reg_meta.last_log_id, meta.last_log_id);
+        assert!(std::fs::exists(&reg_file).unwrap());
+        assert_eq!(read_payload_pairs(&reg_file).unwrap(), pairs);
+        assert!(meta_get(&store.db, META_RESTORE_BEGIN).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2 payload 的 boot 重放（P4-A 路径必须认 v2）。
+    #[tokio::test]
+    async fn boot_replay_accepts_msgpack_payload() {
+        let (dir, sm, store) = msgpack_store("p4a2-replay").await;
+        let meta = snap_meta(32);
+        let pairs = pairs_of(&[("r", "1")]);
+        let payload = dir.join(SNAP_SUBDIR).join("payload-v2.snap");
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        write_v2(&payload, &pairs);
+        let marker = RestoreBegin {
+            meta: meta.clone(),
+            payload: payload.clone(),
+        };
+        meta_put(&store.db, META_RESTORE_BEGIN, &ser(&marker).unwrap()).unwrap();
+
+        let out = recover_interrupted_restore_with(&sm, &store.db, dir.clone(), false).unwrap();
+        assert!(out.is_some());
+        assert_eq!(sm.read().unwrap().dump_all().unwrap(), pairs);
+        assert!(meta_get(&store.db, META_RESTORE_BEGIN).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 损坏/截断/flags/version 全部必须报错，且 `verify_payload_file` 也一样
+    /// （B2'：发送前/安装/boot 重放三处同口径）。
+    #[tokio::test]
+    async fn corrupt_and_truncated_payloads_are_rejected() {
+        let dir = tmpdir("p4a2-corrupt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pairs = pairs_of(&[("k", "v"), ("k2", "v2")]);
+        let good = dir.join("good.snap");
+        write_v2(&good, &pairs);
+        assert_eq!(read_payload_pairs(&good).unwrap(), pairs);
+        assert!(verify_payload_file(&good).is_ok());
+
+        // 1) body 字节翻转 → CRC 不符
+        let mut bad = std::fs::read(&good).unwrap();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        let bad_path = dir.join("bad-crc.snap");
+        std::fs::write(&bad_path, &bad).unwrap();
+        let e = read_payload_pairs(&bad_path).unwrap_err().to_string();
+        assert!(e.contains("CRC"), "损坏 body 必须报 CRC：{e}");
+        assert!(verify_payload_file(&bad_path).is_err());
+
+        // 2) 截断 body 1 字节 → 解码或长度校验任一报错（都算拒绝）
+        let truncated = dir.join("truncated.snap");
+        std::fs::write(&truncated, &bad[..bad.len() - 1]).unwrap();
+        assert!(
+            read_payload_pairs(&truncated).is_err(),
+            "截断 body 必须报错"
+        );
+        assert!(verify_payload_file(&truncated).is_err());
+
+        // 2b) body 合法但 header 的 total_len 多 1 → 长度不符（CRC 只覆盖 body，不受影响）
+        let mut len_bad = std::fs::read(&good).unwrap();
+        let body_len = (len_bad.len() - PAYLOAD_HEADER_LEN) as u64;
+        len_bad[8..16].copy_from_slice(&(body_len + 1).to_le_bytes());
+        let len_path = dir.join("len.snap");
+        std::fs::write(&len_path, &len_bad).unwrap();
+        let e = read_payload_pairs(&len_path).unwrap_err().to_string();
+        assert!(e.contains("length mismatch"), "total_len 不符必须报错：{e}");
+
+        // 3) 截断到 10 字节（MAGIC 在、头不全）
+        let short = dir.join("short.snap");
+        std::fs::write(&short, &bad[..10]).unwrap();
+        let e = read_payload_pairs(&short).unwrap_err().to_string();
+        assert!(e.contains("header truncated"), "头截断必须报错：{e}");
+
+        // 4) 非零 flags
+        let mut flags_bad = std::fs::read(&good).unwrap();
+        flags_bad[PAYLOAD_MAGIC.len() + 1] = 1;
+        let flags_path = dir.join("flags.snap");
+        std::fs::write(&flags_path, &flags_bad).unwrap();
+        let e = read_payload_pairs(&flags_path).unwrap_err().to_string();
+        assert!(e.contains("flags"), "非零 flags 必须报错：{e}");
+
+        // 5) 未知 version
+        let mut ver_bad = std::fs::read(&good).unwrap();
+        ver_bad[PAYLOAD_MAGIC.len()] = 9;
+        let ver_path = dir.join("ver.snap");
+        std::fs::write(&ver_path, &ver_bad).unwrap();
+        let e = read_payload_pairs(&ver_path).unwrap_err().to_string();
+        assert!(e.contains("version"), "未知 version 必须报错：{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

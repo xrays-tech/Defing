@@ -54,6 +54,8 @@ struct Node {
     info: NodeInfo,
     raft: RaftHandle,
     sm: Arc<RwLock<StateMachine>>,
+    // P4a2: 写端格式开关（msgpack 用例在 leader 上打开；默认 v1 无头 JSON）
+    sm_store: Arc<StateMachineStore>,
     // 独立 LogStore handle（Raft consume 其 own; 测试读日志经 this）
     log_store: LogStore,
     dir: std::path::PathBuf,
@@ -107,6 +109,7 @@ async fn bind_node_with_cfg(
         info,
         raft,
         sm,
+        sm_store,
         log_store: LogStore::new(db.clone()),
         dir,
         listener: Some(listener),
@@ -232,6 +235,9 @@ async fn learner_catches_up_via_http_snapshot() {
 
     // 1) leader（真实 HTTP /raft/* 服务端）
     let n1 = start_node(1, "leader", &network).await;
+    // P4a2：这条 e2e 覆盖 **v2 写端全链路**（msgpack body + total_len/crc32 头，经 wire 原样传输、
+    // 对端 install 校验并解析）。voter 用例保持默认 v1（无头 JSON）→ 两种格式都有端到端证据。
+    n1.sm_store.set_msgpack_payload(true);
     initialize_single(&n1.raft, 1, n1.info.clone())
         .await
         .unwrap();
@@ -394,6 +400,21 @@ async fn learner_catches_up_via_http_snapshot() {
         "learner last_applied={:?} < snapshot_index={}",
         m3.last_applied,
         snapshot_index,
+    );
+
+    // 5b) v2 payload 真的过了 wire 并落成 learner 的 canonical 文件（B2' 的端到端证据）
+    let payload = std::fs::read_dir(n2.dir.join(store::SNAP_SUBDIR))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "snap").unwrap_or(false))
+        .expect("learner 应有 canonical snapshot payload");
+    let raw = std::fs::read(&payload).unwrap();
+    assert_eq!(&raw[..6], b"DSHSNP", "learner payload 应带 P4a2 头");
+    assert_eq!(raw[6], 2, "learner payload 应是 version=2（msgpack）");
+    assert!(
+        verify_payload_file(&payload).is_ok(),
+        "落盘 payload 的 total_len/crc32 必须自洽"
     );
     assert!(
         idx(m3.purged) >= snapshot_index,

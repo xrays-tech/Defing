@@ -25,6 +25,6 @@ pub use snapshot_stream::{
 };
 pub use store::{
     recover_interrupted_restore, recover_interrupted_restore_with, sweep_snapshot_payloads,
-    LogStore, StateMachineStore,
+    verify_payload_file, LogStore, StateMachineStore,
 };
 pub use types::{NodeId, NodeInfo, TypeConfig};
