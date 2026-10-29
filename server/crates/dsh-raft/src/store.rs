@@ -2150,7 +2150,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let storage = open_storage(&dir);
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
-        let mut store = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
+        let store = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
         let pairs = vec![(b"k".to_vec(), b"v".to_vec())];
         let body = serde_json::to_vec(&pairs).unwrap();
 
