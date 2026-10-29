@@ -543,6 +543,8 @@ class Node:
         self.raft_addr = "127.0.0.1:%d" % free_port()
         self.grpc_addr = "127.0.0.1:%d" % free_port()
         self.proc = None
+        # 每节点 extra env（滚动升级演练用；Popen 默认继承 os.environ）
+        self.extra_env = {}
         self.down = True            # True while not running (killed / not yet started)
         self.frozen = False         # SIGSTOP'd follower (still "live" for quorum counting)
         self.log = open(log_path, "ab", buffering=0)
@@ -569,12 +571,15 @@ class Node:
         """Start / restart. Log appends (restart → same file). start_new_session so
         we own a fresh process group and never touch foreign defing processes."""
         self.log = open(self.log_path, "ab", buffering=0)
+        env = dict(os.environ)
+        env.update(self.extra_env)
         self.proc = subprocess.Popen(
             self.argv(seed_map),
             stdout=self.log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
         self.down = False
         self.frozen = False
@@ -1902,6 +1907,10 @@ def parse_args():
     p.add_argument("--catchup-timeout", type=float, default=60.0)
     p.add_argument("--max-install-seconds", type=float, default=30.0,
                    help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
+    p.add_argument("--rolling-rehearsal", action="store_true",
+                   help="P5 release gate：真实进程级滚动升级/降级演练（忽略 load/chaos 参数）")
+    p.add_argument("--rolling-writes", type=int, default=4000,
+                   help="每个阶段的写入条数（默认 4000 × 16KB ≈ 64MB/阶段）")
     p.add_argument("--max-write-p99-ms", type=float, default=0.0,
                    help="P5 写停顿预算：publish ack 延迟 p99 上限（load/bulk 两阶段分别检查）。"
                         "默认 0=只观测（summary.write_latency_ms）；标定后由 gate/CI 传值")
@@ -1920,10 +1929,235 @@ def parse_args():
     return p.parse_args()
 
 
+# ---------------------------------------------------------------- rolling upgrade rehearsal
+#
+# 真实进程级滚动升级/降级演练（P5 release gate）：
+#   phase 1 全 v1 写端 → 写入 ~N×16KB（触发策略快照）→ 杀掉 follower 让它经 v1 快照追平
+#   phase 2 逐个重启为 v2 写端（滚动，一次一个）→ 再写 → 杀掉 follower 经 **v2** 快照追平
+#   phase 3 逐个重启回 v1（回滚）→ 再写 → 新快照是 v1，且已落盘的 v2 仍可读
+# 断言：每次滚动后集群健康（全节点 healthz + 有 leader + victim lag 归零）；victim 落盘 payload
+# 的头部版本符合当前写端；三阶段都能完成追赶。输出 JSON summary，exit 0/1。
+
+def _snap_header_version(path):
+    """返回 1（无头 JSON）或 2（DSHSNP+version=2）。"""
+    with open(path, "rb") as f:
+        hdr = f.read(20)
+    if hdr[:6] == b"DSHSNP":
+        return 2 if len(hdr) >= 7 and hdr[6] == 2 else -1
+    return 1
+
+
+def _latest_snap_file(node):
+    snap_dir = os.path.join(node.data_dir, "snapshots")
+    files = []
+    try:
+        for fn in os.listdir(snap_dir):
+            if fn.endswith(".snap"):
+                p = os.path.join(snap_dir, fn)
+                files.append((os.path.getmtime(p), p))
+    except OSError:
+        return None
+    return max(files)[1] if files else None
+
+
+def _wait_settled(nodes, timeout=90.0):
+    """所有 live 节点 healthz + 有 leader + members 里每个 voter 的 lag 归零。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        live = [n for n in nodes if n.alive()]
+        if len(live) >= 3 and all(healthz(n.http_base()) for n in live):
+            lid = wait_leader(1)
+            if lid is not None:
+                md = members(live[0].http_base())
+                if md:
+                    voters = [m for m in md.get("members", []) if m.get("is_voter")]
+                    if voters and all(m.get("lag") in (0, None) for m in voters):
+                        return True
+        time.sleep(0.4)
+    return False
+
+
+def _rolling_restart(nodes, seed_map, env, label):
+    """一次一个节点：kill → 设 env → spawn → 等健康；最后等集群 settled。"""
+    for n in nodes:
+        n.kill()
+        n.extra_env = dict(env)
+        n.spawn(seed_map)
+        if not wait_healthz(n, 30):
+            log("  [%s] node %d 重启失败；log tail:" % (label, n.node_id))
+            for line in n.tail(20):
+                log("    " + line)
+            return False
+        if not _wait_settled(nodes, 60):
+            log("  [%s] node %d 重启后集群未 settled" % (label, n.node_id))
+            return False
+        log("  [%s] node %d 已滚动（env=%s）" % (label, n.node_id, env or "{}"))
+    return True
+
+
+def _write_bulk(node, token, project, count, value_bytes=16384):
+    for i in range(count):
+        n = random.choice([x for x in CLUSTER.live()] or [node])
+        marker = "|R#%d#%s#" % (i, uuid.uuid4().hex[:6])
+        rid = "r-%d-%s" % (i, uuid.uuid4().hex[:6])
+        write_draft(n, token, project, value_bytes, marker)
+        write_publish(n, token, project, "roll", rid)
+    return True
+
+
+def _await_leader_snapshot(nodes, expect_version, since_ts, timeout=90.0):
+    """等 leader 构建出（并落盘）期望版本的新快照；返回 (ok, path)。
+
+    滚动演练的关键时序：victim 必须在 leader **已构建并 purge** 之后重启，否则它会用保留的
+    1000 条日志增量追平（不触发 full-snapshot），演练就测不到 payload 安装路径。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        lid = wait_leader(5)
+        leader = CLUSTER.by_id(lid)
+        if leader is not None:
+            snap = _latest_snap_file(leader)
+            if snap is not None and os.path.getmtime(snap) > since_ts:
+                ver = _snap_header_version(snap)
+                if ver == expect_version:
+                    return (True, snap)
+        time.sleep(0.5)
+    return (False, None)
+
+
+def _catch_up_victim(nodes, seed_map, token, writes, env, expect_version, label):
+    """杀掉一个 follower → 写数据 → 重启 victim → 断言它经 full-snapshot 追平且 payload 版本符合。"""
+    victim = None
+    lid = wait_leader(5)
+    for n in reversed(nodes):
+        if n.node_id != lid:
+            victim = n
+            break
+    if victim is None:
+        return (False, "no follower to victimize")
+    victim.kill()
+    t_writes = time.time()
+    _write_bulk(nodes[0], token, "roll-0", writes)
+    # 等 leader 把新快照构建/落盘（并 purge 到 snapshot-1000），再把 victim 拉起来 → 必须走 InstallSnapshot
+    snap_ok, leader_snap = _await_leader_snapshot(nodes, expect_version, t_writes - 1.0)
+    if not snap_ok:
+        victim.extra_env = dict(env)
+        victim.spawn(seed_map)
+        return (False, "leader 没有在超时内构建出 v%d 快照（victim 会走日志追平）" % expect_version)
+    time.sleep(1.0)  # 给 purge 一个拍
+    victim.extra_env = dict(env)
+    victim.spawn(seed_map)
+    if not wait_healthz(victim, 30):
+        return (False, "victim restart failed")
+    if not _wait_settled(nodes, 120):
+        return (False, "victim did not settle")
+    snap = _latest_snap_file(victim)
+    if snap is None:
+        return (False, "victim has no snapshot file")
+    ver = _snap_header_version(snap)
+    ok = (ver == expect_version) and os.path.getmtime(snap) > t_writes - 1.0
+    # 证据：victim 日志里应有 full-snapshot transfer start（安装路径，而非日志追平）
+    transfer = any("full-snapshot transfer start" in line for line in victim.tail(400))
+    return (ok,
+            "victim=%d snap=%s version=%s expected=%s transfer_started=%s leader_snap=%s"
+            % (victim.node_id, os.path.basename(snap), ver, expect_version, transfer,
+               os.path.basename(leader_snap) if leader_snap else None))
+
+
+def rolling_rehearsal(args):
+    """真实进程级滚动升级/降级演练；返回 (exit_code, summary_dict)。"""
+    import tempfile
+    work = tempfile.mkdtemp(prefix="defing-roll.")
+    nodes = []
+    seed_map = ""
+    n_nodes = int(args.nodes or 5)
+    try:
+        for i in range(1, n_nodes + 1):
+            d = os.path.join(work, "n%d" % i)
+            os.makedirs(d)
+            nodes.append(Node(i, args.bin, d, os.path.join(work, "n%d.log" % i)))
+        seed_map = ",".join("%d@%s@%s" % (n.node_id, n.raft_addr, n.http_addr) for n in nodes)
+        globals()["CLUSTER"] = Cluster(nodes, seed_map)
+        for n in nodes:
+            n.extra_env = {}
+            n.spawn(seed_map)
+        if not all(wait_healthz(n, 30) for n in nodes):
+            return (2, {"ok": False, "phase": "boot"})
+        token = None
+        for _ in range(20):
+            r = http_json(nodes[0].http_base(), None, "POST", "/api/v1/login",
+                          {"password": ADMIN_PASSWORD}, timeout=10.0)
+            if r["status"] == 200 and isinstance(r.get("data"), dict) and r["data"].get("token"):
+                token = r["data"]["token"]
+                break
+            time.sleep(0.5)
+        if not token:
+            return (2, {"ok": False, "phase": "login"})
+        globals()["SESSION_TOKEN"] = token
+        if not _wait_settled(nodes, 60):
+            return (2, {"ok": False, "phase": "formed"})
+        for proj in ["roll-0", "roll-1", "roll-2", "roll-3"]:
+            if not ensure_project(token, proj, time.time() + 30):
+                return (2, {"ok": False, "phase": "project"})
+        log("  rolling rehearsal: cluster up (v1 writers), writing seed data")
+        _write_bulk(nodes[0], token, "roll-0", args.rolling_writes)
+
+        phases = []
+        ok, detail = _catch_up_victim(nodes, seed_map, token, args.rolling_writes,
+                                      {}, 1, "v1-baseline")
+        phases.append({"phase": "v1-baseline", "ok": ok, "detail": detail})
+        log("  [v1-baseline] ok=%s %s" % (ok, detail))
+        if not ok:
+            return (1, {"ok": False, "phases": phases, "work": work})
+
+        msgpack_env = {"DSH_RAFT_SNAPSHOT_PAYLOAD": "msgpack"}
+        if not _rolling_restart(nodes, seed_map, msgpack_env, "to-v2"):
+            return (1, {"ok": False, "phases": phases, "phase": "to-v2", "work": work})
+        ok, detail = _catch_up_victim(nodes, seed_map, token, args.rolling_writes,
+                                      msgpack_env, 2, "v2")
+        phases.append({"phase": "v2", "ok": ok, "detail": detail})
+        log("  [v2] ok=%s %s" % (ok, detail))
+        if not ok:
+            return (1, {"ok": False, "phases": phases, "work": work})
+
+        # 回滚：全部回 v1 写端；已落盘的 v2 不删，新快照应为 v1 且能被新 victim 安装
+        if not _rolling_restart(nodes, seed_map, {}, "to-v1"):
+            return (1, {"ok": False, "phases": phases, "phase": "to-v1", "work": work})
+        ok, detail = _catch_up_victim(nodes, seed_map, token, args.rolling_writes,
+                                      {}, 1, "v1-rollback")
+        phases.append({"phase": "v1-rollback", "ok": ok, "detail": detail})
+        log("  [v1-rollback] ok=%s %s" % (ok, detail))
+
+        # 混合窗口断言：节点 5 保持 v1 写端，但读端能安装 leader 的 v2 payload
+        # （已在 v2 阶段覆盖：victim 就是 v1 写端节点，安装的是 v2 快照）
+        all_ok = all(p["ok"] for p in phases) and len(phases) == 3
+        return (0 if all_ok else 1,
+                {"ok": bool(all_ok), "phases": phases, "work": work,
+                 "note": "v2 阶段 victim 为 v1 写端 → 同时覆盖读端兼容（混合窗口）"})
+    finally:
+        for n in nodes:
+            try:
+                n.kill()
+            except Exception:
+                pass
+            try:
+                n.close_log()
+            except Exception:
+                pass
+
+
 def main():
     args = parse_args()
     GLOBAL["git_rev"] = git_rev(args.bin)
     GLOBAL["git_status"] = git_status(args.bin)
+    if args.rolling_rehearsal:
+        # P5 release gate：滚动升级/降级演练（不做 load/chaos）
+        log("== rolling upgrade/downgrade rehearsal (5 nodes, real processes) ==")
+        code, summary = rolling_rehearsal(args)
+        summary["git_rev"] = GLOBAL.get("git_rev")
+        summary["git_status_porcelain"] = GLOBAL.get("git_status")
+        print("JSON " + json.dumps(summary, sort_keys=True))
+        return code
     try:
         GLOBAL["bin_mtime"] = os.path.getmtime(args.bin) if args.bin else None
     except OSError:
