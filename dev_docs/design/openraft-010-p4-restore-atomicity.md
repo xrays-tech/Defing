@@ -120,3 +120,40 @@
   校验」；重放走流式 reader（P4b 之后）以约束 boot 内存；marker 路径与 sweep 比较都用 canonicalize。
 - 集成点定案：`dsh-cli` 在 `has_persisted_state` 判定之前调用 **fallible 的**
   `recover_interrupted_restore()`（`new_with_rotation` 保持 infallible，不动测试面）。
+
+## 8. 实现落地（P4-A，2026-10-29，提交 0800f8f）
+
+已按 §4/§7 实现（worktree `migrate/openraft-010`）。实现细节与偏差：
+
+- **marker**：raft-meta 键 `restore_begin`（JSON `{meta, payload}`）。`install_snapshot` 在
+  `copy_payload_file`（内含文件 + 目录 fsync）之后、`restore_all` 之前**单事务**写入；
+  registry 提交 + 旧 payload 清理之后删除（删除失败只 warn —— boot 重放同一 payload 幂等）。
+- **sweep keep-set**：`sweep_snapshot_payloads` 同时保留 registry `file` 与 marker.payload
+  （canonicalize 后比较）；坏 marker → `Err` 且不删任何文件。
+- **重放入口**：free fn `dsh_raft::recover_interrupted_restore(&sm, &db, data_dir)`。与 §4.2 的
+  偏差：签名多一个 `&sm` —— 重放必须写状态机，而 `StateMachineStore` 实例在 dsh-cli 侧，且
+  `new_with_rotation` 必须保持 infallible。顺序与 §7 A1 一致：清扫（ctor）→ 重放 → 再清扫。
+  失败（marker 损坏 / payload 缺失或不可解析 / 重放写失败）→ `Err`，dsh-cli 拒绝启动。
+- **A2 kill-switch**：`DSH_RAFT_RESTORE_MARKER=0` 只关「写 marker」（构造时读一次 + WARN）；
+  已存在的 marker 启动时仍重放；忽略必须显式 `DSH_RAFT_RESTORE_FORCE=1`（ERROR 日志 + 清 marker +
+  不重放）。
+- **A3 fail-stop 的 enforcement 点**：
+  1. `StateMachineStore::apply` —— 先 drain 整条流并逐条 `responder.send(Err)`，再返回 Err
+     （不挂客户端）；
+  2. `SnapshotBuilder::build_snapshot` / `get_current_snapshot` —— 返回 Err；
+  3. dsh-api —— `poison_gate` 中间件（auth 之前、count_http 之内）对除 `/healthz`、`/metrics`、
+     `/admin*` 外一律 503 `ERR_RESTORE_POISONED`；`readyz` 503；`linearized_read`（gRPC 数据面入口）
+     与 `ApiState::write` 直接拒绝。
+     解除：一次完整成功的 install（整体替换状态机）；否则重启走重放。
+- **验收对照（§5）**：#1/#2 由 `boot_replay_after_interrupted_restore_with_sweep_on` /
+  `recover_after_registry_commit_is_idempotent` 覆盖（单进程模拟重启 + 开着 sweep）；#3
+  `recover_refuses_missing_payload`；#4 `kill_switch_disables_marker_write` +
+  `recover_force_ignores_marker_without_replay`；#5 `install_snapshot_clears_restore_marker`
+  （e2e 走同一 install 路径，未单独加键断言）；#6 storm 回归待 P4b/P4c 之后重跑。
+- **残留**：(a) 没有子进程 SIGKILL e2e —— 用「崩溃现场（marker + 混合状态）+ ctor 清扫 + recover」
+  等价模拟；(b) boot 重放仍把 payload 整份读成 `Vec`（P4b 的 `restore_stream` 改流式后同步调整）；
+  (c) `restore_all` 分块语义未变：运行期错误由 poison 拦、崩溃由 marker 重放补；
+  (d) gRPC 只有读接口（写走 HTTP），故只接 `linearized_read`。
+- 顺带修 `voter_catches_up_via_http_snapshot_after_being_down` 的读日志竞态：SM 里 value 可见时
+  core 尚未推进 last_applied / 触发 purge，先 `poll_metrics`（last_applied ≥ snapshot_index 且
+  purged ≥ snapshot_index）再断言前缀为空。
