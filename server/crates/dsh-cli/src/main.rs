@@ -936,7 +936,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 以「部分新 + 部分旧」的混合状态继续跑会静默分叉。
     // 注意：`new_with_rotation` 的启动清扫已把 marker.payload 并入 keep-set（设计 §7 A1），
     // 因此顺序是「清扫 → 重放 → 再清扫」，不会先删掉待重放的 payload。
-    match dsh_raft::recover_interrupted_restore(&sm, &db, data_base.clone()) {
+    match dsh_raft::recover_interrupted_restore(&sm_store) {
         Ok(Some(meta)) => eprintln!(
             "node {node_id}: replayed interrupted snapshot restore (last_log_id={:?})",
             meta.last_log_id

@@ -701,6 +701,12 @@ impl StateMachine {
     where
         I: IntoIterator<Item = Result<crate::store::KeyValuePairs, Error>>,
     {
+        // 前置假设：restore 只会在「无并发 apply」时被调用（快照安装/boot 重放）。写命令执行中
+        // 的 pending_ops 若混进来会被丢掉，状态与 last_applied 对不上——用 debug 断言兜住契约。
+        debug_assert!(
+            self.pending_ops.is_empty(),
+            "restore_stream 不能在 apply 中途调用（pending_ops 非空）"
+        );
         let mut first = true;
         for batch in batches {
             let batch = batch?;

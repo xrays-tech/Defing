@@ -42,7 +42,7 @@ def args(**kw):
         leader_kills=5,
         max_install_seconds=30.0,
         min_snapshot_bytes=100_000_000,
-        max_rss_state_ratio=1.2,
+        max_rss_delta_mb=320.0,
         chaos_during_snapshot=True,
     )
     base.update(kw)
@@ -161,9 +161,11 @@ def good_info():
         "snapshot_elections_during_chaos": 0,
         "snapshot_elections_unexplained": 0,
         "victim_rss_max_in_window_kb": 400_000,
+        "victim_peak_rss_kb": 400_000,
         "victim_rss_baseline_kb": 100_000,
-        # P4 口径：RSS 比值基准 = 逻辑状态（redb）字节；300MB 状态 → 净增 300MB = 1.0x
-        "victim_state_bytes": 300_000_000,
+        # P4 口径：断言 = 绝对净增量（max(窗口采样, VmHWM) - 基线）= 300MiB < 320MiB；
+        # db_file/payload 比值只入 summary 供对照。
+        "victim_db_file_bytes": 300_000_000,
     }
 
 
@@ -224,27 +226,33 @@ class C4AssertionsTest(unittest.TestCase):
         info["victim_rss_max_in_window_kb"] = 1_000_000
         self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(args(), info, True)))
 
-    def test_missing_state_bytes_fails(self):
-        """P4 口径：没有格式无关基准（redb 尺寸）必须判失败，而不是静默跳过比值。"""
+    def test_missing_db_file_bytes_fails(self):
+        """观测基准（redb 尺寸）缺失判失败，避免 summary/比值静默缺失。"""
         info = good_info()
-        info["victim_state_bytes"] = None
-        self.assertTrue(any("逻辑状态尺寸" in e for e in ls.c4_errors(args(), info, True)))
+        info["victim_db_file_bytes"] = None
+        self.assertTrue(any("redb 尺寸" in e for e in ls.c4_errors(args(), info, True)))
 
-    def test_rss_state_ratio_uses_state_not_payload(self):
-        """同一 delta：payload 386MB（v1 JSON 4x 膨胀）与 95MB（v2）都不影响判定——
-        判定只认 delta/state。delta 360MB / state 300MB = 1.2x 恰好等于预算（不失败）。"""
+    def test_rss_delta_absolute_budget_not_payload(self):
+        """同一净增量：payload 386MB（v1 JSON 4x 膨胀）与 95MB（v2）都不影响判定。"""
         info = good_info()
         info["snapshot_bytes"] = 386_000_000   # v1 的膨胀 payload
         info["victim_rss_baseline_kb"] = 100_000
-        info["victim_rss_max_in_window_kb"] = 450_000  # delta 350MiB ≈ 1.19x state
-        self.assertEqual(ls.c4_errors(args(), info, True), [])
-        # payload 缩到 v2 尺寸，判定不变（不再拿 payload 当分母）
-        info["snapshot_bytes"] = 95_000_000
-        self.assertEqual(ls.c4_errors(args(min_snapshot_bytes=0), info, True), [])
-        # 超预算（delta 390MiB / 300MB ≈ 1.33x）
-        info["victim_rss_max_in_window_kb"] = 490_000
+        info["victim_rss_max_in_window_kb"] = 450_000  # delta 350MiB > 320MiB 预算 → 失败
         self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(args(), info, True)))
+        # 同一 delta，payload 缩到 v2 尺寸 → 判定不变
+        info["snapshot_bytes"] = 95_000_000
+        self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(
+            args(min_snapshot_bytes=0), info, True)))
+        # 预算内（delta 300MiB）；payload 仍是 95MB，用 min_snapshot_bytes=0 排除规模下限干扰
+        info["victim_rss_max_in_window_kb"] = 400_000
+        self.assertEqual(ls.c4_errors(args(min_snapshot_bytes=0), info, True), [])
 
+    def test_rss_uses_vmhwm_when_window_sample_lower(self):
+        """窗口采样漏采峰值时用 VmHWM：window 150MiB 但 VmHWM 350MiB → 超预算判失败。"""
+        info = good_info()
+        info["victim_rss_max_in_window_kb"] = 250_000   # delta 150MiB（看起来 OK）
+        info["victim_peak_rss_kb"] = 450_000            # delta 350MiB（真实峰值）
+        self.assertTrue(any("净增量 RSS" in e for e in ls.c4_errors(args(), info, True)))
 
 class C3AssertionsTest(unittest.TestCase):
     def test_good_case(self):

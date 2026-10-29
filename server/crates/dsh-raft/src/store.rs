@@ -371,6 +371,21 @@ where
     Ok(final_path)
 }
 
+/// 写一个 msgpack `[bin(k), bin(v)]` 项（P4c）。长度超 u32::MAX 时报错（`write_bin` 的
+/// 长度标记是 u32，直接 `as u32` 会静默截断）。
+fn write_msgpack_pair<W: std::io::Write>(w: &mut W, k: &[u8], v: &[u8]) -> Result<(), ErrOf> {
+    if k.len() > u32::MAX as usize || v.len() > u32::MAX as usize {
+        return Err(io_write(
+            "snapshot pair key/value exceeds msgpack bin32 length limit",
+        ));
+    }
+    rmp::encode::write_array_len(w, 2)
+        .map_err(|e| io_write(format!("payload msgpack item header: {e}")))?;
+    rmp::encode::write_bin(w, k).map_err(|e| io_write(format!("payload msgpack key: {e}")))?;
+    rmp::encode::write_bin(w, v).map_err(|e| io_write(format!("payload msgpack value: {e}")))?;
+    Ok(())
+}
+
 /// Read a payload file (install-side validation happens in the caller before any state change).
 fn read_payload_file(path: PathBuf) -> Result<Vec<u8>, ErrOf> {
     fs::read(path).map_err(io_read)
@@ -1447,6 +1462,8 @@ pub struct StateMachineStore {
     payload_format: Arc<AtomicU8>,
     /// P4c：写端分页预算（`dump_batches` 每页字节数；默认 64MiB，测试可调小以强制多页）。
     payload_batch_bytes: Arc<AtomicUsize>,
+    /// P4b 读端分批预算（install/boot 重放；默认 16MiB，测试可调小以强制多批）。
+    restore_batch_bytes: Arc<AtomicUsize>,
     /// P4-A A3 fail-stop：restore 失败（非进程死亡）后置位。置位期间 apply / 快照构建 /
     /// `get_current_snapshot` 全部拒绝，dsh-api 据此对 HTTP 读写返回 503——不能带着
     /// 「部分新 + 部分旧」的混合状态继续服务。解除方式：一次完整成功的 install_snapshot，
@@ -1506,6 +1523,7 @@ impl StateMachineStore {
             restore_marker: Arc::new(AtomicBool::new(restore_marker)),
             payload_format: Arc::new(AtomicU8::new(payload_format)),
             payload_batch_bytes: Arc::new(AtomicUsize::new(DUMP_PAGE_BYTES)),
+            restore_batch_bytes: Arc::new(AtomicUsize::new(RESTORE_BATCH_BYTES)),
             poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1520,6 +1538,13 @@ impl StateMachineStore {
     #[doc(hidden)]
     pub fn set_payload_batch_bytes(&self, bytes: usize) {
         self.payload_batch_bytes
+            .store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    /// P4b：读端分批预算覆盖（测试用，强制多批；0/未设置 = 16MiB）。
+    #[doc(hidden)]
+    pub fn set_restore_batch_bytes(&self, bytes: usize) {
+        self.restore_batch_bytes
             .store(bytes.max(1), Ordering::Relaxed);
     }
 
@@ -1573,8 +1598,11 @@ impl StateMachineStore {
             });
             sm.restore_stream(mapped).map_err(storage_err)?;
         }
-        if let Some(last_log_id) = &meta.last_log_id {
-            self.write_last_applied(last_log_id)?;
+        match &meta.last_log_id {
+            Some(last_log_id) => self.write_last_applied(last_log_id)?,
+            // 初始快照（无 last_log_id）：状态被清空后 last_applied 也必须归零（删键），
+            // 否则会留下「新状态 + 旧 last_applied」的不一致。
+            None => meta_del(&self.db, META_LAST_APPLIED)?,
         }
         self.write_membership(&meta.last_membership)?;
         persist_snapshot_registry(&self.db, meta, path.to_path_buf())
@@ -1751,50 +1779,53 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
                 "state machine poisoned: refusing to build a snapshot from a mixed state",
             ));
         }
-        let pairs = {
+        // **一致性（gate blocker）**：`meta`（last_applied/membership，raft-meta 表）与 body
+        // 必须在**同一个状态机读锁**内取得。openraft 明确要求 snapshot builder 自己保证一致视图
+        // （0.10 `core/sm/worker.rs`：builder 可能在 spawned task 里与 apply 并发）；apply 在
+        // 同一个 `sm.write()` 保护下同时改状态和写 last_applied，所以「一个读锁覆盖 meta + body」
+        // 就够。否则：v1 路径 body 可能旧于 meta（follower 装完 last_applied=N+1 但状态是 S(N)，
+        // 永远漏 apply 一条）；v2 路径 body 可能新于 meta（重复 apply）。两者都是静默分叉。
+        let started = std::time::Instant::now();
+        let (meta, path) = {
             let sm = self.inner.sm.read().map_err(|e| io_read(e.to_string()))?;
-            sm.dump_all().map_err(storage_err)?
-        };
-        let last_applied = self.inner.read_last_applied()?;
-        let membership = self.inner.read_membership()?;
-        // 0.10：SnapshotMeta.snapshot_id 已 gone（wire 兼容 slot 保留 but always empty，see compat doc）
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership: membership,
-        };
-        // P2a: payload 落盘文件（`{name}.part` + rename，失败清理）——Snapshot 只 ever carries PathBuf
-        let dir = self.inner.data_dir.join(SNAP_SUBDIR);
-        let name = snap_file_name(&meta);
-        // P4a2 写端：v2 = 20B 头（total_len + crc32）+ msgpack body；v1 = 无头 JSON（P3 原样）。
-        // 头与 body 分两段写（`write_payload_file_chunks`），不为拼「头 + 体」再复制一份 payload。
-        let path = if self.inner.payload_format.load(Ordering::Relaxed) == PAYLOAD_FORMAT_MSGPACK {
-            // P4c：写端流式 —— dump 分页（P4c0）→ 逐页编码 → 直接落 .part，body 不整份驻留。
-            // 读锁贯穿「计数 + 流式写」：msgpack 数组头需要总数，且计数与内容必须同一状态视图
-            // （锁内无 await，不会挂住 reactor）。代价是快照构建期间写命令等待更久（一次写盘时间）。
-            let sm = self.inner.sm.read().map_err(|e| io_read(e.to_string()))?;
-            let total = sm.count_prefix_keys(b"").map_err(storage_err)?;
-            let budget = self.inner.payload_batch_bytes.load(Ordering::Relaxed);
-            write_payload_v2_streamed(dir, name, |w| {
-                let n = u32::try_from(total)
-                    .map_err(|_| io_write("snapshot too many pairs for msgpack array length"))?;
-                rmp::encode::write_array_len(w, n)
-                    .map_err(|e| io_write(format!("payload msgpack array header: {e}")))?;
-                for page in sm.dump_batches(budget) {
-                    let page = page.map_err(storage_err)?;
-                    for (k, v) in page {
-                        rmp::encode::write_array_len(w, 2)
-                            .map_err(|e| io_write(format!("payload msgpack item header: {e}")))?;
-                        rmp::encode::write_bin(w, &k)
-                            .map_err(|e| io_write(format!("payload msgpack key: {e}")))?;
-                        rmp::encode::write_bin(w, &v)
-                            .map_err(|e| io_write(format!("payload msgpack value: {e}")))?;
+            let last_applied = self.inner.read_last_applied()?;
+            let membership = self.inner.read_membership()?;
+            // 0.10：SnapshotMeta.snapshot_id 已 gone（wire 兼容 slot 保留 but always empty）
+            let meta = SnapshotMeta {
+                last_log_id: last_applied,
+                last_membership: membership,
+            };
+            // P2a: payload 落盘文件（`{name}.part` + rename，失败清理）——Snapshot 只 ever carries PathBuf
+            let dir = self.inner.data_dir.join(SNAP_SUBDIR);
+            let name = snap_file_name(&meta);
+            let msgpack =
+                self.inner.payload_format.load(Ordering::Relaxed) == PAYLOAD_FORMAT_MSGPACK;
+            let path = if msgpack {
+                // P4c：写端流式 —— dump 分页（P4c0）→ 逐页编码 → 直接落 .part，body 不整份驻留。
+                // 读锁一直持有到 body 写完（写命令在这段时间内等待；见部署手册的启动/写延迟口径）。
+                let total = sm.count_prefix_keys(b"").map_err(storage_err)?;
+                let budget = self.inner.payload_batch_bytes.load(Ordering::Relaxed);
+                write_payload_v2_streamed(dir, name, |w| {
+                    let n = u32::try_from(total).map_err(|_| {
+                        io_write("snapshot too many pairs for msgpack array length")
+                    })?;
+                    rmp::encode::write_array_len(w, n)
+                        .map_err(|e| io_write(format!("payload msgpack array header: {e}")))?;
+                    for page in sm.dump_batches(budget) {
+                        let page = page.map_err(storage_err)?;
+                        for (k, v) in page {
+                            write_msgpack_pair(w, &k, &v)?;
+                        }
                     }
-                }
-                Ok(())
-            })?
-        } else {
-            let data = serde_json::to_vec(&pairs).map_err(|e| io_write(e.to_string()))?;
-            write_payload_file(dir, name, &data)?
+                    Ok(())
+                })?
+            } else {
+                // v1（默认，无头 JSON）：整份 dump（升级期路径；v2 不再走这里，见 MAJOR 1 修复）
+                let pairs = sm.dump_all().map_err(storage_err)?;
+                let data = serde_json::to_vec(&pairs).map_err(|e| io_write(e.to_string()))?;
+                write_payload_file(dir, name, &data)?
+            };
+            (meta, path)
         };
         // registry 落盘（meta + file key；同事务 removes legacy inline data key）；旧文件清理 after commit
         let old = persist_snapshot_registry(&self.inner.db, &meta, path.clone())?;
@@ -1803,6 +1834,17 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
             meta: meta.clone(),
             snapshot: path.clone(),
         };
+        tracing::info!(
+            "snapshot built: last_log_id={:?} format={} bytes={} elapsed={:?}",
+            meta.last_log_id,
+            if self.inner.payload_format.load(Ordering::Relaxed) == PAYLOAD_FORMAT_MSGPACK {
+                "msgpack"
+            } else {
+                "json"
+            },
+            fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            started.elapsed(),
+        );
         *self.inner.current_snapshot.lock().await = Some((meta, path));
         Ok(snapshot)
     }
@@ -1919,7 +1961,9 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 sm: self.sm.clone(),
                 db: self.db.clone(),
                 data_dir: self.data_dir.clone(),
-                current_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+                // 与主 store 共享同一份 current_snapshot：builder 写完新快照后，主 store 的
+                // get_current_snapshot 必须看到同一个值（否则会返回被 build 删掉的旧路径）。
+                current_snapshot: self.current_snapshot.clone(),
                 events: self.events.clone(),
                 rotation_hook: self.rotation_hook.clone(),
                 fail_last_applied_at: self.fail_last_applied_at.clone(),
@@ -1927,6 +1971,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 restore_marker: self.restore_marker.clone(),
                 payload_format: self.payload_format.clone(),
                 payload_batch_bytes: self.payload_batch_bytes.clone(),
+                restore_batch_bytes: self.restore_batch_bytes.clone(),
                 poisoned: self.poisoned.clone(),
             }),
         }
@@ -1942,14 +1987,18 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // 顺序（P3d）：先把 payload 落成 canonical 文件 + 解析校验，**再**动状态机。
         // 这样 copy/解析失败时状态机和 last_applied 都没有前进（旧顺序先 restore 再落盘，
         // 落盘失败会留下「last_applied 已前进但没有 registry 快照」的窗口）。
-        // P4b：打开流式批次（v2 = 头 total_len/CRC 校验 + 惰性逐项解码；v1 = 整份解析）。
-        // 这一步在 copy / 动状态机之前，坏 payload 不会被采纳。
-        let batches = read_payload_batches(&snapshot, RESTORE_BATCH_BYTES)?;
+        // 顺序（P3d/P4b）：先校验收到的 payload（v2 = total_len+CRC；v1 无头文件没有完整性头），
+        // 再落 canonical 副本，**然后从 canonical 副本**打开流式批次——marker/registry 指向的
+        // 就是这个文件，首次 restore 与未来 boot 重放必须读同一份字节（复核 minor：源与副本
+        // 不应有两套内容）。坏 payload 在 copy / 动状态机之前被拒。
+        verify_payload_file(&snapshot)?;
         let path = copy_payload_file(
             self.data_dir.join(SNAP_SUBDIR),
             snap_file_name(meta),
             &snapshot,
         )?;
+        let batches =
+            read_payload_batches(&path, self.restore_batch_bytes.load(Ordering::Relaxed))?;
         // P4-A：payload 已 fsync（copy_payload_file 内含文件 + 目录 fsync）、restore 之前写标记。
         // 单事务（Durability=Immediate）→ 崩溃点可判定：见 META_RESTORE_BEGIN 注释。
         // 标记写失败时状态机未动，直接返回 Err（不 poison）。
@@ -1973,9 +2022,16 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         if old.as_deref() != Some(path.as_path()) {
             delete_old_snapshot_file(old);
         }
-        // registry 已提交：标记删除是幂等收尾。清理失败只 warn——boot 重放同一 payload 是幂等的。
+        // registry 已提交：标记删除是幂等收尾。但**不能**只 warn（gate blocker）：
+        // 若残留 marker 而节点继续 apply 更多日志，下次崩溃时 boot 重放会把 last_applied 回滚到
+        // 快照点——与已 purge 的日志冲突（openraft 拒绝启动）或对已应用条目重复 apply。
+        // 这里 fail-stop 并返回 Err：openraft 会重试安装，下一次成功安装会重写 marker 并在尾部
+        // 清理，poison 也随之解除。
         if let Err(e) = meta_del(&self.db, META_RESTORE_BEGIN) {
-            tracing::warn!("clear restore marker after successful install: {e}");
+            self.poison(format!(
+                "clear restore marker after successful install failed: {e}"
+            ));
+            return Err(io_write(format!("clear restore marker: {e}")));
         }
         // 一次完整成功的 install 已经把状态机整体替换成 payload 内容 → 解除 fail-stop。
         self.poisoned.store(false, Ordering::SeqCst);
@@ -2024,22 +2080,23 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 /// （fail-fast）。静默降级成「无快照」会丢数据；自动向 leader 要快照需要网络与成员表，超出
 /// boot 期职责。
 pub fn recover_interrupted_restore(
-    sm: &Arc<RwLock<StateMachine>>,
-    db: &DbHandle,
-    data_dir: PathBuf,
+    store: &StateMachineStore,
 ) -> Result<Option<SnapshotMetaOf<TypeConfig>>, ErrOf> {
-    recover_interrupted_restore_with(sm, db, data_dir, env_true(ENV_RESTORE_FORCE))
+    recover_interrupted_restore_with(store, env_true(ENV_RESTORE_FORCE))
 }
 
 /// `recover_interrupted_restore` 的显式参数版本（单测用；`force_ignore` 对应
 /// `DSH_RAFT_RESTORE_FORCE=1` 的人工逃生门）。
+///
+/// 取 `&StateMachineStore` 而不是 (sm, db, dir)：FORCE 路径要能把 store 置为 poison
+/// （用混合状态启动后必须拒绝服务，直到一次完整 install 成功）。
 #[doc(hidden)]
 pub fn recover_interrupted_restore_with(
-    sm: &Arc<RwLock<StateMachine>>,
-    db: &DbHandle,
-    data_dir: PathBuf,
+    store: &StateMachineStore,
     force_ignore: bool,
 ) -> Result<Option<SnapshotMetaOf<TypeConfig>>, ErrOf> {
+    let db = &store.db;
+    let data_dir = store.data_dir.clone();
     let Some(raw) = meta_get(db, META_RESTORE_BEGIN)? else {
         return Ok(None);
     };
@@ -2052,16 +2109,40 @@ pub fn recover_interrupted_restore_with(
             )))
         }
     };
+    // 过期 marker（gate blocker）：install 成功后清 marker 失败、节点又继续 apply 了更多日志，
+    // 之后崩溃。此时 last_applied 已越过快照点，重放会把 last_applied 回滚到快照点——与已 purge
+    // 的日志冲突（openraft 拒绝启动）或对已应用条目重复 apply。只清 marker，绝不重放/回滚。
+    let applied: Option<LogIdOf> = meta_get(db, META_LAST_APPLIED)?
+        .map(|raw| de::<LogIdOf>(&raw))
+        .transpose()?;
+    if let (Some(marker_id), Some(applied_id)) = (&marker.meta.last_log_id, &applied) {
+        if marker_id.index < applied_id.index {
+            tracing::error!(
+                "stale restore marker (snapshot={:?} < last_applied={:?}); the install already \
+                 completed and only the marker clear failed. Clearing it WITHOUT replay \
+                 (replay would roll last_applied back).",
+                marker_id,
+                applied_id
+            );
+            meta_del(db, META_RESTORE_BEGIN)?;
+            return Ok(None);
+        }
+    }
     if force_ignore {
         // 唯一允许「忽略 marker」的路径：运维确认 payload 不可用且接受混合状态。
+        // 以混合状态启动后必须 fail-stop（读/写 503），直到一次完整快照安装成功。
         tracing::error!(
             "DSH_RAFT_RESTORE_FORCE set: IGNORING interrupted-restore marker \
              (last_log_id={:?}, payload={}). State machine may be a MIX of old and new data; \
-             consistency must be verified manually.",
+             the node will boot POISONED (503) until a full snapshot install succeeds.",
             marker.meta.last_log_id,
             marker.payload.display()
         );
         meta_del(db, META_RESTORE_BEGIN)?;
+        store.poison(format!(
+            "DSH_RAFT_RESTORE_FORCE ignored marker for payload {} (mixed state)",
+            marker.payload.display()
+        ));
         return Ok(None);
     }
     if !fs::exists(&marker.payload).unwrap_or(false) {
@@ -2071,7 +2152,11 @@ pub fn recover_interrupted_restore_with(
             marker.payload.display()
         )));
     }
-    let batches = read_payload_batches(&marker.payload, RESTORE_BATCH_BYTES).map_err(|e| {
+    let batches = read_payload_batches(
+        &marker.payload,
+        store.restore_batch_bytes.load(Ordering::Relaxed),
+    )
+    .map_err(|e| {
         io_read(format!(
             "interrupted snapshot restore: payload {} is unreadable/corrupt ({e}); refusing to start.",
             marker.payload.display()
@@ -2079,7 +2164,8 @@ pub fn recover_interrupted_restore_with(
     })?;
     let started = std::time::Instant::now();
     {
-        let sm = sm
+        let sm = store
+            .sm
             .write()
             .map_err(|e| io_write(format!("state lock unavailable: {e}")))?;
         // P4b：boot 重放同样走流式（bounded memory + 只清空一次）。
@@ -2088,8 +2174,10 @@ pub fn recover_interrupted_restore_with(
         });
         sm.restore_stream(mapped).map_err(storage_err)?;
     }
-    if let Some(last_log_id) = &marker.meta.last_log_id {
-        put_last_applied(db, last_log_id)?;
+    match &marker.meta.last_log_id {
+        Some(last_log_id) => put_last_applied(db, last_log_id)?,
+        // 初始快照（无 last_log_id）：状态被清空，last_applied 必须一并归零/清除。
+        None => meta_del(db, META_LAST_APPLIED)?,
     }
     put_membership(db, &marker.meta.last_membership)?;
     let old = persist_snapshot_registry(db, &marker.meta, marker.payload.clone())?;
@@ -2110,7 +2198,6 @@ pub fn recover_interrupted_restore_with(
     }
     Ok(Some(marker.meta))
 }
-
 // ---------------- 内嵌单测（设计 §6 N4a：范围翻译+多表事务最易错路径） ----------------
 
 #[cfg(test)]
@@ -3129,7 +3216,8 @@ mod p4a_tests {
         assert!(fs::exists(&part).unwrap());
 
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
-        let e = recover_interrupted_restore_with(&sm, &db, dir.clone(), false).unwrap_err();
+        let store = StateMachineStore::new(sm, db.clone(), dir.clone());
+        let e = recover_interrupted_restore_with(&store, false).unwrap_err();
         assert!(
             e.to_string().contains("corrupt"),
             "坏 marker 必须报 corrupt：{e}"
@@ -3154,6 +3242,19 @@ mod p4a_tests {
         let meta = snap_meta(5);
         let data = json_payload(&pairs_of(&[("a", "1")]));
         let payload = write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta, &data).unwrap();
+        // 先证明 marker 真的会在 install 过程中写：注入 last_applied 失败 → 安装失败但 marker 在
+        store.set_fail_last_applied(1);
+        assert!(store
+            .install_snapshot(&meta, payload.clone())
+            .await
+            .is_err());
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_some(),
+            "失败 install 必须留下 marker 供 boot 重放"
+        );
+        assert!(store.is_poisoned());
+        // 解除注入 → 成功安装清 marker 并解除 fail-stop
+        store.set_fail_last_applied(0);
         store.install_snapshot(&meta, payload).await.unwrap();
         assert!(
             meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
@@ -3173,10 +3274,11 @@ mod p4a_tests {
         let storage = open_storage(&dir);
         let db = storage.raw_db();
         let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
-        // 崩溃前状态机内容（旧）
+        // 崩溃前状态机内容：**混合**（旧 key + 已经写进快照的一部分新 key）——模拟
+        // restore_stream 中途崩溃留下的「部分新 + 部分旧」现场；重放后必须精确等于 payload。
         sm.write()
             .unwrap()
-            .restore_all(&pairs_of(&[("old", "1")]))
+            .restore_all(&pairs_of(&[("old", "1"), ("new", "2")]))
             .unwrap();
 
         // 崩溃现场：新 payload 已落盘、marker 已写，restore 未开始
@@ -3188,12 +3290,12 @@ mod p4a_tests {
         write_marker(&db, &meta, &payload);
 
         // 「重启」：先构造 store（内部跑清扫），再走 dsh-cli 的 boot 重放入口
-        let _store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+        let store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
         assert!(
             fs::exists(&payload).unwrap(),
             "ctor 清扫不得删掉 marker payload"
         );
-        let out = recover_interrupted_restore(&sm, &db, dir.clone()).unwrap();
+        let out = recover_interrupted_restore(&store).unwrap();
         assert_eq!(
             out.expect("应返回重放的 meta").last_log_id,
             meta.last_log_id
@@ -3233,9 +3335,15 @@ mod p4a_tests {
                 .unwrap();
         persist_snapshot_registry(&db, &meta, payload.clone()).unwrap();
         write_marker(&db, &meta, &payload);
+        let store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
 
-        let out = recover_interrupted_restore_with(&sm, &db, dir.clone(), false).unwrap();
+        let out = recover_interrupted_restore_with(&store, false).unwrap();
         assert!(out.is_some());
+        assert_eq!(
+            state_pairs(&sm),
+            new_pairs,
+            "重放必须真的写状态机（Some 但未重放不能被接受）"
+        );
         assert!(fs::exists(&payload).unwrap(), "registry payload 不得被删");
         let (_, reg_file) = load_snapshot_registry(&db, dir.join(SNAP_SUBDIR))
             .unwrap()
@@ -3256,8 +3364,9 @@ mod p4a_tests {
         let meta = snap_meta(11);
         let ghost = dir.join(SNAP_SUBDIR).join("gone.snap");
         write_marker(&db, &meta, &ghost);
+        let store = StateMachineStore::new(sm, db.clone(), dir.clone());
 
-        let e = recover_interrupted_restore_with(&sm, &db, dir.clone(), false).unwrap_err();
+        let e = recover_interrupted_restore_with(&store, false).unwrap_err();
         assert!(e.to_string().contains("missing"), "{e}");
         assert!(
             e.to_string().contains("backup"),
@@ -3291,9 +3400,14 @@ mod p4a_tests {
         )
         .unwrap();
         write_marker(&db, &meta, &payload);
+        let store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
 
-        let out = recover_interrupted_restore_with(&sm, &db, dir.clone(), true).unwrap();
+        let out = recover_interrupted_restore_with(&store, true).unwrap();
         assert!(out.is_none(), "force 路径不重放");
+        assert!(
+            store.is_poisoned(),
+            "force 用混合状态启动后必须 fail-stop（直到一次完整 install 成功）"
+        );
         assert_eq!(
             state_pairs(&sm),
             pairs_of(&[("old", "1")]),
@@ -3304,6 +3418,58 @@ mod p4a_tests {
             "force 清 marker"
         );
         assert!(fs::exists(&payload).unwrap(), "payload 不被 force 删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 设计 §7 A3：restore 在**中段**失败（第一批已落盘、第二批结构损坏）→ poison + marker 保留。
+    /// CRC 是有效的（损坏在 msgpack 结构层），所以这覆盖「完整性校验通过但解码失败」的路径；
+    /// 读批预算设成 1 字节 → 每条一批 → 第 2 条才炸，第一批已写入状态机。
+    #[tokio::test]
+    async fn mid_restore_decode_error_poisons_and_keeps_marker() {
+        let dir = tmpdir("p4a-mid-restore");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+        store.set_restore_batch_bytes(1); // 每批 1 条，确保「第一批成功、第二批失败」
+
+        // 构造 v2 body：array(3)；item0 合法、item1 是 3 字段（结构损坏）、item2 合法。
+        let mut body = Vec::new();
+        rmp::encode::write_array_len(&mut body, 3).unwrap();
+        for i in 0..3u8 {
+            let fields = if i == 1 { 3 } else { 2 };
+            rmp::encode::write_array_len(&mut body, fields).unwrap();
+            for f in 0..fields {
+                let v = [b'a' + i, b'0' + f as u8];
+                rmp::encode::write_bin(&mut body, &v).unwrap();
+            }
+        }
+        let head =
+            encode_payload_header(PAYLOAD_VERSION_MSGPACK, 0, body.len() as u64, crc32(&body));
+        let mut all = head.to_vec();
+        all.extend_from_slice(&body);
+        let payload = dir.join("bad-structure.snap");
+        std::fs::write(&payload, &all).unwrap();
+        assert!(
+            verify_payload_file(&payload).is_ok(),
+            "CRC/长度本身是自洽的"
+        );
+
+        let meta = snap_meta(17);
+        let r = store.install_snapshot(&meta, payload).await;
+        assert!(r.is_err(), "结构损坏的批次必须让 restore 失败");
+        assert!(store.is_poisoned(), "中段失败必须 fail-stop");
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_some(),
+            "中段失败必须保留 marker（boot 重放/人工处置）"
+        );
+        // 第一批已落盘（诚实记录：分块 restore 无原子性，靠 marker 兜底）
+        let state = sm.read().unwrap().dump_all().unwrap();
+        assert!(
+            state.iter().any(|(k, _)| k == b"a0"),
+            "第一批应已写入（中段失败的语义就是部分恢复）: {state:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3340,7 +3506,7 @@ mod p4a_tests {
         let payload2 =
             write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta2, &json_payload(&pairs2)).unwrap();
         write_marker(&db, &meta2, &payload2);
-        let out = recover_interrupted_restore_with(&sm, &db, dir.clone(), false).unwrap();
+        let out = recover_interrupted_restore_with(&store, false).unwrap();
         assert_eq!(
             out.expect("已有 marker 必须重放").last_log_id,
             meta2.last_log_id
@@ -3553,7 +3719,7 @@ mod p4a2_tests {
         };
         meta_put(&store.db, META_RESTORE_BEGIN, &ser(&marker).unwrap()).unwrap();
 
-        let out = recover_interrupted_restore_with(&sm, &store.db, dir.clone(), false).unwrap();
+        let out = recover_interrupted_restore_with(&store, false).unwrap();
         assert!(out.is_some());
         assert_eq!(sm.read().unwrap().dump_all().unwrap(), pairs);
         assert!(meta_get(&store.db, META_RESTORE_BEGIN).unwrap().is_none());
@@ -3955,6 +4121,162 @@ mod p4_scale_tests {
         0
     }
 
+    /// 流式生成一份 v2 payload（不整份驻留）：`count` 条 `k{j:07} -> [b'v'; value_bytes]`。
+    fn gen_v2_payload(
+        dir: &std::path::Path,
+        count: usize,
+        value_bytes: usize,
+    ) -> (std::path::PathBuf, f64) {
+        let t0 = std::time::Instant::now();
+        let v = vec![b'v'; value_bytes];
+        let path = write_payload_v2_streamed(dir.to_path_buf(), "incoming.snap".to_string(), |w| {
+            let n = u32::try_from(count).map_err(|_| io_write("too many pairs"))?;
+            rmp::encode::write_array_len(w, n)
+                .map_err(|e| io_write(format!("array header: {e}")))?;
+            for j in 0..count {
+                let k = format!("k{j:07}");
+                write_msgpack_pair(w, k.as_bytes(), &v)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        (path, t0.elapsed().as_secs_f64())
+    }
+
+    fn rss_sampler(
+        baseline: u64,
+    ) -> (Arc<AtomicBool>, Arc<AtomicU64>, std::thread::JoinHandle<()>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(baseline));
+        let sampler = {
+            let stop = stop.clone();
+            let peak = peak.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let r = rss_kb();
+                    peak.fetch_max(r, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            })
+        };
+        (stop, peak, sampler)
+    }
+
+    /// **结构性**证明 v2 写端不再整份驻留（gate 复核要求；比 in-process RSS 探针更可靠——
+    /// 后者受 allocator 保留影响，无法稳定区分「整份驻留」与「页缓冲」）。
+    /// 计数 Store 包装：整前缀**取值**扫描（`get_prefix`，会 materialize value）、
+    /// 整前缀**只取 key** 扫描（`get_prefix_keys`，msgpack 数组头计数用）与分页扫描分别计数。
+    /// v2 build 必须 **0 次整前缀取值扫描**（不整份驻留）、≥1 次分页扫描；
+    /// v1 build 反例（≥1 次整前缀取值扫描）。
+    #[tokio::test]
+    async fn v2_build_never_scans_whole_prefix() {
+        use dsh_core::store::KeyValuePairs;
+        use dsh_core::store::Store;
+        use dsh_core::Error as CoreError;
+
+        struct Counting {
+            inner: dsh_storage::RedbStorage,
+            whole_values: Arc<std::sync::atomic::AtomicUsize>,
+            whole_keys: Arc<std::sync::atomic::AtomicUsize>,
+            page: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Store for Counting {
+            fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, CoreError> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) -> Result<(), CoreError> {
+                self.inner.put(key, value)
+            }
+            fn delete(&self, key: &[u8]) -> Result<(), CoreError> {
+                self.inner.delete(key)
+            }
+            fn get_prefix(&self, prefix: &[u8]) -> Result<KeyValuePairs, CoreError> {
+                self.whole_values.fetch_add(1, Ordering::Relaxed);
+                self.inner.get_prefix(prefix)
+            }
+            fn get_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, CoreError> {
+                self.whole_keys.fetch_add(1, Ordering::Relaxed);
+                self.inner.get_prefix_keys(prefix)
+            }
+            fn get_prefix_page(
+                &self,
+                prefix: &[u8],
+                after: Option<&[u8]>,
+                budget: usize,
+            ) -> Result<KeyValuePairs, CoreError> {
+                self.page.fetch_add(1, Ordering::Relaxed);
+                self.inner.get_prefix_page(prefix, after, budget)
+            }
+            fn put_batch(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), CoreError> {
+                self.inner.put_batch(pairs)
+            }
+            fn write_batch(
+                &self,
+                puts: &[(Vec<u8>, Vec<u8>)],
+                deletes: &[Vec<u8>],
+            ) -> Result<(), CoreError> {
+                self.inner.write_batch(puts, deletes)
+            }
+            fn flush(&self) -> Result<(), CoreError> {
+                self.inner.flush()
+            }
+        }
+
+        let dir = tmpdir("p4c-spy");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let whole_values = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let whole_keys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let page = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Counting {
+            inner: storage.clone(),
+            whole_values: whole_values.clone(),
+            whole_keys: whole_keys.clone(),
+            page: page.clone(),
+        };
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(counting))));
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..50)
+            .map(|i| (format!("k{i:03}").into_bytes(), vec![b'v'; 100]))
+            .collect();
+        sm.write().unwrap().restore_all(&pairs).unwrap();
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+
+        // v2：0 次整前缀扫描，≥1 次分页扫描
+        store.set_msgpack_payload(true);
+        store.set_payload_batch_bytes(256); // 强制多页
+        whole_values.store(0, Ordering::Relaxed);
+        whole_keys.store(0, Ordering::Relaxed);
+        page.store(0, Ordering::Relaxed);
+        let mut builder = store.get_snapshot_builder().await;
+        builder.build_snapshot().await.unwrap();
+        assert_eq!(
+            whole_values.load(Ordering::Relaxed),
+            0,
+            "v2 写端不得整前缀**取值**扫描（dump_all 回归）"
+        );
+        assert!(
+            whole_keys.load(Ordering::Relaxed) >= 1,
+            "v2 写端只需要一次 key-only 计数扫描"
+        );
+        assert!(
+            page.load(Ordering::Relaxed) >= 2,
+            "v2 写端必须分页扫描（got {}）",
+            page.load(Ordering::Relaxed)
+        );
+
+        // v1（对照）：必须整前缀扫描（无头 JSON 仍是升级期整份路径）
+        store.set_msgpack_payload(false);
+        whole_values.store(0, Ordering::Relaxed);
+        let mut builder = store.get_snapshot_builder().await;
+        builder.build_snapshot().await.unwrap();
+        assert!(
+            whole_values.load(Ordering::Relaxed) >= 1,
+            "v1 写端应走整份 dump（对照）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 大快照安装的「净增量 RSS / 快照字节」与 install 耗时（P4 gate 尺度证据）。
     ///
     /// 默认 `#[ignore]`（~350MB payload、~10s、~700MB 磁盘）；显式运行：
@@ -3977,29 +4299,7 @@ mod p4_scale_tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let gen_dir = dir.join("gen");
-        let t0 = std::time::Instant::now();
-        let path = write_payload_v2_streamed(gen_dir, "incoming.snap".to_string(), |w| {
-            let n = u32::try_from(count).map_err(|_| io_write("too many pairs"))?;
-            rmp::encode::write_array_len(w, n)
-                .map_err(|e| io_write(format!("array header: {e}")))?;
-            let mut i = 0usize;
-            while i < count {
-                let end = (i + 64).min(count);
-                for j in i..end {
-                    let k = format!("k{j:07}");
-                    let v = vec![b'v'; value_bytes];
-                    rmp::encode::write_array_len(w, 2)
-                        .map_err(|e| io_write(format!("item header: {e}")))?;
-                    rmp::encode::write_bin(w, k.as_bytes())
-                        .map_err(|e| io_write(format!("key: {e}")))?;
-                    rmp::encode::write_bin(w, &v).map_err(|e| io_write(format!("value: {e}")))?;
-                }
-                i = end;
-            }
-            Ok(())
-        })
-        .unwrap();
-        let gen_secs = t0.elapsed().as_secs_f64();
+        let (path, gen_secs) = gen_v2_payload(&gen_dir, count, value_bytes);
         let snapshot = std::fs::metadata(&path).unwrap().len();
         assert!(verify_payload_file(&path).is_ok());
 
@@ -4008,20 +4308,7 @@ mod p4_scale_tests {
         let mut store = StateMachineStore::new(sm.clone(), storage.raw_db(), dir.join("victim"));
         let meta = snap_meta(9_000);
         let baseline = rss_kb();
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let peak = Arc::new(AtomicU64::new(baseline));
-        let sampler = {
-            let stop = stop.clone();
-            let peak = peak.clone();
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let r = rss_kb();
-                    peak.fetch_max(r, Ordering::Relaxed);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            })
-        };
+        let (stop, peak, sampler) = rss_sampler(baseline);
         let t1 = std::time::Instant::now();
         store.install_snapshot(&meta, path).await.unwrap();
         let install_secs = t1.elapsed().as_secs_f64();

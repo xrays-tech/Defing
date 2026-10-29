@@ -255,6 +255,11 @@ impl config_service_server::ConfigService for ConfigGrpcService {
         &self,
         req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        // P4-A A3：fail-stop —— poisoned（restore 失败、混合状态）时连 watch 重放也不能服务。
+        // 这条路径直接从 state machine 读版本历史，不经过 linearized_read，必须显式拒绝。
+        if self.state.is_poisoned() {
+            return Err(Status::unavailable(crate::POISONED_MESSAGE));
+        }
         // 项目访问令牌鉴权：流建立时校验一次（metadata Bearer；须在 into_inner 前取 metadata）
         let meta = req.metadata().clone();
         let r = req.into_inner();

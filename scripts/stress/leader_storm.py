@@ -339,12 +339,13 @@ def read_peak_rss_kb(node):
     return None
 
 
-def state_bytes(node):
-    """victim 的逻辑状态字节数（`{data_dir}/dsh.redb` 尺寸）——RSS 比值的**格式无关**基准。
+def db_file_bytes(node):
+    """victim 的 redb 文件字节数（`{data_dir}/dsh.redb`）——**仅供观测**，不是逻辑状态。
 
-    P4 口径修正：payload 字节数不再等价于「状态大小」——v1 的 JSON payload 把 `Vec<u8>` 编成
-    十进制数字数组（≈4 字符/字节），v2 msgpack 用 bin，同一个状态两种 payload 能差 4x。用落盘
-    redb 尺寸当基准，两种格式/RSS 比值才可比（含 raft 表与 free page，是上界近似）。
+    注意（P4 gate 复核）：dsh.redb 含 raft 表、free page 与 region 对齐（实测 314,576,896 B =
+    300 MiB + 4 KiB），约为逻辑状态的 3x；它随 redb 分配/回收单调不减，不能当作严格的状态基准。
+    C4 的**断言**用绝对净增量 `rss_delta_bytes`（见 `--max-rss-delta-mb`）；本值只入 summary
+    供对照（`rss_delta_vs_db_file`）。
     """
     try:
         return os.path.getsize(os.path.join(node.data_dir, "dsh.redb"))
@@ -1495,7 +1496,7 @@ def snapshot_phase(args, stats, token, rng):
     # C4 证据：victim 峰值 RSS（VmHWM）+ 快照字节数 + 追赶 episode（含 retry）
     victim_peak_rss_kb = read_peak_rss_kb(victim)
     snapshot_bytes = latest_snapshot_bytes(victim)
-    victim_state_bytes = state_bytes(victim)
+    victim_db_file_bytes = db_file_bytes(victim)
     episode = snapshot_episode(victim, victim_restart_offset)
     events = election_events(victim, victim_restart_offset)
     attr = classify_elections(episode, events, chaos_done)
@@ -1518,7 +1519,7 @@ def snapshot_phase(args, stats, token, rng):
             "snapshot_elections_since_restart": attr["since_restart"],
             "victim_rss_max_in_window_kb": rss_in_window_kb,
             "victim_rss_baseline_kb": rss_baseline_kb,
-            "victim_state_bytes": victim_state_bytes,
+            "victim_db_file_bytes": victim_db_file_bytes,
             "victim_heartbeat_samples": hb_samples,
             "victim_heartbeat_max_ms": hb_max_ms,
             "victim_heartbeat_max_in_window_ms": hb_max_in_window_ms,
@@ -1657,23 +1658,28 @@ def c4_errors(args, snapshot_info, victim_is_voter):
                        info.get("snapshot_elections_during_chaos")))
 
     rss_kb = info.get("victim_rss_max_in_window_kb")
+    vhm_kb = info.get("victim_peak_rss_kb")
     base_kb = info.get("victim_rss_baseline_kb") or 0
-    state_b = info.get("victim_state_bytes")
+    state_b = info.get("victim_db_file_bytes")
     if rss_kb is None:
         errs.append("C4: 缺 install 窗口 RSS 采样（victim_rss_max_in_window_kb=None）")
     elif not state_b:
-        errs.append("C4: 缺 victim 逻辑状态尺寸（victim_state_bytes=None）——RSS 比值需要格式无关基准")
+        errs.append("C4: 缺 victim redb 尺寸（victim_db_file_bytes=None）——比值观测需要它")
     else:
-        # P4 口径修正：比值基准改用**逻辑状态字节**（redb 尺寸），不再用 payload 字节。
-        # 原因：v1 的 JSON payload 是 Vec<u8> 的十进制数字数组（≈4 字符/字节），v2 msgpack 是 bin；
-        # 同一状态的 payload 差 4x，用 payload 当分母会让「格式升级」看起来像内存回退
-        # （P4 实测：v2 delta 179.8MB < v1 255.3MB，但 delta/payload 反而更高）。
-        net_kb = max(0, rss_kb - int(base_kb))
-        ratio = (net_kb * 1024.0) / float(state_b)
-        if ratio > args.max_rss_state_ratio:
-            errs.append("C4: install 窗口净增量 RSS %.2fx 状态 > 预算 %.2fx"
-                        "（rss=%dKiB baseline=%dKiB state=%dB payload=%sB）"
-                        % (ratio, args.max_rss_state_ratio, rss_kb, int(base_kb), state_b, sb))
+        # P4 gate 复核后的口径（两次复核一致）：payload 与 redb 文件都不能当严格的状态基准，
+        # **断言改用绝对净增量**：delta = max(窗口采样, VmHWM) - 重启基线。
+        # - VmHWM 兜住窗口采样漏采（10ms 轮询可能错过峰值）；
+        # - 绝对预算 `--max-rss-delta-mb` 抓到「整份 payload 驻留」这类回归（350MB 状态驻留
+        #   ≈ +350MB，远超预算），不再依赖会被 region/free page 放大的比值；
+        # - `rss_delta_vs_payload` / `rss_delta_vs_db_file` 只入 summary 供对照。
+        peak_kb = max(int(rss_kb), int(vhm_kb or 0))
+        delta_kb = max(0, peak_kb - int(base_kb))
+        budget_kb = int(args.max_rss_delta_mb * 1024)
+        if delta_kb > budget_kb:
+            errs.append("C4: install 窗口净增量 RSS %dMiB > 预算 %dMiB"
+                        "（window=%dKiB vmhwm=%sKiB baseline=%dKiB payload=%sB db_file=%dB）"
+                        % (delta_kb // 1024, int(args.max_rss_delta_mb), rss_kb, vhm_kb,
+                           int(base_kb), sb, state_b))
     return errs
 
 
@@ -1848,9 +1854,10 @@ def parse_args():
     p.add_argument("--catchup-timeout", type=float, default=60.0)
     p.add_argument("--max-install-seconds", type=float, default=30.0,
                    help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
-    p.add_argument("--max-rss-state-ratio", type=float, default=1.2,
-                   help="C4 内存预算：install 窗口净增量 RSS / victim 逻辑状态字节（redb 尺寸，"
-                        "格式无关；P4 起默认 1.2。旧的 payload 比值不再断言，仅入 summary 供对照）")
+    p.add_argument("--max-rss-delta-mb", type=float, default=320.0,
+                   help="C4 内存预算：install 窗口**净增量 RSS**（max(窗口采样, VmHWM) - 重启基线）"
+                        "的绝对上限，默认 320MiB。payload/redb 比值只入 summary 供对照"
+                        "（payload 受 JSON 编码膨胀影响，redb 含 raft 表/free page，均不适合当断言基准）")
     p.add_argument("--min-snapshot-bytes", type=int, default=100_000_000,
                    help="C4 规模下限：victim 实际落盘快照字节数，默认 100MB（153MB/12k 目标的下限保护）")
     p.add_argument("--chaos-during-snapshot", action="store_true",
@@ -2068,23 +2075,27 @@ def main():
             summary["victim_elections_since_restart"] = snapshot_info.get("victim_elections_since_restart")
             summary["victim_rss_max_in_window_kb"] = snapshot_info.get("victim_rss_max_in_window_kb")
             summary["victim_rss_baseline_kb"] = snapshot_info.get("victim_rss_baseline_kb")
-            summary["victim_state_bytes"] = snapshot_info.get("victim_state_bytes")
+            summary["victim_db_file_bytes"] = snapshot_info.get("victim_db_file_bytes")
             _sb = snapshot_info.get("snapshot_bytes")
-            _st = snapshot_info.get("victim_state_bytes")
+            _db = snapshot_info.get("victim_db_file_bytes")
             _rss = snapshot_info.get("victim_rss_max_in_window_kb")
+            _vhm = snapshot_info.get("victim_peak_rss_kb")
             _base = snapshot_info.get("victim_rss_baseline_kb") or 0
-            if _rss is not None and _st:
-                summary["rss_delta_bytes"] = max(0, _rss - int(_base)) * 1024
-                summary["rss_delta_vs_state"] = round((max(0, _rss - int(_base)) * 1024.0) / _st, 2)
+            if _rss is not None:
+                _peak = max(int(_rss), int(_vhm or 0))
+                _delta = max(0, _peak - int(_base)) * 1024
+                summary["rss_delta_bytes"] = _delta
                 if _sb:
-                    summary["rss_delta_vs_payload"] = round(
-                        (max(0, _rss - int(_base)) * 1024.0) / _sb, 2)
-                    summary["rss_ratio_note"] = ("比值基准=逻辑状态（redb）；payload 比值仅供对照——"
-                                                 "v1 JSON 是 Vec<u8> 的十进制数字数组（≈4x）")
+                    summary["rss_delta_vs_payload"] = round(_delta / float(_sb), 2)
+                if _db:
+                    summary["rss_delta_vs_db_file"] = round(_delta / float(_db), 2)
+                summary["rss_ratio_note"] = (
+                    "断言=绝对净增量（--max-rss-delta-mb）；payload/db_file 比值仅供对照——"
+                    "v1 JSON payload 是 Vec<u8> 的十进制数字数组（≈4x），dsh.redb 含 raft 表/free page")
             summary["victim_heartbeat_samples"] = snapshot_info.get("victim_heartbeat_samples")
             summary["victim_heartbeat_max_in_window_ms"] = snapshot_info.get(
                 "victim_heartbeat_max_in_window_ms")
-            summary["max_rss_state_ratio_budget"] = args.max_rss_state_ratio
+            summary["max_rss_delta_mb_budget"] = args.max_rss_delta_mb
             summary["snapshot_chaos_windows"] = snapshot_info.get("snapshot_chaos_windows")
             summary["snapshot_attempts"] = snapshot_info.get("snapshot_attempts")
             summary["snapshot_last_attempt_seconds"] = snapshot_info.get("snapshot_last_attempt_seconds")
