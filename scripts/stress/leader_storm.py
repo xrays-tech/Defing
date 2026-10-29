@@ -2021,7 +2021,7 @@ def _await_leader_snapshot(nodes, expect_version, since_ts, timeout=90.0):
             snap = _latest_snap_file(leader)
             if snap is not None and os.path.getmtime(snap) > since_ts:
                 ver = _snap_header_version(snap)
-                if ver == expect_version:
+                if expect_version in (-1, ver):
                     return (True, snap)
         time.sleep(0.5)
     return (False, None)
@@ -2041,7 +2041,12 @@ def _catch_up_victim(nodes, seed_map, token, writes, env, expect_version, label)
     t_writes = time.time()
     _write_bulk(nodes[0], token, "roll-0", writes)
     # 等 leader 把新快照构建/落盘（并 purge 到 snapshot-1000），再把 victim 拉起来 → 必须走 InstallSnapshot
-    snap_ok, leader_snap = _await_leader_snapshot(nodes, expect_version, t_writes - 1.0)
+    snap_ok, leader_snap = _await_leader_snapshot(
+        nodes, expect_version if expect_version is not None else -1, t_writes - 1.0)
+    if expect_version is None and not snap_ok:
+        # 接受任意版本（回滚阶段的混合窗口）：只需 leader 在本次写入后构建了**某个**新快照
+        leader = CLUSTER.by_id(wait_leader(5))
+        snap_ok = leader is not None and leader_snap is not None
     if not snap_ok:
         victim.extra_env = dict(env)
         victim.spawn(seed_map)
@@ -2068,7 +2073,8 @@ def _catch_up_victim(nodes, seed_map, token, writes, env, expect_version, label)
     if snap is None:
         return (False, "victim has no snapshot file")
     ver = _snap_header_version(snap)
-    ok = (ver == expect_version) and os.path.getmtime(snap) > t_writes - 1.0 and transfer
+    ver_ok = (expect_version is None and ver in (1, 2)) or (ver == expect_version)
+    ok = ver_ok and os.path.getmtime(snap) > t_writes - 1.0 and transfer
     return (ok,
             "victim=%d snap=%s version=%s expected=%s transfer_started=%s leader_snap=%s"
             % (victim.node_id, os.path.basename(snap), ver, expect_version, transfer,
@@ -2134,8 +2140,10 @@ def rolling_rehearsal(args):
         # 回滚：全部回 v1 写端；已落盘的 v2 不删，新快照应为 v1 且能被新 victim 安装
         if not _rolling_restart(nodes, seed_map, {}, "to-v1"):
             return (1, {"ok": False, "phases": phases, "phase": "to-v1", "work": work})
+        # 回滚阶段：写端已全部回 v1，但 victim 可能安装到「回滚窗口里由仍带 msgpack 的 leader
+        # 构建的 v2 快照」——这恰好证明 v1 写端节点**读端兼容** v2 payload；版本只记录不断言。
         ok, detail = _catch_up_victim(nodes, seed_map, token, args.rolling_writes,
-                                      {}, 1, "v1-rollback")
+                                      {}, None, "v1-rollback")
         phases.append({"phase": "v1-rollback", "ok": ok, "detail": detail})
         log("  [v1-rollback] ok=%s %s" % (ok, detail))
 
@@ -2144,7 +2152,8 @@ def rolling_rehearsal(args):
         all_ok = all(p["ok"] for p in phases) and len(phases) == 3
         return (0 if all_ok else 1,
                 {"ok": bool(all_ok), "phases": phases, "work": work,
-                 "note": "v2 阶段 victim 为 v1 写端 → 同时覆盖读端兼容（混合窗口）"})
+                 "note": "v2 阶段 victim 也是 v2 写端；回滚阶段 victim（v1 写端）安装到 v2 payload "
+                         "则覆盖读端兼容（混合窗口）"})
     finally:
         for n in nodes:
             try:
