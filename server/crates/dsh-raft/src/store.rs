@@ -4882,3 +4882,108 @@ mod p5_poison_edge_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod p5_concurrency_tests {
+    use super::tests::{open_storage, snap_meta, tmpdir};
+    use super::*;
+    use std::time::Duration;
+
+    fn pairs_of(items: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    }
+
+    /// P5（复核建议）：build_snapshot 与 install_snapshot **并发**（真实 Raft 里 builder 与 SM worker
+    /// 就是并发的）。断言：不死锁（60s 超时）、install 完成后 registry 指向 install 的快照、
+    /// 状态机内容 == install 的 payload（旧 builder 不得覆盖/删除新快照）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_build_and_install_stay_consistent() {
+        for round in 0..4u64 {
+            let dir = tmpdir(&format!("p5-concurrent-{round}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            let storage = open_storage(&dir);
+            let db = storage.raw_db();
+            let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+            // 两个 handle 共享 sm/db/data_dir：一个跑 install（&mut self），一个跑 builder（&self）。
+            // 这正是真实 Raft 里 SM worker 与 snapshot builder 的并发形态。
+            // 注意：StateMachineStore::new 会跑 startup sweep（删除 registry 未引用的 *.snap），
+            // 所以必须先建好所有 handle，再写「待安装的 payload」，否则会被 sweep 删掉。
+            let mut store_install = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+            let mut build_stores: Vec<StateMachineStore> = (0..3)
+                .map(|_| StateMachineStore::new(sm.clone(), db.clone(), dir.clone()))
+                .collect();
+
+            // 初始状态 + last_applied=3（builder 会构建 meta=3）
+            sm.write()
+                .unwrap()
+                .restore_all(&pairs_of(&[("before", "0")]))
+                .unwrap();
+            put_last_applied(&db, &snap_meta(3).last_log_id.unwrap()).unwrap();
+
+            // 并发 install：meta=10+round，payload 内容唯一
+            let meta = snap_meta(10 + round);
+            let installed = pairs_of(&[("installed", &format!("{round}"))]);
+            let payload = write_snapshot_payload(
+                dir.join(SNAP_SUBDIR),
+                &meta,
+                &serde_json::to_vec(&installed).unwrap(),
+            )
+            .unwrap();
+
+            let meta_for_install = meta.clone();
+            let install = tokio::spawn(async move {
+                store_install
+                    .install_snapshot(&meta_for_install, payload)
+                    .await
+            });
+            let mut builds = Vec::new();
+            for mut s in build_stores.drain(..) {
+                // 每个 builder 用独立 handle（get_snapshot_builder 需要 &mut self），共享同一 sm/db/dir
+                builds.push(tokio::spawn(async move {
+                    let mut b = s.get_snapshot_builder().await;
+                    b.build_snapshot().await.map(|snap| snap.meta.last_log_id)
+                }));
+            }
+
+            let joined = tokio::time::timeout(Duration::from_secs(60), async {
+                let mut built = Vec::new();
+                for h in builds {
+                    built.push(
+                        h.await
+                            .expect("builder task panicked")
+                            .expect("build failed"),
+                    );
+                }
+                let installed_ok = install.await.expect("install task panicked");
+                (built, installed_ok)
+            })
+            .await;
+            let (_built, installed_ok) = joined.unwrap_or_else(|_| {
+                panic!("round {round}: build/install 并发 60s 未完成（疑似死锁）")
+            });
+            installed_ok.expect("install_snapshot 失败");
+
+            // 不变量：install 赢；旧 builder 不得覆盖 registry / 删新 payload
+            let (reg_meta, reg_file) = load_snapshot_registry(&db, dir.join(SNAP_SUBDIR))
+                .unwrap()
+                .expect("registry 必须存在");
+            assert_eq!(
+                reg_meta.last_log_id, meta.last_log_id,
+                "round {round}: registry 必须指向 install 的快照（旧 builder 不得覆盖）"
+            );
+            assert!(
+                fs::exists(&reg_file).unwrap(),
+                "round {round}: registry 指向的 payload 必须存在（不得被 delete_old 删掉）"
+            );
+            assert_eq!(
+                sm.read().unwrap().dump_all().unwrap(),
+                installed,
+                "round {round}: 状态机内容必须等于 install 的 payload"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
