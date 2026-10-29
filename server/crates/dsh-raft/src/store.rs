@@ -514,6 +514,7 @@ fn meta_get(db: &DbHandle, key: &[u8]) -> Result<Option<Vec<u8>>, ErrOf> {
 
 /// 写 raft-meta 单键（单事务提交；Durability 默认 Immediate，commit 即 fsync）。
 /// 删除一个 meta 键（幂等）。P4-A 的 `META_RESTORE_BEGIN` 生命周期用得到。
+#[allow(dead_code)] // P4-A 落地前仅由单测使用
 fn meta_del(db: &DbHandle, key: &[u8]) -> Result<(), ErrOf> {
     let txn = db.begin_write().map_err(io_write)?;
     {
