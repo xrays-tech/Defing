@@ -400,6 +400,9 @@ msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / 
   `192MiB + payload`（随规模放大；`--max-rss-delta-mb>0` 只能收紧）：固定开销 192MiB + 允许一份
   payload 副本，「整份额外驻留」回归会超预算。payload/redb 比值只作观测（JSON payload 会被编成
   十进制数组放大 ~4x，`dsh.redb` 含 raft 表/free page 且按 region 取整，都不适合当判定基准）。
+- **单快照上限**：`MAX_SNAPSHOT_BYTES = 2GiB`（原 640MiB）。v1 无头 JSON 约为逻辑状态的 4x
+  （60KB value、~200MB 状态 → ~824MB payload），640MiB 会在接收端截断、发送端反复重试。
+  超过 2GiB 请改用 v2 msgpack（约 1/4）或拆分项目。
 - **install_snapshot_timeout**：`DSH_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS`（**默认 120000ms**）是
   openraft 0.10 传给 InstallSnapshot RPC 的 `hard_ttl`。v1 JSON 快照可达 ~1GB，旧的 30s 默认
   在 extreme 规模实测会反复超时、lag 卡死（47 次重试无一完成）。按
