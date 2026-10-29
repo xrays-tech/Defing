@@ -37,6 +37,7 @@ def args(**kw):
         max_install_seconds=30.0,
         min_snapshot_bytes=100_000_000,
         max_heartbeat_gap_ms=3000,
+        max_rss_ratio=2.0,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -183,6 +184,20 @@ class C4AssertionsTest(unittest.TestCase):
     def test_learner_victim_fails(self):
         errs = ls.c4_errors(args(), good_snapshot_info(), False)
         self.assertTrue(any("不是 voter" in e for e in errs), errs)
+
+    def test_rss_over_budget_fails(self):
+        info = good_snapshot_info()
+        info["victim_rss_max_in_window_kb"] = 1_000_000  # 净 (1000-100)MB / 250MB ≈ 3.6x
+        info["victim_rss_baseline_kb"] = 100_000
+        errs = ls.c4_errors(args(), info, True)
+        self.assertTrue(any("净增量 RSS" in e for e in errs), errs)
+
+    def test_rss_within_budget_passes(self):
+        info = good_snapshot_info()
+        info["victim_rss_max_in_window_kb"] = 400_000  # 净 (400-100)MB / 250MB ≈ 1.2x
+        info["victim_rss_baseline_kb"] = 100_000
+        errs = ls.c4_errors(args(), info, True)
+        self.assertEqual(errs, [])
 
     def test_missing_measurement_fails(self):
         info = good_snapshot_info()

@@ -619,8 +619,11 @@ impl StateMachine {
     ///
     /// P3c：改走 `Store::write_batch`（单事务 + 一次 fsync）——旧实现逐 key `delete`/`put`
     /// 各开一个事务，400MB 快照（约 4 万对 KV）在 btrfs 上要 ~4 万次 fsync，实测 install 84s
-    /// 基本全耗在这里。按字节预算分块提交：块内单事务，块间可重试（与旧实现的部分恢复语义一致），
-    /// 同时避免单事务把整份 payload 的脏页驻留内存。
+    /// 基本全耗在这里。按字节预算分块提交，避免单事务把整份 payload 的脏页驻留内存。
+    ///
+    /// 崩溃语义（不要误读）：块之间**没有重试**，也没有原子性——中途崩溃会留下「部分新 + 部分旧」
+    /// 的混合状态。这是与旧实现同级的已知缺陷，P4 用 `RESTORE_BEGIN` 标记 + boot 重放解决
+    /// （见 dev_docs/design/openraft-010-p4-restore-atomicity.md）。
     pub fn restore_all(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error> {
         self.restore_all_batched(pairs, RESTORE_CHUNK_BYTES)
     }
@@ -631,11 +634,8 @@ impl StateMachine {
         pairs: &[(Vec<u8>, Vec<u8>)],
         chunk_bytes: usize,
     ) -> Result<(), Error> {
-        let existing: Vec<Vec<u8>> = self
-            .get_prefix_merged(b"")?
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
+        // 只要 key（不 materialize value）：本来就有大状态时，旧写法会额外驻留一份 payload。
+        let existing: Vec<Vec<u8>> = self.store.get_prefix_keys(b"")?;
         if pairs.is_empty() {
             if !existing.is_empty() {
                 self.store.write_batch(&[], &existing)?;

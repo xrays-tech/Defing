@@ -183,6 +183,29 @@ impl Store for RedbStorage {
         txn.commit().map_err(|e| redb_error("commit delete", e))
     }
 
+    fn get_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| redb_error("begin read", e))?;
+        let table = txn
+            .open_table(TBL_STATE)
+            .map_err(|e| redb_error("open state table", e))?;
+        let mut keys = Vec::new();
+        let iter = table
+            .range::<&[u8]>(prefix..)
+            .map_err(|e| redb_error("prefix range", e))?;
+        for entry in iter {
+            let (key, _value) = entry.map_err(|e| redb_error("prefix scan", e))?;
+            let k = key.value();
+            if !k.starts_with(prefix) {
+                break;
+            }
+            keys.push(k.to_vec());
+        }
+        Ok(keys)
+    }
+
     fn get_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
         let txn = self
             .db
@@ -447,6 +470,34 @@ mod tests {
         );
         let state = txn.open_table(TBL_STATE).unwrap();
         assert_eq!(state.get(b"p/x".as_slice()).unwrap().unwrap().value(), b"1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_prefix_keys_matches_full_scan_keys_without_values() {
+        let dir = tmpdir("prefix-keys");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RedbStorage::open(&dir.display().to_string()).unwrap();
+        store.put(b"a/1", b"v1").unwrap();
+        store.put(b"a/2", b"v2").unwrap();
+        store.put(b"b/1", b"v3").unwrap();
+
+        let keys = store.get_prefix_keys(b"a/").unwrap();
+        assert_eq!(
+            keys,
+            vec![b"a/1".to_vec(), b"a/2".to_vec()],
+            "只返回前缀内 key，按字典序"
+        );
+
+        let full: Vec<Vec<u8>> = store
+            .get_prefix(b"a/")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, full, "与 get_prefix 的 key 序列一致");
+
+        assert!(store.get_prefix_keys(b"zzz/").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

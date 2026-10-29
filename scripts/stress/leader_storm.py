@@ -265,6 +265,25 @@ def healthz(base):
     return r["status"] == 200
 
 
+def read_rss_kb(node):
+    """当前 RSS（VmRSS）。install 窗口内采样用——VmHWM 是整段进程生命周期的峰值，
+    不能证明「安装窗口内」的内存；复核 major 指出过这点。"""
+    try:
+        pid = node.proc.pid if node and node.proc else None
+    except AttributeError:
+        pid = None
+    if not pid:
+        return None
+    try:
+        with open("/proc/%d/status" % pid, "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        return None
+    return None
+
+
 def read_peak_rss_kb(node):
     """Victim 进程的峰值 RSS（VmHWM，内核高水位）—— P3 C4 的 install RSS 证据。
 
@@ -1289,6 +1308,8 @@ def snapshot_phase(args, stats, token, rng):
     lag_none_seen = False   # victim lag reported null at least once
     # 心跳证据（plan §9.3）：leader 视角 victim 的「最近一次确认心跳」age。
     # 0.10 的独立 heartbeat worker 要证明的正是「快照 install 期间心跳不停」。
+    rss_in_window_kb = None
+    rss_baseline_kb = None
     hb_samples = 0
     hb_max_ms = None
     hb_max_in_window_ms = None
@@ -1322,6 +1343,16 @@ def snapshot_phase(args, stats, token, rng):
             for m in md.get("members", []):
                 if str(m.get("node_id")) == str(victim_id):
                     hb_age = m.get("last_heartbeat_ms_ago")
+                    if transfer_seen_at is not None and catchup_seconds is None:
+                        rss_now = read_rss_kb(victim)
+                        if isinstance(rss_now, int):
+                            if rss_baseline_kb is None:
+                                # 窗口内第一个采样 ≈ 进程基线（传输刚起、状态机未 restore）
+                                rss_baseline_kb = rss_now
+                            rss_in_window_kb = (
+                                rss_now if rss_in_window_kb is None
+                                else max(rss_in_window_kb, rss_now)
+                            )
                     if isinstance(hb_age, int) and not isinstance(hb_age, bool):
                         hb_samples += 1
                         hb_max_ms = hb_age if hb_max_ms is None else max(hb_max_ms, hb_age)
@@ -1402,6 +1433,8 @@ def snapshot_phase(args, stats, token, rng):
             "snapshot_transfer_seconds": win["transfer_seconds"],
             "snapshot_apply_seconds": win["apply_seconds"],
             "snapshot_elections_pre_vote": attr["pre_votes"],
+            "victim_rss_max_in_window_kb": rss_in_window_kb,
+            "victim_rss_baseline_kb": rss_baseline_kb,
             "victim_heartbeat_samples": hb_samples,
             "victim_heartbeat_max_ms": hb_max_ms,
             "victim_heartbeat_max_in_window_ms": hb_max_in_window_ms,
@@ -1520,6 +1553,17 @@ def c4_errors(args, snapshot_info, victim_is_voter):
     if victim_is_voter is not True:
         errs.append("C4: victim node %s 不是 voter（is_voter=%s）——learner 追平不能算 C4"
                     % (info.get("victim_id"), victim_is_voter))
+    # 内存预算（§8.5）：install **窗口内** peak RSS（不是整段进程 VmHWM），
+    # 且按「扣除进程基线后的净增量」算 ratio —— 小快照时进程基线会主导原始比值。
+    rss_kb = info.get("victim_rss_max_in_window_kb")
+    base_kb = info.get("victim_rss_baseline_kb") or 0
+    if isinstance(rss_kb, int) and sb:
+        net_kb = max(0, rss_kb - int(base_kb))
+        ratio = (net_kb * 1024.0) / float(sb)
+        if ratio > args.max_rss_ratio:
+            errs.append("C4: install 窗口净增量 RSS %.2fx 快照 > 预算 %.2fx"
+                        "（rss=%dKiB baseline=%dKiB snapshot=%dB）"
+                        % (ratio, args.max_rss_ratio, rss_kb, int(base_kb), sb))
     return errs
 
 
@@ -1693,6 +1737,8 @@ def parse_args():
     p.add_argument("--catchup-timeout", type=float, default=60.0)
     p.add_argument("--max-install-seconds", type=float, default=30.0,
                    help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
+    p.add_argument("--max-rss-ratio", type=float, default=2.0,
+                   help="C4 内存预算：install 窗口内 victim 峰值 RSS / 快照字节数（§8.5 默认 2.0）")
     p.add_argument("--max-heartbeat-gap-ms", type=int, default=3000,
                    help="C3 心跳证据：install 窗口内 leader 观测到的 victim 心跳 age 上限（默认 3s）")
     p.add_argument("--min-snapshot-bytes", type=int, default=100_000_000,
@@ -1902,6 +1948,8 @@ def main():
             summary["victim_elections_during_catchup"] = snapshot_info.get("victim_elections")
             summary["victim_elections_since_restart"] = snapshot_info.get("victim_elections_since_restart")
             summary["victim_pre_votes_during_install"] = snapshot_info.get("snapshot_elections_pre_vote")
+            summary["victim_rss_max_in_window_kb"] = snapshot_info.get("victim_rss_max_in_window_kb")
+            summary["victim_rss_baseline_kb"] = snapshot_info.get("victim_rss_baseline_kb")
             summary["victim_heartbeat_samples"] = snapshot_info.get("victim_heartbeat_samples")
             summary["victim_heartbeat_max_ms"] = snapshot_info.get("victim_heartbeat_max_ms")
             summary["victim_heartbeat_max_in_window_ms"] = snapshot_info.get(

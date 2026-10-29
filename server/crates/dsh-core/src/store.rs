@@ -15,6 +15,18 @@ pub trait Store: Send + Sync {
     fn delete(&self, key: &[u8]) -> Result<(), Error>;
     /// 前缀扫描（按 key 字典序）。
     fn get_prefix(&self, prefix: &[u8]) -> Result<KeyValuePairs, Error>;
+    /// 前缀 key 扫描（不 materialize value）。
+    ///
+    /// 快照安装要「清空全部旧 key」，只需要 key：旧实现用 `get_prefix_merged(b"")` 拿全量
+    /// (k,v)，在「本来就有大状态」的节点上会额外驻留一份 payload（复核 major）。默认实现
+    /// 丢弃 value（内存实现足够）；redb 覆盖为只读 key 的 range 扫描。
+    fn get_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(self
+            .get_prefix(prefix)?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect())
+    }
     /// 批量写（单次事务提交语义）。
     fn put_batch(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error>;
     /// 批量写 + 批量删（单事务，原子提交；redb 一次 fsync；内存实现先删后插）。
