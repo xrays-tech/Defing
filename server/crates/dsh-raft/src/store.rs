@@ -5,7 +5,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dsh_core::error::Error as DshError;
@@ -57,6 +57,49 @@ const META_VOTE: &[u8] = b"vote";
 const META_LAST_PURGED: &[u8] = b"last_purged";
 const META_LAST_APPLIED: &[u8] = b"last_applied";
 const META_MEMBERSHIP: &[u8] = b"membership";
+
+// ---------------- P4-A restore-in-progress 标记 ----------------
+//
+// install_snapshot 的 restore 是**分块提交**（`Store::write_batch`，64MiB/块），崩溃/IO 错误
+// 落在中间会留下「部分新 + 部分旧」的混合状态。P4-A 用 raft-meta 里的一个标记把窗口变成可重放：
+//   1. payload 已 fsync 落到 canonical 文件后、动状态机之前写 `META_RESTORE_BEGIN{meta,payload}`；
+//   2. registry 提交（+ 旧 payload 清理）之后删除标记；
+//   3. boot 见到标记 → 用同一 payload 重放一次全量 restore（幂等），再清标记。
+// 顺序不变量（设计 §7 A1/A4/A5）：
+//   - 标记必须晚于 payload 的 fsync（copy_payload_file/write_payload_file 内部已 fsync 文件 + 目录）；
+//   - 标记指向的 payload 就是 registry 即将指向的路径（同一个 `path`）；
+//   - 启动清扫必须把 marker payload 并入 keep-set，否则会在重放前把它当 orphan 删掉（A1 blocker）。
+const META_RESTORE_BEGIN: &[u8] = b"restore_begin";
+
+/// `META_RESTORE_BEGIN` 的值（raft-meta 表，JSON；与 registry 同库同事务语义）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreBegin {
+    /// 正在安装的快照元数据：重放后原样写回 last_applied / membership / registry。
+    meta: SnapshotMetaOf<TypeConfig>,
+    /// 已 fsync 的 canonical payload 文件（`{data_dir}/snapshots/` 下）。
+    payload: PathBuf,
+}
+
+/// kill-switch：`DSH_RAFT_RESTORE_MARKER=0` **只关闭写 marker**；已存在的 marker 在 boot 时
+/// 仍必须重放（设计 §7 A2）——否则会以混合状态启动。
+const ENV_RESTORE_MARKER: &str = "DSH_RAFT_RESTORE_MARKER";
+/// 唯一的「忽略已有 marker」逃生门，必须显式 `=1`/`true`（大声 WARN），供运维在 payload
+/// 确认不可用时人工放行；默认关闭。
+const ENV_RESTORE_FORCE: &str = "DSH_RAFT_RESTORE_FORCE";
+
+fn env_true(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    )
+}
+
+fn restore_marker_enabled_from_env() -> bool {
+    !matches!(
+        std::env::var(ENV_RESTORE_MARKER).as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
 
 // ---------------- snapshot persistence (snapshots table registry; B5; P2a file-backed) ----------------
 //
@@ -118,17 +161,21 @@ fn prepare_snap_dir(dir: PathBuf) -> Result<(), ErrOf> {
 
 /// (P3a-A) startup sweep of `{data_dir}/snapshots/`:
 /// - every `*.part` (crashed write residue from any name) is removed;
-/// - every canonical `*.snap` the registry's `file` key does not reference is removed
-///   (install/legacy-migration renames replace the previous payload; old files are garbage);
+/// - every canonical `*.snap` not referenced by the registry `file` key **or by an in-flight
+///   restore marker** is removed (install/legacy-migration renames replace the previous payload;
+///   old files are garbage);
 /// - foreign names (not `*.part` / `*.snap`) are left untouched (operator debug drops).
-///   Registry read/parse failure aborts the sweep (never mass-delete on a corrupt read).
+///   Registry read/parse failure or a corrupt restore marker aborts the sweep (never mass-delete
+///   on a corrupt read; P4-A: a marker we cannot parse means boot recovery will fail-fast, and
+///   deleting its payload first would turn that into a bricked node).
 ///   Returns `(parts_removed, orphans_removed)`.
 pub fn sweep_snapshot_payloads(db: &DbHandle, dir: PathBuf) -> Result<(u64, u64), ErrOf> {
     if !fs::exists(&dir).unwrap_or(false) {
         return Ok((0, 0));
     }
-    // canonical referenced path: the single `file` registry key (JSON-encoded PathBuf).
-    // `file` absent (no snapshot, or legacy inline `data` not yet migrated) = no keep.
+    // canonical referenced paths: the `file` registry key (JSON-encoded PathBuf) and, when an
+    // install is in flight, the restore marker's payload (P4-A A1). `file` absent (no snapshot,
+    // or legacy inline `data` not yet migrated) = no registry keep.
     let ref_raw = {
         let txn = db.begin_read().map_err(io_read)?;
         let table = txn.open_table(TBL_SNAPSHOTS).map_err(io_read)?;
@@ -137,11 +184,32 @@ pub fn sweep_snapshot_payloads(db: &DbHandle, dir: PathBuf) -> Result<(u64, u64)
             .map_err(io_read)?
             .map(|guard| guard.value().to_vec())
     };
-    let keep: PathBuf = match ref_raw {
-        Some(raw) => de(&raw)?,
-        None => PathBuf::new(),
-    };
-    let keep_canon = fs::canonicalize(&keep).ok();
+    let mut keep: Vec<PathBuf> = Vec::new();
+    if let Some(raw) = ref_raw {
+        keep.push(de(&raw)?);
+    }
+    if let Some(raw) = meta_get(db, META_RESTORE_BEGIN)? {
+        match de::<RestoreBegin>(&raw) {
+            Ok(marker) => keep.push(marker.payload),
+            Err(e) => {
+                return Err(io_read(format!(
+                    "restore marker is corrupt ({e}); refusing to sweep the snapshots dir \
+                     (boot recovery must fail-fast instead of losing the marker payload)"
+                )))
+            }
+        }
+    }
+    let keep_canon: Vec<PathBuf> = keep
+        .iter()
+        .filter_map(|p| match fs::canonicalize(p) {
+            Ok(c) => Some(c),
+            Err(_) => {
+                // missing payload is recover's problem (fail-fast), not the sweep's: nothing to keep.
+                tracing::warn!("sweep keep-set path missing: {}", p.display());
+                None
+            }
+        })
+        .collect();
     let mut parts: u64 = 0;
     let mut orphans: u64 = 0;
     let listing = fs::read_dir(&dir).map_err(io_read)?;
@@ -161,9 +229,10 @@ pub fn sweep_snapshot_payloads(db: &DbHandle, dir: PathBuf) -> Result<(u64, u64)
                     // P3f：按 canonicalize 后比较，而不是 display() 字符串。`--data-dir data`
                     // 与 `./data` / 绝对路径只是拼写不同，字符串比较会把 registry 正在使用的
                     // payload 判成 orphan 删掉（重启后没有快照）。
-                    let is_keep = match (&keep_canon, fs::canonicalize(&path).ok()) {
-                        (Some(k), Some(p)) => *k == p,
-                        _ => path == keep,
+                    let is_keep = match fs::canonicalize(&path) {
+                        Ok(p) => keep_canon.contains(&p),
+                        // canonicalize 失败（罕见：权限/竞态）→ 退回按原始路径字符串比较
+                        Err(_) => keep.contains(&path),
                     };
                     if is_keep {
                         continue;
@@ -514,7 +583,6 @@ fn meta_get(db: &DbHandle, key: &[u8]) -> Result<Option<Vec<u8>>, ErrOf> {
 
 /// 写 raft-meta 单键（单事务提交；Durability 默认 Immediate，commit 即 fsync）。
 /// 删除一个 meta 键（幂等）。P4-A 的 `META_RESTORE_BEGIN` 生命周期用得到。
-#[allow(dead_code)] // P4-A 落地前仅由单测使用
 fn meta_del(db: &DbHandle, key: &[u8]) -> Result<(), ErrOf> {
     let txn = db.begin_write().map_err(io_write)?;
     {
@@ -530,6 +598,16 @@ fn meta_put(db: &DbHandle, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
     table.insert(key, value).map_err(io_write)?;
     drop(table); // 表句柄先于 commit 释放（commit 消费事务）
     txn.commit().map_err(io_write)
+}
+
+/// P4-A：last_applied / membership 的自由函数形态——`install_snapshot` 与 boot 重放
+/// （`recover_interrupted_restore`，没有 StateMachineStore 实例）共用同一份落盘语义。
+fn put_last_applied(db: &DbHandle, id: &LogIdOf) -> Result<(), ErrOf> {
+    meta_put(db, META_LAST_APPLIED, &ser(id)?)
+}
+
+fn put_membership(db: &DbHandle, m: &StoredMembershipOf<TypeConfig>) -> Result<(), ErrOf> {
+    meta_put(db, META_MEMBERSHIP, &ser(m)?)
 }
 
 /// 共享的日志读取逻辑（LogReader 与 LogStore 复用）：[start, end] 闭区间。
@@ -899,6 +977,13 @@ pub struct StateMachineStore {
     /// Relaxed atomic 读/增量 per entry（negligible vs redb 事务），仅测试路径非默认。
     fail_last_applied_at: Arc<AtomicU64>,
     last_applied_calls: Arc<AtomicU64>,
+    /// P4-A kill-switch：是否写 `META_RESTORE_BEGIN`（`DSH_RAFT_RESTORE_MARKER=0` 只关写）。
+    restore_marker: Arc<AtomicBool>,
+    /// P4-A A3 fail-stop：restore 失败（非进程死亡）后置位。置位期间 apply / 快照构建 /
+    /// `get_current_snapshot` 全部拒绝，dsh-api 据此对 HTTP 读写返回 503——不能带着
+    /// 「部分新 + 部分旧」的混合状态继续服务。解除方式：一次完整成功的 install_snapshot，
+    /// 或重启走 boot 重放。
+    poisoned: Arc<AtomicBool>,
 }
 
 impl StateMachineStore {
@@ -925,6 +1010,14 @@ impl StateMachineStore {
             Ok(_) => {}
             Err(e) => tracing::warn!("snapshots dir startup sweep skipped: {e}"),
         };
+        let restore_marker = restore_marker_enabled_from_env();
+        if !restore_marker {
+            tracing::warn!(
+                "DSH_RAFT_RESTORE_MARKER disabled: snapshot installs will NOT write the \
+                 restore-in-progress marker, so a crash mid-restore cannot be replayed \
+                 (release-period escape hatch only). Existing markers are still replayed on boot."
+            );
+        }
         Self {
             sm,
             db,
@@ -934,7 +1027,54 @@ impl StateMachineStore {
             rotation_hook: hook,
             fail_last_applied_at: Arc::new(AtomicU64::new(NO_FAULT)),
             last_applied_calls: Arc::new(AtomicU64::new(0)),
+            restore_marker: Arc::new(AtomicBool::new(restore_marker)),
+            poisoned: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// P4-A kill-switch 的进程内覆盖（测试用；生产走 `DSH_RAFT_RESTORE_MARKER`）。
+    #[doc(hidden)]
+    pub fn set_restore_marker(&self, enabled: bool) {
+        self.restore_marker.store(enabled, Ordering::Relaxed);
+    }
+
+    /// P4-A：fail-stop 标记句柄（dsh-cli 交给 dsh-api，置位后 HTTP 读写 503）。
+    pub fn poison_flag(&self) -> Arc<AtomicBool> {
+        self.poisoned.clone()
+    }
+
+    /// P4-A：restore 失败后是否处于 fail-stop。
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
+    }
+
+    /// P4-A A3：restore 错误 → 进入 fail-stop（只记第一次，避免刷日志）。
+    fn poison(&self, why: impl std::fmt::Display) {
+        if !self.poisoned.swap(true, Ordering::SeqCst) {
+            tracing::error!(
+                "state machine POISONED (fail-stop): {why}. Refusing apply/snapshot/read paths \
+                 until a full snapshot install succeeds or the node restarts (boot replay)."
+            );
+        }
+    }
+
+    /// P4-A：install_snapshot 的「状态机已可能被改写」区段（标记已写之后）。
+    /// 返回被替换的旧 registry 文件路径（交给调用方在提交后清理）。
+    fn restore_and_persist_inner(
+        &self,
+        meta: &SnapshotMetaOf<TypeConfig>,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        path: &std::path::Path,
+    ) -> Result<Option<PathBuf>, ErrOf> {
+        {
+            let sm = self.sm.write().map_err(|e| io_write(e.to_string()))?;
+            sm.restore_all(pairs).map_err(storage_err)?;
+        }
+        if let Some(last_log_id) = &meta.last_log_id {
+            self.write_last_applied(last_log_id)?;
+        }
+        self.write_membership(&meta.last_membership)?;
+        persist_snapshot_registry(&self.db, meta, path.to_path_buf())
     }
 
     /// P1 测试注入开关（doc-hidden）：第 `n`（≥1）write_last_applied 调用 IO-fail；`0`/`NO_FAULT` 关闭。
@@ -1002,7 +1142,7 @@ impl StateMachineStore {
             return Err(io_write("injected write_last_applied IO failure"));
         }
         // 每条独立事务（设计 §8.7：重启重放边界语义优先，不合并为批末单写）
-        meta_put(&self.db, META_LAST_APPLIED, &ser(id)?)
+        put_last_applied(&self.db, id)
     }
 
     fn read_membership(&self) -> Result<StoredMembershipOf<TypeConfig>, ErrOf> {
@@ -1013,7 +1153,7 @@ impl StateMachineStore {
     }
 
     fn write_membership(&self, m: &StoredMembershipOf<TypeConfig>) -> Result<(), ErrOf> {
-        meta_put(&self.db, META_MEMBERSHIP, &ser(m)?)
+        put_membership(&self.db, m)
     }
     #[doc(hidden)]
     /// apply 一个条目：状态机变更 + per-entry last_applied 落盘（§8.7 独立事务）。
@@ -1103,6 +1243,11 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
     type SnapshotData = PathBuf;
 
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<TypeConfig, PathBuf>, ErrOf> {
+        if self.inner.is_poisoned() {
+            return Err(io_write(
+                "state machine poisoned: refusing to build a snapshot from a mixed state",
+            ));
+        }
         let pairs = {
             let sm = self.inner.sm.read().map_err(|e| io_read(e.to_string()))?;
             sm.dump_all().map_err(storage_err)?
@@ -1152,6 +1297,24 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     where
         Strm: Stream<Item = Result<EntryResponder<TypeConfig>, ErrOf>> + Unpin + OptionalSend,
     {
+        // P4-A A3：fail-stop。restore 已失败 → 本地状态机可能是「部分新 + 部分旧」，
+        // 继续 apply 会把日志条目叠在混合状态上（静默分叉）。这里必须拒绝，但 openraft
+        // 已为条目创建 responder（P1 教训：不 respond 会让 client_write 永久挂起）——
+        // 先把整条流 drain 并逐条 respond Err，再返回 Err。
+        if self.is_poisoned() {
+            const WHY: &str =
+                "state machine poisoned: a snapshot restore failed; restart to replay";
+            while let Some(item) = entries.next().await {
+                match item {
+                    Ok((_, Some(responder))) => {
+                        responder.send(Err(DshError::internal(WHY)));
+                    }
+                    Ok((_, None)) => {}
+                    Err(e) => tracing::warn!("poisoned apply drain stream error: {e}"),
+                }
+            }
+            return Err(io_write(WHY));
+        }
         // perf 方案③：写锁作用域化（per-entry）——events 收集后 unlock 再广播（锁外 send），
         // 缩短写锁持有时间（fsync 已由方案①收敛；send 移到锁外不阻塞读）。
         let mut pending_events: Vec<PublishEvent> = Vec::new();
@@ -1231,6 +1394,8 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 rotation_hook: self.rotation_hook.clone(),
                 fail_last_applied_at: self.fail_last_applied_at.clone(),
                 last_applied_calls: self.last_applied_calls.clone(),
+                restore_marker: self.restore_marker.clone(),
+                poisoned: self.poisoned.clone(),
             }),
         }
     }
@@ -1251,19 +1416,35 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             snap_file_name(meta),
             &snapshot,
         )?;
-        {
-            let sm = self.sm.write().map_err(|e| io_write(e.to_string()))?;
-            sm.restore_all(&pairs).map_err(storage_err)?;
+        // P4-A：payload 已 fsync（copy_payload_file 内含文件 + 目录 fsync）、restore 之前写标记。
+        // 单事务（Durability=Immediate）→ 崩溃点可判定：见 META_RESTORE_BEGIN 注释。
+        // 标记写失败时状态机未动，直接返回 Err（不 poison）。
+        if self.restore_marker.load(Ordering::Relaxed) {
+            let marker = RestoreBegin {
+                meta: meta.clone(),
+                payload: path.clone(),
+            };
+            meta_put(&self.db, META_RESTORE_BEGIN, &ser(&marker)?)?;
         }
-        if let Some(last_log_id) = &meta.last_log_id {
-            self.write_last_applied(last_log_id)?;
-        }
-        self.write_membership(&meta.last_membership)?;
-        let old = persist_snapshot_registry(&self.db, meta, path.clone())?;
+        // 从这里开始状态机可能被改写：任何错误都必须 fail-stop（A3），
+        // 带着「部分新 + 部分旧」继续 apply / 对外读会静默分叉。
+        let old = match self.restore_and_persist_inner(meta, &pairs, path.as_path()) {
+            Ok(old) => old,
+            Err(e) => {
+                self.poison(format!("install_snapshot restore failed: {e}"));
+                return Err(e);
+            }
+        };
         // P3d：old 与 path 相同时**不能删**（名字复用/同名 meta 会命中，删掉就等于删掉刚登记的快照）
         if old.as_deref() != Some(path.as_path()) {
             delete_old_snapshot_file(old);
         }
+        // registry 已提交：标记删除是幂等收尾。清理失败只 warn——boot 重放同一 payload 是幂等的。
+        if let Err(e) = meta_del(&self.db, META_RESTORE_BEGIN) {
+            tracing::warn!("clear restore marker after successful install: {e}");
+        }
+        // 一次完整成功的 install 已经把状态机整体替换成 payload 内容 → 解除 fail-stop。
+        self.poisoned.store(false, Ordering::SeqCst);
         *self.current_snapshot.lock().await = Some((meta.clone(), path));
         Ok(())
     }
@@ -1271,6 +1452,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<SnapshotOf<TypeConfig, PathBuf>>, ErrOf> {
+        if self.is_poisoned() {
+            return Err(io_read(
+                "state machine poisoned: snapshot restore failed; restart to replay",
+            ));
+        }
         let guard = self.current_snapshot.lock().await;
         if let Some((meta, path)) = guard.as_ref() {
             // P2a: PathBuf 拷贝 —— no whole-payload blob clone（P1 每次 clone 整个 Vec）
@@ -1291,6 +1477,103 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     }
 }
 
+/// P4-A：boot 期重放被中断的快照安装。
+///
+/// 返回 `Some(meta)` = 确实重放过一次（调用方应记日志）；`None` = 没有残留标记。
+///
+/// 顺序固定（设计 §7 A1/A4/A5，store 构造时的 sweep 已把 marker payload 并入 keep-set）：
+/// 读 marker → 校验 payload 存在且可解析 → 全量 restore（分块写，幂等替换）→
+/// 写 last_applied / membership → registry 指向同一 payload（+ 清理被替换的旧文件）→ 清 marker →
+/// 末端再清扫一次（此时 registry 与 marker 都指向该 payload，其余 canonical 文件是孤儿）。
+///
+/// 失败语义：marker 损坏、payload 缺失/不可解析、重放写失败 → **Err**，调用方必须拒绝启动
+/// （fail-fast）。静默降级成「无快照」会丢数据；自动向 leader 要快照需要网络与成员表，超出
+/// boot 期职责。
+pub fn recover_interrupted_restore(
+    sm: &Arc<RwLock<StateMachine>>,
+    db: &DbHandle,
+    data_dir: PathBuf,
+) -> Result<Option<SnapshotMetaOf<TypeConfig>>, ErrOf> {
+    recover_interrupted_restore_with(sm, db, data_dir, env_true(ENV_RESTORE_FORCE))
+}
+
+/// `recover_interrupted_restore` 的显式参数版本（单测用；`force_ignore` 对应
+/// `DSH_RAFT_RESTORE_FORCE=1` 的人工逃生门）。
+#[doc(hidden)]
+pub fn recover_interrupted_restore_with(
+    sm: &Arc<RwLock<StateMachine>>,
+    db: &DbHandle,
+    data_dir: PathBuf,
+    force_ignore: bool,
+) -> Result<Option<SnapshotMetaOf<TypeConfig>>, ErrOf> {
+    let Some(raw) = meta_get(db, META_RESTORE_BEGIN)? else {
+        return Ok(None);
+    };
+    let marker: RestoreBegin = match de(&raw) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(io_read(format!(
+                "interrupted snapshot restore marker is corrupt ({e}); refusing to start \
+                 (mixed state). Restore the node from backup, or clear the data volume to rejoin."
+            )))
+        }
+    };
+    if force_ignore {
+        // 唯一允许「忽略 marker」的路径：运维确认 payload 不可用且接受混合状态。
+        tracing::error!(
+            "DSH_RAFT_RESTORE_FORCE set: IGNORING interrupted-restore marker \
+             (last_log_id={:?}, payload={}). State machine may be a MIX of old and new data; \
+             consistency must be verified manually.",
+            marker.meta.last_log_id,
+            marker.payload.display()
+        );
+        meta_del(db, META_RESTORE_BEGIN)?;
+        return Ok(None);
+    }
+    if !fs::exists(&marker.payload).unwrap_or(false) {
+        return Err(io_read(format!(
+            "interrupted snapshot restore: payload {} is missing; refusing to start. \
+             Restore the node from backup, or clear the data volume to rejoin.",
+            marker.payload.display()
+        )));
+    }
+    let pairs = read_payload_pairs(&marker.payload).map_err(|e| {
+        io_read(format!(
+            "interrupted snapshot restore: payload {} is unreadable/corrupt ({e}); refusing to start.",
+            marker.payload.display()
+        ))
+    })?;
+    let started = std::time::Instant::now();
+    {
+        let sm = sm
+            .write()
+            .map_err(|e| io_write(format!("state lock unavailable: {e}")))?;
+        sm.restore_all(&pairs).map_err(storage_err)?;
+    }
+    if let Some(last_log_id) = &marker.meta.last_log_id {
+        put_last_applied(db, last_log_id)?;
+    }
+    put_membership(db, &marker.meta.last_membership)?;
+    let old = persist_snapshot_registry(db, &marker.meta, marker.payload.clone())?;
+    if old.as_deref() != Some(marker.payload.as_path()) {
+        delete_old_snapshot_file(old);
+    }
+    meta_del(db, META_RESTORE_BEGIN)?;
+    tracing::warn!(
+        "restore replayed on boot: last_log_id={:?} payload={} pairs={} elapsed={:?}",
+        marker.meta.last_log_id,
+        marker.payload.display(),
+        pairs.len(),
+        started.elapsed()
+    );
+    // 设计 §7 A1 的最后一步：registry 已指向该 payload，清扫其余 canonical 残留。
+    // 清扫失败不阻断启动（registry/marker 都已一致；残留文件下次 boot 再清）。
+    if let Err(e) = sweep_snapshot_payloads(db, data_dir.join(SNAP_SUBDIR)) {
+        tracing::warn!("post-recovery snapshots sweep skipped: {e}");
+    }
+    Ok(Some(marker.meta))
+}
+
 // ---------------- 内嵌单测（设计 §6 N4a：范围翻译+多表事务最易错路径） ----------------
 
 #[cfg(test)]
@@ -1304,22 +1587,22 @@ mod tests {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     // 0.10：apply 消费 Stream<EntryResponder>；测试 entries 无 client responder（None）
-    fn entry_stream(
+    pub(super) fn entry_stream(
         entries: Vec<EntryOf>,
     ) -> Vec<Result<(EntryOf, Option<ApplyResponder<TypeConfig>>), ErrOf>> {
         entries.into_iter().map(|e| Ok((e, None))).collect()
     }
 
-    fn tmpdir(tag: &str) -> std::path::PathBuf {
+    pub(super) fn tmpdir(tag: &str) -> std::path::PathBuf {
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!("dsh-raft-store-{tag}-{}-{n}", std::process::id()))
     }
 
-    fn open_storage(dir: &std::path::Path) -> RedbStorage {
+    pub(super) fn open_storage(dir: &std::path::Path) -> RedbStorage {
         RedbStorage::open(&dir.display().to_string()).unwrap()
     }
 
-    fn blank(index: u64) -> EntryOf {
+    pub(super) fn blank(index: u64) -> EntryOf {
         EntryOf {
             log_id: LogId {
                 leader_id: LeaderId {
@@ -1855,7 +2138,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn snap_meta(index: u64) -> SnapshotMetaOf<TypeConfig> {
+    pub(super) fn snap_meta(index: u64) -> SnapshotMetaOf<TypeConfig> {
         SnapshotMeta {
             last_log_id: Some(LogId {
                 leader_id: LeaderId {
@@ -2218,6 +2501,355 @@ mod tests {
         meta_del(&db, b"k").unwrap();
         assert!(meta_get(&db, b"k").unwrap().is_none());
         meta_del(&db, b"k").unwrap(); // 幂等
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------- P4-A：restore-in-progress 标记 + boot 重放 + fail-stop ----------------
+
+#[cfg(test)]
+mod p4a_tests {
+    use super::tests::{blank, entry_stream, open_storage, snap_meta, tmpdir};
+    use super::*;
+    use futures_util::stream;
+
+    fn pairs_of(items: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn json_payload(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        serde_json::to_vec(&pairs).unwrap()
+    }
+
+    fn write_marker(db: &DbHandle, meta: &SnapshotMetaOf<TypeConfig>, payload: &std::path::Path) {
+        let marker = RestoreBegin {
+            meta: meta.clone(),
+            payload: payload.to_path_buf(),
+        };
+        meta_put(db, META_RESTORE_BEGIN, &ser(&marker).unwrap()).unwrap();
+    }
+
+    fn state_pairs(sm: &Arc<RwLock<StateMachine>>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        sm.read().unwrap().dump_all().unwrap()
+    }
+
+    /// 交接测试 #1：marker 存在时，启动清扫必须保留其 payload；去掉 marker 后同一文件
+    /// 才算 orphan（证明「保留」确实来自 marker keep-set，而不是清扫失效）。
+    #[tokio::test]
+    async fn sweep_keeps_restore_marker_payload() {
+        let dir = tmpdir("p4a-sweep-marker");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let snap_dir = dir.join(SNAP_SUBDIR);
+
+        let meta = snap_meta(4);
+        let data = json_payload(&pairs_of(&[("k", "v")]));
+        let payload = write_snapshot_payload(snap_dir.clone(), &meta, &data).unwrap();
+        let orphan = write_snapshot_payload(snap_dir.clone(), &snap_meta(3), &data).unwrap();
+        write_marker(&db, &meta, &payload);
+
+        let (parts, orphans) = sweep_snapshot_payloads(&db, snap_dir.clone()).unwrap();
+        assert_eq!((parts, orphans), (0, 1), "只应删掉真正的 orphan");
+        assert!(fs::exists(&payload).unwrap(), "marker payload 必须保留");
+        assert!(!fs::exists(&orphan).unwrap());
+
+        // 反证：清掉 marker 再扫，同一 payload 变成 orphan
+        meta_del(&db, META_RESTORE_BEGIN).unwrap();
+        let (_, orphans2) = sweep_snapshot_payloads(&db, snap_dir.clone()).unwrap();
+        assert_eq!(orphans2, 1);
+        assert!(
+            !fs::exists(&payload).unwrap(),
+            "无 marker 时 payload 是 orphan"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 坏 marker：清扫必须 Err 且**不删任何文件**（不能把待重放 payload 当 orphan 删掉）；
+    /// boot 重放同样 Err（fail-fast）。
+    #[tokio::test]
+    async fn corrupt_restore_marker_aborts_sweep_and_recovery() {
+        let dir = tmpdir("p4a-corrupt-marker");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let snap_dir = dir.join(SNAP_SUBDIR);
+        fs::create_dir_all(&snap_dir).unwrap();
+
+        meta_put(&db, META_RESTORE_BEGIN, b"not-a-marker").unwrap();
+        let payload = snap_dir.join("maybe-good.snap");
+        fs::write(&payload, b"{}").unwrap();
+        let part = snap_dir.join("residue.snap.part");
+        fs::write(&part, b"x").unwrap();
+
+        assert!(
+            sweep_snapshot_payloads(&db, snap_dir.clone()).is_err(),
+            "坏 marker 时清扫必须 fail-fast"
+        );
+        assert!(fs::exists(&payload).unwrap(), "清扫不得删除任何文件");
+        assert!(fs::exists(&part).unwrap());
+
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let e = recover_interrupted_restore_with(&sm, &db, dir.clone(), false).unwrap_err();
+        assert!(
+            e.to_string().contains("corrupt"),
+            "坏 marker 必须报 corrupt：{e}"
+        );
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_some(),
+            "fail-fast 时保留 marker 现场，供人工判断"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 交接测试 #2：正常 install 成功后 marker 不残留。
+    #[tokio::test]
+    async fn install_snapshot_clears_restore_marker() {
+        let dir = tmpdir("p4a-install-marker");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, db.clone(), dir.clone());
+
+        let meta = snap_meta(5);
+        let data = json_payload(&pairs_of(&[("a", "1")]));
+        let payload = write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta, &data).unwrap();
+        store.install_snapshot(&meta, payload).await.unwrap();
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
+            "成功 install 必须清 marker"
+        );
+        assert!(!store.is_poisoned());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 交接测试 #4 + 设计 §7 A1 的验收：**开着清扫**模拟一次崩溃点
+    /// （payload 已落盘 + marker 已写 + 状态机仍是旧内容），重启后
+    /// ctor 清扫保留 payload → recover 重放 → 状态/registry/marker 一致。
+    #[tokio::test]
+    async fn boot_replay_after_interrupted_restore_with_sweep_on() {
+        let dir = tmpdir("p4a-boot-replay");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        // 崩溃前状态机内容（旧）
+        sm.write()
+            .unwrap()
+            .restore_all(&pairs_of(&[("old", "1")]))
+            .unwrap();
+
+        // 崩溃现场：新 payload 已落盘、marker 已写，restore 未开始
+        let meta = snap_meta(9);
+        let new_pairs = pairs_of(&[("new", "2"), ("other", "3")]);
+        let payload =
+            write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta, &json_payload(&new_pairs))
+                .unwrap();
+        write_marker(&db, &meta, &payload);
+
+        // 「重启」：先构造 store（内部跑清扫），再走 dsh-cli 的 boot 重放入口
+        let _store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+        assert!(
+            fs::exists(&payload).unwrap(),
+            "ctor 清扫不得删掉 marker payload"
+        );
+        let out = recover_interrupted_restore(&sm, &db, dir.clone()).unwrap();
+        assert_eq!(
+            out.expect("应返回重放的 meta").last_log_id,
+            meta.last_log_id
+        );
+
+        assert_eq!(state_pairs(&sm), new_pairs, "状态机必须是 payload 内容");
+        let (reg_meta, reg_file) = load_snapshot_registry(&db, dir.join(SNAP_SUBDIR))
+            .unwrap()
+            .expect("registry");
+        assert_eq!(reg_meta.last_log_id, meta.last_log_id);
+        assert_eq!(reg_file, payload, "registry 必须指向 marker 的 payload");
+        assert_eq!(
+            meta_get(&db, META_LAST_APPLIED).unwrap(),
+            Some(ser(&meta.last_log_id.unwrap()).unwrap()),
+            "重放必须补写 last_applied"
+        );
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
+            "重放成功必须清 marker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 崩溃于「registry 已提交、marker 未清」之间：重放幂等，不得删掉 registry 自己的 payload。
+    #[tokio::test]
+    async fn recover_after_registry_commit_is_idempotent() {
+        let dir = tmpdir("p4a-replay-idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+
+        let meta = snap_meta(7);
+        let new_pairs = pairs_of(&[("k", "v")]);
+        let payload =
+            write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta, &json_payload(&new_pairs))
+                .unwrap();
+        persist_snapshot_registry(&db, &meta, payload.clone()).unwrap();
+        write_marker(&db, &meta, &payload);
+
+        let out = recover_interrupted_restore_with(&sm, &db, dir.clone(), false).unwrap();
+        assert!(out.is_some());
+        assert!(fs::exists(&payload).unwrap(), "registry payload 不得被删");
+        let (_, reg_file) = load_snapshot_registry(&db, dir.join(SNAP_SUBDIR))
+            .unwrap()
+            .expect("registry");
+        assert_eq!(reg_file, payload);
+        assert!(meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 交接测试 #3：marker 在、payload 被删 → 启动必须返回明确错误（不静默继续）。
+    #[tokio::test]
+    async fn recover_refuses_missing_payload() {
+        let dir = tmpdir("p4a-missing-payload");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let meta = snap_meta(11);
+        let ghost = dir.join(SNAP_SUBDIR).join("gone.snap");
+        write_marker(&db, &meta, &ghost);
+
+        let e = recover_interrupted_restore_with(&sm, &db, dir.clone(), false).unwrap_err();
+        assert!(e.to_string().contains("missing"), "{e}");
+        assert!(
+            e.to_string().contains("backup"),
+            "错误信息必须给出恢复路径：{e}"
+        );
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_some(),
+            "fail-fast 不清 marker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 交接测试 #5：`DSH_RAFT_RESTORE_FORCE`（显式逃生门）忽略 marker —— 只清标记，不重放。
+    #[tokio::test]
+    async fn recover_force_ignores_marker_without_replay() {
+        let dir = tmpdir("p4a-force");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        sm.write()
+            .unwrap()
+            .restore_all(&pairs_of(&[("old", "1")]))
+            .unwrap();
+
+        let meta = snap_meta(13);
+        let payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &json_payload(&pairs_of(&[("new", "2")])),
+        )
+        .unwrap();
+        write_marker(&db, &meta, &payload);
+
+        let out = recover_interrupted_restore_with(&sm, &db, dir.clone(), true).unwrap();
+        assert!(out.is_none(), "force 路径不重放");
+        assert_eq!(
+            state_pairs(&sm),
+            pairs_of(&[("old", "1")]),
+            "状态机保持原样"
+        );
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
+            "force 清 marker"
+        );
+        assert!(fs::exists(&payload).unwrap(), "payload 不被 force 删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// kill-switch：`DSH_RAFT_RESTORE_MARKER=0` 只关「写 marker」。restore 失败时没有标记可重放
+    /// ——这正是它只能当发布期逃生门的原因（测试用 set_restore_marker 覆盖，避免 env 竞态）。
+    #[tokio::test]
+    async fn kill_switch_disables_marker_write() {
+        let dir = tmpdir("p4a-kill-switch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, db.clone(), dir.clone());
+        store.set_restore_marker(false);
+        store.set_fail_last_applied(1);
+
+        let meta = snap_meta(15);
+        let payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &json_payload(&pairs_of(&[("k", "v")])),
+        )
+        .unwrap();
+        assert!(store.install_snapshot(&meta, payload).await.is_err());
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none(),
+            "关闭后不得写 marker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 设计 §7 A3：restore 中段 IO 错误（restore_all 已成功、last_applied 写失败）→
+    /// 节点进入 fail-stop：apply / 快照构建 / get_current_snapshot 全拒绝，marker 保留待重放；
+    /// 一次完整成功的 install 才解除。
+    #[tokio::test]
+    async fn restore_error_poisons_until_next_successful_install() {
+        let dir = tmpdir("p4a-poison");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+
+        let meta = snap_meta(21);
+        let pairs = pairs_of(&[("a", "1"), ("b", "2")]);
+        let payload =
+            write_snapshot_payload(dir.join(SNAP_SUBDIR), &meta, &json_payload(&pairs)).unwrap();
+
+        // 注入：install 内部的 write_last_applied（restore 之后）失败
+        store.set_fail_last_applied(1);
+        assert!(store
+            .install_snapshot(&meta, payload.clone())
+            .await
+            .is_err());
+        assert!(store.is_poisoned(), "restore 错误必须 fail-stop");
+        assert!(
+            meta_get(&db, META_RESTORE_BEGIN).unwrap().is_some(),
+            "失败 install 必须留下 marker 供 boot 重放"
+        );
+
+        // apply 必须拒绝（并 drain responder，不能挂客户端）
+        let items = entry_stream(vec![blank(22)]);
+        assert!(
+            store.apply(stream::iter(items)).await.is_err(),
+            "poisoned apply 必须返回 Err"
+        );
+        // 快照构建 / 读取拒绝
+        assert!(store
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .is_err());
+        assert!(store.get_current_snapshot().await.is_err());
+
+        // 解除注入后重试同一 payload → 成功即解除 fail-stop、清 marker
+        store.set_fail_last_applied(0);
+        store.install_snapshot(&meta, payload).await.unwrap();
+        assert!(!store.is_poisoned());
+        assert!(meta_get(&db, META_RESTORE_BEGIN).unwrap().is_none());
+        assert_eq!(state_pairs(&sm), pairs);
+        assert!(store.write_last_applied(&meta.last_log_id.unwrap()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

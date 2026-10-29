@@ -930,6 +930,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cluster_rotation_hook(cli.master_key_file.as_deref(), cipher.clone()),
         data_base.clone(),
     ));
+    // P4-A：boot 期重放被中断的快照安装（`META_RESTORE_BEGIN`）。必须在 `has_persisted_state`
+    // 与 `new_raft_node` 之前——重放会补写 last_applied / membership / snapshot registry。
+    // 失败（marker 损坏、payload 缺失/损坏、重放写失败）→ **拒绝启动**（fail-fast）：
+    // 以「部分新 + 部分旧」的混合状态继续跑会静默分叉。
+    // 注意：`new_with_rotation` 的启动清扫已把 marker.payload 并入 keep-set（设计 §7 A1），
+    // 因此顺序是「清扫 → 重放 → 再清扫」，不会先删掉待重放的 payload。
+    match dsh_raft::recover_interrupted_restore(&sm, &db, data_base.clone()) {
+        Ok(Some(meta)) => eprintln!(
+            "node {node_id}: replayed interrupted snapshot restore (last_log_id={:?})",
+            meta.last_log_id
+        ),
+        Ok(None) => {}
+        Err(e) => return Err(format!("快照恢复中断且无法重放，拒绝启动：{e}").into()),
+    }
     // A2：seed 与集群现实比对用——保留一份 store 引用（sm_store 随后被 new_raft_node 移走）。
     // 直接读持久化成员表而非 raft.metrics()：metrics 在 Raft::new 后可能尚未发布（watch 异步），
     // 读存储层是确定性的。
@@ -1148,6 +1162,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app.publish.publish_policy = cli.publish_policy.into();
     app.publish.shared_cascade = cli.shared_cascade.into();
     app.read_mode = cli.read_mode.into();
+    // P4-A A3：restore 失败的 fail-stop 句柄（store 置位 → HTTP 读写 503 / gRPC UNAVAILABLE）
+    app.set_poison(sm_store_check.poison_flag());
     spawn_grpc(&cli, app.clone());
     let router = dsh_api::build_router(app);
     let listener = tokio::net::TcpListener::bind(&cli.http_addr).await?;

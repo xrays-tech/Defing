@@ -627,18 +627,9 @@ async fn voter_catches_up_via_http_snapshot_after_being_down() {
         "voter 60s 未经过 full-snapshot 追平（draft value 不可见）"
     );
 
-    // 强证据：victim 日志 1..=snapshot_index 已被 install 后 purge ⇒ value 只可能来自快照
-    let covered = n3
-        .log_store
-        .try_get_log_entries(1..=snapshot_index)
-        .await
-        .unwrap();
-    assert!(
-        covered.is_empty(),
-        "voter log 1..={} 应 empty（value 经 snapshot 传输）, got {}",
-        snapshot_index,
-        covered.len(),
-    );
+    // 先等 openraft 侧确认 install：SM 里的 value 在 install_snapshot 内部 restore 完成时
+    // 就已可见，而 core 推进 last_applied / 发起 log purge 是**异步**的（P4-A 在 install
+    // 尾部增加了 marker 清理等写事务，放大了这条窗口）。不等这一步就读日志会与 purge 赛跑。
     let m3 = poll_metrics(&n3.raft, Duration::from_secs(10), |m| {
         idx(m.last_applied) >= snapshot_index && idx(m.purged) >= snapshot_index
     })
@@ -654,6 +645,20 @@ async fn voter_catches_up_via_http_snapshot_after_being_down() {
         "voter purged={:?} < snapshot_index={}",
         m3.purged,
         snapshot_index,
+    );
+
+    // 强证据：victim 日志 1..=snapshot_index 已被 install 后 purge ⇒ value 只可能来自快照
+    // （append 路径不会移除前缀；前缀只能由 purge 清掉，而 purge 只在 install 时推进）。
+    let covered = n3
+        .log_store
+        .try_get_log_entries(1..=snapshot_index)
+        .await
+        .unwrap();
+    assert!(
+        covered.is_empty(),
+        "voter log 1..={} 应 empty（value 经 snapshot 传输）, got {}",
+        snapshot_index,
+        covered.len(),
     );
 
     // 强证据：victim 在成员表里确实是 voter（不是 learner），且集群仍有 3 voters

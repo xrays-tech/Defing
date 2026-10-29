@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock};
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -76,7 +77,14 @@ pub struct ApiState {
     dev_token: Option<std::sync::Arc<str>>,
     /// 读取模式（G1/D37：Linear=ReadIndex 门控 / Stale=本地直读；CLI --read-mode 注入，默认 Linear）
     pub read_mode: dsh_core::model::ReadMode,
+    /// P4-A A3：restore 失败后的 fail-stop 标记。由 dsh-raft 的 `StateMachineStore::poison_flag()`
+    /// 注入；置位期间 HTTP 读写一律 503、gRPC 读取返回 UNAVAILABLE、readyz 不就绪。
+    poison: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// P4-A：restore fail-stop 的对外错误信息（HTTP 503 / gRPC UNAVAILABLE 共用）。
+pub const POISONED_MESSAGE: &str =
+    "节点快照恢复失败，状态机处于混合状态（fail-stop）；请重启节点以重放快照恢复";
 
 impl ApiState {
     #[allow(clippy::too_many_arguments)]
@@ -148,13 +156,28 @@ impl ApiState {
             trusted_proxies,
             dev_token,
             read_mode: dsh_core::model::ReadMode::Stale,
+            poison: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// P4-A A3：接管 fail-stop 标记（dsh-cli 传入 `StateMachineStore::poison_flag()`）。
+    pub fn set_poison(&mut self, poison: Arc<std::sync::atomic::AtomicBool>) {
+        self.poison = poison;
+    }
+
+    /// P4-A A3：restore 失败后是否处于 fail-stop（混合状态）。
+    pub fn is_poisoned(&self) -> bool {
+        self.poison.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 通用写（dev-single 直 apply；集群经 Raft client_write）。
     /// G1/D37：线性读门控——Linear 模式 + 集群下先做 ReadIndex（ensure_linearizable），
     /// 保证读已提交；Stale 或 dev-single 直接返回（本地读）。
     pub async fn linearized_read(&self) -> Result<(), ApiError> {
+        // P4-A A3：fail-stop —— 混合状态不得对外提供读（gRPC 数据面也走这里）。
+        if self.is_poisoned() {
+            return Err(ApiError(dsh_core::Error::internal(POISONED_MESSAGE)));
+        }
         if self.read_mode != dsh_core::model::ReadMode::Linear {
             return Ok(());
         }
@@ -189,6 +212,10 @@ impl ApiState {
     }
 
     async fn write(&self, cmd: &Command, now_ms: i64) -> Result<dsh_raft::WriteOutcome, ApiError> {
+        // P4-A A3：fail-stop —— 混合状态上的写入会叠在错误基线上，直接拒绝。
+        if self.is_poisoned() {
+            return Err(ApiError(dsh_core::Error::internal(POISONED_MESSAGE)));
+        }
         dsh_raft::write_command(
             &self.sm,
             self.raft.as_ref(),
@@ -3846,8 +3873,38 @@ async fn count_http(
     resp
 }
 
+/// P4-A A3：restore 失败后的 fail-stop 门。
+///
+/// 放在 auth 之前（省掉无谓鉴权），但仍在 `count_http` 之内（503 计入 5xx 指标）。
+/// 放行：`/healthz`（liveness 探针必须继续成功，否则 k8s 会直接重启而不是让日志/现场可见）、
+/// `/metrics`（指标采集）与 `/admin*`（内嵌静态 UI，本身不碰状态机；其 API 调用会被本门拦下）。
+/// 其余（`/api/v1/*`、`/v1/*`）一律 503 —— 混合状态不能对外读，更不能写。
+async fn poison_gate(
+    State(app): State<ApiState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if app.is_poisoned() {
+        let path = req.uri().path().to_string();
+        let exempt = path == "/healthz" || path == "/metrics" || path.starts_with("/admin");
+        if !exempt {
+            tracing::warn!("rejecting {path}: state machine poisoned (restore fail-stop)");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiErrorBody {
+                    code: "ERR_RESTORE_POISONED".into(),
+                    message: POISONED_MESSAGE.into(),
+                    detail: None,
+                }),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 async fn readyz(State(app): State<ApiState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    if !is_ready(app.raft.as_ref()) {
+    if app.is_poisoned() || !is_ready(app.raft.as_ref()) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let state = app
@@ -5297,6 +5354,11 @@ pub fn build_router(app: ApiState) -> Router {
     router = router.layer(axum::middleware::from_fn_with_state(
         app.clone(),
         auth_middleware,
+    ));
+    // P4-A A3：fail-stop 门（包住 auth，先于鉴权拒绝；仍在 count_http 之内）
+    router = router.layer(axum::middleware::from_fn_with_state(
+        app.clone(),
+        poison_gate,
     ));
     router = router.layer(axum::middleware::from_fn(security_headers));
     // 写转发：包住鉴权+handler，仅对鉴权通过的写响应处理 428（K3s/LB 场景管理面写）
