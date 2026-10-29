@@ -43,12 +43,13 @@ pub fn dev_config() -> RaftConfig {
         // appends to stale leaders; 60 KiB fat entries make the roundtrips expensive.
         enable_pre_vote: Some(true),
         enable_tick: true,
-        // P5 release gate：大 payload 的安装必须给足时间（1GB 级 v1 JSON 快照在 30s 内传不完会
-        // 反复重试）。默认 30s 兼容旧行为，生产按 `payload_bytes / 带宽 + 安装时间` 放大。
+        // P5 release gate：大 payload 的安装必须给足时间。实测 v1 JSON 快照在 extreme 规模可达
+        // ~840MB，30s（旧默认）内传不完 → InstallSnapshot 反复超时、lag 卡死。默认放宽到 120s
+        // （≈1GB @ ≥9MB/s），生产按 `payload_bytes / 带宽 + 安装时间` 用 env 调整。
         install_snapshot_timeout: std::env::var("DSH_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30_000),
+            .unwrap_or(120_000),
         snapshot_max_chunk_size: 1024 * 1024,
         // P3f（design §9.4「默认提升并可配置」）：快照已覆盖、但仍保留不 purge 的日志条数。
         // 值越大，略落后的 follower 越可能靠增量日志追上而不必整份快照（issue #1706）；
