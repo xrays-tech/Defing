@@ -1330,11 +1330,13 @@ def snapshot_phase(args, stats, token, rng):
                 % (leader_n.node_id, time.time() - catchup_t0))
             # C3：与 load 阶段一致——kill 后、重启前观测是否真的换人（否则 C3 计数不平）
             changed = False
+            changed_at = None
             deadline = time.time() + 3.0
             while time.time() < deadline:
                 nl = wait_leader(1)
                 if nl is not None and nl != leader_n.node_id:
                     changed = True
+                    changed_at = time.time()
                     stats.bump("observed_leader_changes")
                     break
                 time.sleep(0.2)
@@ -1344,8 +1346,10 @@ def snapshot_phase(args, stats, token, rng):
             with CLUSTER.lock:
                 leader_n.spawn(CLUSTER.seed_map)
             wait_healthz(leader_n, 25)
+            # 复核：窗口在「新 leader 被观测到」时结束；respawn+healthz 可能拖到 25s，
+            # 用它会误把之后很久的竞选都算成「churn 解释得了」。
             return {"kind": "kill", "target": leader_n.node_id, "at": at,
-                    "resumed_at": time.time()}
+                    "resumed_at": changed_at if changed_at is not None else time.time()}
         else:
             with CLUSTER.lock:
                 leader_n.stop_freeze()
@@ -1373,7 +1377,6 @@ def snapshot_phase(args, stats, token, rng):
     # 心跳证据（plan §9.3）：leader 视角 victim 的「最近一次确认心跳」age。
     # 0.10 的独立 heartbeat worker 要证明的正是「快照 install 期间心跳不停」。
     rss_in_window_kb = None
-    rss_baseline_kb = None
     projects_compared = 0
     hb_samples = 0
     hb_max_ms = None
@@ -2046,6 +2049,7 @@ def main():
             summary["victim_heartbeat_max_in_window_ms"] = snapshot_info.get(
                 "victim_heartbeat_max_in_window_ms")
             summary["max_rss_ratio_budget"] = args.max_rss_ratio
+            summary["snapshot_chaos_windows"] = snapshot_info.get("snapshot_chaos_windows")
             summary["snapshot_attempts"] = snapshot_info.get("snapshot_attempts")
             summary["snapshot_last_attempt_seconds"] = snapshot_info.get("snapshot_last_attempt_seconds")
             summary["snapshot_bytes_mtime"] = snapshot_info.get("snapshot_bytes_mtime")
