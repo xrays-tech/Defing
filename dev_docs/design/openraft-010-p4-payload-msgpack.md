@@ -37,7 +37,7 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
 - 写 v2（P4a2 已落地）：`rmp::encode::write_array_len` + `write_bin` 逐项编码，body 目前仍整份
   `Vec`（`dump_all()` 返回整份）。**流式写**（dump 分页 → 边 dump 边写）属 P4c，前置是 P4c0。
 - 读 v2（P4b）：`rmp::decode::read_array_len` / `read_bin_len` 逐项解码，按字节预算组装 batch
-  （64MiB）→ `restore_stream`（B1：只清空一次 + ≥3 批）。P4a2 只提供整份解码的单测路径。
+  （16MiB）→ `restore_stream`（B1：只清空一次 + ≥3 批）。P4a2 只提供整份解码的单测路径。
 - 读 v1：保持 `serde_json::from_reader`（升级期一次性路径，P4d 后按发布周期下线）。
 - 兼容：`MAGIC` 不匹配 → 视为 v1（旧文件没有头），解析失败报错并保留文件（不删）。
 
@@ -130,7 +130,7 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
   （`get_prefix_keys(b"")` + 首批 `write_batch(batch, deletes)`），后续批只插入；空流等价于清空。
   `restore_all` 保留为「切块 → `restore_stream`」，与流式路径共用同一份语义。
   测试：3 批全存活 + 旧 key 被清（逐批清空的旧写法会立刻失败）、空流清空、批错误传播。
-- **`read_payload_batches(path, budget)`（dsh-raft）**：返回 `PayloadBatches` 迭代器。
+- **`read_payload_batches(path, budget)`（dsh-raft）**：返回 `PayloadBatches` 迭代器（读端预算 16MiB）。
   - v2：打开时先 `verify_payload_file`（total_len + crc32，B2'）并校验文件长度，再**惰性**逐项
     `rmp::decode`，按 64MiB 预算切批（批因最后一条略超预算；单条超预算单独成批）。
   - v1（无头/带头 JSON）：整份解析后切批 —— 升级期一次性路径，设计 §3 已声明。
@@ -184,7 +184,7 @@ VERSION 2: BODY = msgpack：array(n) of [bin(k), bin(v)]（rmp positional；有 
 | victim 峰值 RSS | 386.7MB | 306.2MB | |
 | victim 基线 RSS | 131.4MB | 126.5MB | |
 | 净增量 delta | 255.3MB | **179.8MB（−30%）** | |
-| delta / payload | 0.66x | 1.88x | **比值不可跨格式比较**（见下） |
+| delta / payload | 0.66x | 1.88x | **比值不可跨格式比较**（见下）；VmHWM 口径见 §12.2 |
 | 窗口内选举 / 无法解释选举 | 0 / 0 | 0 / 0 | |
 | kill 验证 / 换人 / 项目比对 | 5/5 / 5/5 / 8 | 5/5 / 5/5 / 8 | |
 | storm 判定 | `ok:true` | 仅 C4 `net 1.88x > 1.2x` 失败 | 见下 |
@@ -214,3 +214,25 @@ redb 尺寸或 msgpack payload 近似），不再用 v1-JSON payload 当分母�
 - 与 v1 A/B（同命令）：payload 386.0MB→93.6MB（**0.25x**）、install 3.67s→0.758s、
   delta 255.3MB→180.3MB（**−30%**）；350MB 尺度探针 net **0.44x**。
 - 结论：§6 的 volume / install / RSS 三项在「逻辑状态」口径下全部达标；P4 实现侧证据齐。
+
+### 12.2 复核后的口径与数字修正（c1d3041）
+
+两次实现复核（架构 / 迁移测试）指出 §12 的比值口径不可用于判定；最终口径与修正数字：
+
+- **断言改为绝对净增量**：`delta = max(install 窗口 10ms 采样, VmHWM) - 重启基线`，
+  预算 `--max-rss-delta-mb`（默认 320MiB）；`rss_delta_vs_payload` / `rss_delta_vs_db_file`
+  只入 summary 对照（payload 受 JSON 数字数组 4x 膨胀影响；`dsh.redb` 含 raft 表/free page
+  且按 region 取整，实测为逻辑状态的 ~3x）。
+- **12k v2 实测（recompute）**：快照 93.6MB、窗口采样 300,304KiB、VmHWM 330,312KiB、
+  基线 124,200KiB → delta = **206,112KiB ≈ 211MB**（不是我早先写的 180.3MB——早先只用窗口采样）；
+  `delta/db_file ≈ 0.67`、`delta/payload ≈ 2.26`。
+- **v1 A/B recompute（不重跑）**：窗口采样 == VmHWM = 386,680KiB、基线 131,368KiB →
+  delta **255,312KiB ≈ 261MB**；v1→v2 绝对增量 **−19%**（不是 −30%），payload 386.0→93.6MB（0.25x），
+  install 3.67s→0.758s。
+- 350MB 探针（c1d3041，干净树，`evidence/p4-scale-install.log`）：payload 349MiB、install 7.89s
+  （debug）、baseline 11.6MiB、peak 169.7MiB、delta 154MiB → **net 0.44x / raw 0.47x**（按 payload 也是
+  0.44x，因为 msgpack payload ≈ 逻辑状态）。
+- **写端**：in-process RSS 探针受 allocator 保留影响，不能稳定区分「整份驻留」与「页缓冲」，
+  故不作为断言；改为**结构性测试**（计数 Store）：v2 build 期间整前缀**取值**扫描 0 次、
+  分页扫描 ≥1 次；v1 对照 ≥1 次（`v2_build_never_scans_whole_prefix`）。
+- 最终 12k gate 结果见 `evidence/p4-gate-final.log`。

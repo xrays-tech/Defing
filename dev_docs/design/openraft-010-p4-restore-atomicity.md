@@ -154,7 +154,18 @@
   等价模拟；(b) ~~boot 重放整份读成 `Vec`~~ → **P4b 已改流式**（`read_payload_batches` +
   `restore_stream`，v2 有界内存；v1 仍是整份解析的升级期路径）；
   (c) `restore_all` 分块语义未变：运行期错误由 poison 拦、崩溃由 marker 重放补；
-  (d) gRPC 只有读接口（写走 HTTP），故只接 `linearized_read`。
+  (d) fail-stop 已补 gRPC `watch`（版本历史重放不走 `linearized_read`）；
+  写路径经 HTTP middleware 拦截。
+- **复核补丁（2026-10-29，提交 c1d3041）**：
+  1. **marker 清理失败不再只 warn**：`install_snapshot` 清 marker 失败 → poison + Err
+     （否则残留 marker 会把下一次崩溃后的 `last_applied` 回滚到快照点）；
+  2. **过期 marker 不重放**：`recover` 发现 marker 的快照点 < `last_applied` ⇒ 安装已完成、
+     只清 marker（绝不回滚 `last_applied`）；
+  3. **FORCE 语义收紧**：`DSH_RAFT_RESTORE_FORCE=1` 忽略 marker 后节点**poison 启动**
+     （503，直到一次完整 install），不再是「无保护地以混合状态服务」；
+  4. **restore 从 canonical 副本读**（epoch 与 marker/registry 同一份字节）；
+  5. 中段解码失败（CRC 合法、msgpack 结构损坏）有专项测试：poison + marker 保留 + 首批已落地；
+  6. `restore_stream` 加 `pending_ops` debug_assert；初始快照（无 last_log_id）显式清 last_applied。
 - 顺带修 `voter_catches_up_via_http_snapshot_after_being_down` 的读日志竞态：SM 里 value 可见时
   core 尚未推进 last_applied / 触发 purge，先 `poll_metrics`（last_applied ≥ snapshot_index 且
   purged ≥ snapshot_index）再断言前缀为空。

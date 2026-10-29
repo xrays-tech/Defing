@@ -367,9 +367,10 @@ msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / 
   （400MB 级别约 1–2s），运维手册按此预留启动探针的 `initialDelaySeconds`；
 - payload 缺失/损坏、标记损坏 → **拒绝启动**（日志给出 payload 路径 + 从备份恢复或清卷重建的指引），
   不会带着「部分新 + 部分旧」的混合状态起来；
-- `DSH_RAFT_RESTORE_MARKER=0` **只关闭写标记**（发布期兜底；崩溃窗口重新变大），已有的标记
-  **仍会被重放**；`DSH_RAFT_RESTORE_FORCE=1` 才是「忽略标记、允许混合状态启动」的逃生门
-  （ERROR 日志，需人工确认数据一致性后使用）。
+- `DSH_RAFT_RESTORE_MARKER=0` **只关闭写标记**（发布期兜底；崩溃窗口重新变大，WARN 日志会说明
+  「崩溃不可重放」），已有的标记**仍会被重放**。
+- `DSH_RAFT_RESTORE_FORCE=1` 才是「忽略标记、允许混合状态启动」的逃生门：节点会**以 poison 启动**
+  （读写 503，直到一次完整快照安装成功），ERROR 日志 + 需人工确认数据一致性后使用。
 
 **恢复失败后的 fail-stop（poison）**：非崩溃型 restore 错误（如磁盘 IO）会让节点进入 fail-stop：
 
@@ -377,9 +378,21 @@ msgpack body）在**读端**已全部兼容（v1 无头 JSON / v1 带头 JSON / 
   `/readyz` 503（LB 摘除），gRPC 数据面 UNAVAILABLE；日志有 `state machine POISONED (fail-stop)`；
 - 处置：**重启该节点**（带标记 → boot 重放；无标记 → 需要重装快照/重建）。不要直接放流量。
 
-**内存/磁盘**：v2 的读端按 64MiB 分批恢复、写端按 64MiB 分页 dump（写端不再整份驻留）；v1（默认）
-仍是整份 JSON 解析路径（升级期），追平期 RSS 规划不变（net ≤ 2x）；磁盘峰值仍是快照的约 3 倍
-（旧 canonical + 收到的 payload + install 的 canonical 副本）。
+**内存/磁盘**：
+- 读端（install / boot 重放）按 **16MiB** 分批恢复（v2 流式，内存 ≈ 一批 + redb 事务缓冲；
+  v1 无头 JSON 仍是整份解析的升级期路径）。
+- 写端（v2）按 **64MiB** 分页 dump + 逐页编码直接落盘，**不再整份驻留**；代价是快照构建期间
+  leader 的写命令会等待一次写盘时间（日志行 `snapshot built: ... elapsed=...` 可观测；
+  生产 p99 写延迟标定留 P5）。
+- 闸门口径：storm 用**绝对净增量 RSS**（`max(窗口采样, VmHWM) - 重启基线`）≤ 320MiB
+  （`--max-rss-delta-mb`）；payload/redb 比值只作观测（JSON payload 会被编成十进制数组放大 ~4x，
+  `dsh.redb` 含 raft 表/free page 且按 region 取整，两者都不适合当判定基准）。
+- 磁盘峰值仍是快照的约 3 倍（旧 canonical + 收到的 payload + install 的 canonical 副本）。
+
+**降级到 P4 之前的二进制**：旧二进制不认识 v2 payload（`DSHSNP` 头 → `unsupported snapshot
+payload version 2`），无法安装/读取。步骤：先停旧版本滚动、把**所有节点**的
+`DSH_RAFT_SNAPSHOT_PAYLOAD` 去掉并重启（写端回 v1）→ 删除各节点 `{data-dir}/snapshots/*.snap`
+（registry 指向的文件让 leader 重发）→ 再降级。不要在 registry 仍指向 v2 payload 时启动旧二进制。
 
 ---
 
