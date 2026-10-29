@@ -226,9 +226,38 @@ fn read_payload_file(path: PathBuf) -> Result<Vec<u8>, ErrOf> {
 
 /// P3c：流式解析 payload 文件成 `(key, value)` 列表 —— 只驻留解析结果一份；
 /// 与 `read_payload_file` 的「整份读 + 再解析」相比，省掉一份 4xx MB 的全量拷贝。
+/// P4a1：payload 头（读端兼容层）。
+/// 布局（8B）：`MAGIC(6B)="DSHSNP" | version(u8) | flags(u8)`。
+/// version=1 表示 body 仍是 JSON（即现状）；写端在 P4a2 之前**不写头**，读端两者都接受。
+/// P4a2 起 version=2 = msgpack body（见 dev_docs/design/openraft-010-p4-payload-msgpack.md §7）。
+pub const PAYLOAD_MAGIC: &[u8; 6] = b"DSHSNP";
+pub const PAYLOAD_HEADER_LEN: usize = 8;
+const PAYLOAD_VERSION_JSON: u8 = 1;
+
 fn read_payload_pairs(path: &std::path::Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrOf> {
-    let f = fs::File::open(path).map_err(io_read)?;
-    serde_json::from_reader(std::io::BufReader::new(f)).map_err(io_read)
+    use std::io::Read as _;
+    let mut f = fs::File::open(path).map_err(io_read)?;
+    let mut head = [0u8; PAYLOAD_HEADER_LEN];
+    let mut n = 0usize;
+    while n < head.len() {
+        match f.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) => return Err(io_read(e)),
+        }
+    }
+    if n == PAYLOAD_HEADER_LEN && &head[..PAYLOAD_MAGIC.len()] == PAYLOAD_MAGIC {
+        let version = head[PAYLOAD_MAGIC.len()];
+        if version != PAYLOAD_VERSION_JSON {
+            return Err(io_read(format!(
+                "unsupported snapshot payload version {version}（本 binary 只认 v1=JSON；P4a2 才写 v2）"
+            )));
+        }
+        return serde_json::from_reader(std::io::BufReader::new(f)).map_err(io_read);
+    }
+    // 无头（旧 payload）：把已读到的前缀接回去，从字节 0 解析。
+    let prefix = std::io::Cursor::new(head[..n].to_vec());
+    serde_json::from_reader(std::io::BufReader::new(prefix.chain(f))).map_err(io_read)
 }
 
 /// P3c：把收到的 payload 落成本节点 canonical snapshot 文件。
@@ -2105,7 +2134,64 @@ mod tests {
             txn.commit().unwrap();
         }
         let r = store.try_get_log_entries(1..=5).await;
-        assert!(r.is_err(), "purged 前缀之后的空洞必须报错，实际 {:?}", r.map(|v| v.len()));
+        assert!(
+            r.is_err(),
+            "purged 前缀之后的空洞必须报错，实际 {:?}",
+            r.map(|v| v.len())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P4a1：读端必须同时接受「无头旧 payload」与「带 MAGIC 头的 v1 payload」，
+    /// 并对未知 version 明确报错（不能静默按 JSON 解析）。
+    #[tokio::test]
+    async fn payload_reader_accepts_legacy_and_magic_json_but_rejects_unknown_version() {
+        let dir = tmpdir("payload-header");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, storage.raw_db(), dir.clone());
+        let pairs = vec![(b"k".to_vec(), b"v".to_vec())];
+        let body = serde_json::to_vec(&pairs).unwrap();
+
+        // 1) 无头（旧格式）可读
+        let legacy = dir.join("legacy.json");
+        std::fs::write(&legacy, &body).unwrap();
+        assert_eq!(read_payload_pairs(&legacy).unwrap(), pairs);
+
+        // 2) 带 MAGIC 头 + version=1 可读
+        let mut framed = Vec::new();
+        framed.extend_from_slice(PAYLOAD_MAGIC);
+        framed.push(PAYLOAD_VERSION_JSON);
+        framed.push(0);
+        framed.extend_from_slice(&body);
+        let with_head = dir.join("framed.bin");
+        std::fs::write(&with_head, &framed).unwrap();
+        assert_eq!(read_payload_pairs(&with_head).unwrap(), pairs);
+
+        // 3) 未知版本必须报错
+        let mut bad = framed.clone();
+        bad[PAYLOAD_MAGIC.len()] = 9;
+        let bad_path = dir.join("v9.bin");
+        std::fs::write(&bad_path, &bad).unwrap();
+        assert!(
+            read_payload_pairs(&bad_path).is_err(),
+            "未知 payload 版本必须报错"
+        );
+
+        // 4) 用带头 payload 走完整 install（另一份 store 实例）
+        let meta = snap_meta(11);
+        let storage2 = open_storage(&dir.join("n2"));
+        let sm2 = Arc::new(RwLock::new(StateMachine::new(Box::new(storage2.clone()))));
+        let mut store2 = StateMachineStore::new(sm2, storage2.raw_db(), dir.join("n2"));
+        store2.install_snapshot(&meta, with_head).await.unwrap();
+        let snap = store2
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot");
+        assert!(std::fs::exists(&snap.snapshot).unwrap());
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
