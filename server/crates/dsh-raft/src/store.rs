@@ -493,25 +493,27 @@ fn meta_put(db: &DbHandle, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
 }
 
 /// 共享的日志读取逻辑（LogReader 与 LogStore 复用）：[start, end] 闭区间。
-/// 当前 last_purged 的 index（兼容完整 LogId 与旧 index-only 格式）—— 空洞检测的期望起点。
-fn last_purged_index(db: &DbHandle) -> Result<Option<u64>, ErrOf> {
-    match meta_get(db, META_LAST_PURGED)? {
-        None => Ok(None),
-        Some(raw) => match de::<LogIdOf>(&raw) {
-            Ok(id) => Ok(Some(id.index)),
-            Err(_) => Ok(Some(de::<u64>(&raw)?)),
-        },
-    }
-}
-
-
 fn read_entries(db: &DbHandle, start: u64, end: u64) -> Result<Vec<EntryOf>, ErrOf> {
     let txn = db.begin_read().map_err(io_read)?;
     let table = txn.open_table(TBL_RAFT_LOG).map_err(io_read)?;
     let start_key = log_key(start);
     let mut out: Vec<EntryOf> = Vec::new();
-    // 期望的首个 index：purged 前缀之后的第一个（调用方 start 可能落在已 purge 区间）。
-    let first_expected = last_purged_index(db)?.map(|p| p + 1).unwrap_or(start).max(start);
+    // last_purged 与日志 range 必须同一个 read txn：分两个 txn 时，purge 在两者之间提交会让
+    // expected 落后于日志快照，误报 "log hole"（openraft 会把读日志失败升级为 Fatal::StorageError）。
+    let first_expected = {
+        let mt = txn.open_table(TBL_RAFT_META).map_err(io_read)?;
+        let purged = match mt.get(META_LAST_PURGED).map_err(io_read)? {
+            None => None,
+            Some(g) => {
+                let raw = g.value().to_vec();
+                Some(match de::<LogIdOf>(&raw) {
+                    Ok(id) => id.index,
+                    Err(_) => de::<u64>(&raw)?,
+                })
+            }
+        };
+        purged.map(|v| v + 1).unwrap_or(start).max(start)
+    };
     let mut expected: Option<u64> = Some(first_expected);
     for row in table.range(start_key.as_slice()..).map_err(io_read)? {
         let (k, v) = row.map_err(io_read)?;
@@ -549,7 +551,20 @@ fn read_entries_limited(
     let start_key = log_key(start);
     let mut out: Vec<EntryOf> = Vec::new();
     let mut acc = 0u64;
-    let first_expected = last_purged_index(db)?.map(|p| p + 1).unwrap_or(start).max(start);
+    let first_expected = {
+        let mt = txn.open_table(TBL_RAFT_META).map_err(io_read)?;
+        let purged = match mt.get(META_LAST_PURGED).map_err(io_read)? {
+            None => None,
+            Some(g) => {
+                let raw = g.value().to_vec();
+                Some(match de::<LogIdOf>(&raw) {
+                    Ok(id) => id.index,
+                    Err(_) => de::<u64>(&raw)?,
+                })
+            }
+        };
+        purged.map(|v| v + 1).unwrap_or(start).max(start)
+    };
     let mut expected: Option<u64> = Some(first_expected);
     for row in table.range(start_key.as_slice()..).map_err(io_read)? {
         let (k, v) = row.map_err(io_read)?;

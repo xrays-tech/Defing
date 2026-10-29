@@ -67,3 +67,28 @@ VERSION 2: BODY = msgpack：数组 header(n) + 逐项 [bin(k), bin(v)]
 | 流式恢复多批边界 | 已测（64MiB 单测） | 保留并通过 |
 
 功能回归：voter/learner 快照 e2e、`snapshot_persist`、`snapshot_sweep`、storm 断言与 P3 相同。
+
+## 7. 修订（P4 design gate attempt 1 之后，必须按此实现）
+
+复核 REJECT，两条 blocker + 若干 major：
+
+- **B1（blocker）清空语义**：`restore_all_batched()` 每次调用都会重算 `existing` 并在首批删光所有旧 key
+  → 逐批调用会把前 N-1 批删掉。**改为**：新增
+  `StateMachine::restore_stream(batches: impl Iterator<Item=Vec<(k,v)>>)`，由它**只清空一次**、
+  后续批只做插入；`restore_all(pairs)` 变成「单批的 restore_stream」。验收：≥3 批（每批 < 64MiB，
+  总 > 128MiB）全部 key 存活 + 旧 key 被清 + 空流清空。
+- **B2（blocker）上线兼容**：payload 是**原样上线**的（`FrameEmitter` 直接流文件），MAGIC/v2 头会
+  出现在 wire 上，而帧 Header 没有 format/version 协商 → 滚动升级单向打断 catch-up。**发布策略**：
+  1. **P4a1（可先做）**：读端同时接受 v1(旧，无头) / v2(带 MAGIC)；写端**仍写 v1**；
+  2. **P4a2**：等全集群都跑 P4a1 后，用 `DSH_RAFT_SNAPSHOT_PAYLOAD=msgpack` 打开写端 v2；
+  3. 回滚：关掉 flag 即回到 v1（读端一直兼容 v1）。
+  混跑矩阵与「协调重启」作为备选写进 runbook。
+- **B2'（major）payload 级完整性**：头部补 `total_len` + body 的 `CRC32`（帧 CRC 只保护 wire，
+  且由发送方对可能已损坏的文件计算）；install、boot replay、发送前都校验；加截断/损坏测试。
+- **B3（major）口径统一**：只认两个指标 —— `net = (window_max - baseline)/snapshot`（1024 换算）
+  与 `raw = window_max/snapshot`。P3m 基线：net 0.64x / raw 1.24x；目标写成 `net <= 0.7x`。
+- **B4（major）撤回错误声明**：现有测试只注入 1/4 字节 chunk 的**分块**测试，没有 64MiB 多批流式
+  测试；本文 §6 那一行改为「P4b 新增」。
+- **B5（major）顺序**：`dump_all()` 分页拆成 **P4c0**（只读分页 dump + 验收），P4c 依赖它。
+- minors：tuple 用 positional 编码 + KAT（避免 §13.5 同类）；MAGIC 不匹配走**有界嗅探**（读头部
+  再判），加 v2 截断测试；明确 v1 读路径下线条件；P4d 触发条件写清。

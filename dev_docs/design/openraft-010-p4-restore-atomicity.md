@@ -91,3 +91,32 @@
 - 双写 payload（输入 + canonical）在 P4 msgpack 方案里会合并成流式写入，届时标记里的 payload 指向需同步调整。
 - 未决（gate 决策）：标记放 raft-meta 还是独立小文件（`{data_dir}/RESTORE_BEGIN.json`）。
   倾向 raft-meta（与 registry 同库同事务语义）；独立文件的好处是 store 之外的装配也能看到。
+
+## 7. 修订（P4 design gate attempt 1 之后，必须按此实现）
+
+复核给了 REJECT，两条 blocker + 若干 major，本节覆盖它们：
+
+- **A1（blocker）boot 重放与启动清扫冲突**：`StateMachineStore::new_with_rotation` 会先跑
+  `sweep_snapshot_payloads`，而 `RESTORE_BEGIN` 指向的 payload 在 registry 提交前是 orphan →
+  被删 → §4.2 fail-fast 反而砖化节点。**实现约束**：
+  1. `sweep_snapshot_payloads` 增加参数「保留路径集合」，把 `RESTORE_BEGIN.payload`
+     （canonicalize 后）并入保留集；
+  2. 恢复流程顺序固定为「读 marker → 校验 payload → 重放 → 写 registry → 清 marker → 再清扫」；
+  3. 验收必须**开着 sweep** 跑：崩溃在 3-4 之间 → 重启后 replay 成功且 payload 未被删。
+- **A2（blocker）kill-switch 不得掩盖 marker**：`DSH_RAFT_RESTORE_MARKER=0` 只关闭「写 marker」；
+  若启动时**存在** marker，必须照样重放（或显式 `DSH_RAFT_RESTORE_FORCE=1` 才允许忽略并大声 WARN）。
+  否则会以混合状态启动。
+- **A3（major）非崩溃型 restore 错误**：restore 返回 Err（非进程死亡）时，节点必须 fail-stop
+  （poison 状态 + 拒绝服务写/读），不能带着混合状态继续；测试：注入 restore 中段 IO 错误。
+- **A4（major）不变量前置条件**：marker 必须在「payload 完整且已 fsync（含目录 fsync）」之后写，
+  且写 marker 前不得修改状态机。P3j 的 copy 路径已满足；P4b 若改为直写 canonical，必须由写方
+  fsync 完成后交棒（见 §6 未决与 msgpack 文档 §5）。
+- **A5（major）与 P4b 直写 canonical 的交互**：marker.payload 必须指向「已 fsync 的最终文件」，
+  且 registry 与 marker 指向同一路径；删除任一方都要先清 marker。
+- **A6（major）基线更新**：以 P3m 为准 —— 384.2MB、episode 3.739s（attempts=2，末次 2.53s）、
+  窗口净增量 RSS 0.62x（1024 换算 0.64x）、raw VmHWM 1.24x。本文 §3 里 269MB/1.78s/1.37x 等
+  旧数字作废。
+- minors 采纳：验收 #1 要写明「子进程 SIGKILL 注入点」；#5 追加「marker 键不存在 + registry/尺寸
+  校验」；重放走流式 reader（P4b 之后）以约束 boot 内存；marker 路径与 sweep 比较都用 canonicalize。
+- 集成点定案：`dsh-cli` 在 `has_persisted_state` 判定之前调用 **fallible 的**
+  `recover_interrupted_restore()`（`new_with_rotation` 保持 infallible，不动测试面）。
