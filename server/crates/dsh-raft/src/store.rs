@@ -1031,6 +1031,21 @@ fn log_index_from_key(key: &[u8]) -> u64 {
     u64::from_be_bytes(b)
 }
 
+/// `true` = `built` 比 `reg` 新（允许覆盖 registry）。P5 复核遗留：builder 的提交在锁外，
+/// 并发 install 可能已提交更新快照；覆盖前用它判断，避免旧快照盖掉新快照并删掉新 payload。
+fn snapshot_meta_newer(
+    built: &SnapshotMetaOf<TypeConfig>,
+    reg: &SnapshotMetaOf<TypeConfig>,
+) -> bool {
+    match (&built.last_log_id, &reg.last_log_id) {
+        (Some(b), Some(r)) => b > r,
+        // built 有 last_log_id、registry 是初始快照 → built 更新
+        (Some(_), None) => true,
+        // built 是初始快照（或两者皆初始）→ 不覆盖
+        _ => false,
+    }
+}
+
 fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>, ErrOf> {
     serde_json::to_vec(v).map_err(|e| io_write(e.to_string()))
 }
@@ -1878,6 +1893,26 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
             };
             (meta, path)
         };
+        // P5（复核遗留）：提交阶段在读锁之外，并发的 install 可能已经提交了更新的快照。
+        // 覆盖前比较 registry：若 registry 里的快照不新于本快照 → 保留 registry（不写、不删、
+        // 不覆盖 current_snapshot），只把构建结果返回给 openraft（其文件成为 orphan，下次清扫回收）。
+        let reg = load_snapshot_registry(&self.inner.db, self.inner.data_dir.join(SNAP_SUBDIR));
+        if let Ok(Some((reg_meta, _))) = &reg {
+            if !snapshot_meta_newer(&meta, reg_meta) {
+                tracing::warn!(
+                    "snapshot build: registry already holds last_log_id={:?} (built {:?}); \
+                     keeping registry (concurrent install won), built payload is an orphan",
+                    reg_meta.last_log_id,
+                    meta.last_log_id
+                );
+                return Ok(Snapshot {
+                    meta,
+                    snapshot: path,
+                });
+            }
+        } else if let Err(e) = &reg {
+            tracing::warn!("snapshot build: registry read failed ({e}); proceeding with commit");
+        }
         // registry 落盘（meta + file key；同事务 removes legacy inline data key）；旧文件清理 after commit
         let old = persist_snapshot_registry(&self.inner.db, &meta, path.clone())?;
         delete_old_snapshot_file(old);
@@ -4723,6 +4758,89 @@ mod p4a_force_boot_tests {
             msg.contains("poisoned") || msg.contains("mixed state"),
             "fail-fast 的原因必须是「拒绝从混合状态构建快照」，实际：{msg}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod p5_registry_race_tests {
+    use super::tests::{open_storage, snap_meta, tmpdir};
+    use super::*;
+
+    /// P5（复核遗留）：并发 install 已提交更新快照时，builder 的提交阶段**不得**用旧快照
+    /// 覆盖 registry，也不得删掉新快照的 payload（原实现会：persist 旧 meta + delete_old 删新文件）。
+    #[tokio::test]
+    async fn build_does_not_overwrite_newer_install_registry() {
+        let dir = tmpdir("p5-registry-race");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+
+        // 状态与 last_applied 都停在 5（builder 会构建 meta=5）
+        sm.write()
+            .unwrap()
+            .restore_all(&[(b"k".to_vec(), b"v".to_vec())])
+            .unwrap();
+        put_last_applied(&db, &snap_meta(5).last_log_id.unwrap()).unwrap();
+
+        // registry 里已有更新的快照 meta=10 + 它自己的 payload（模拟并发 install 先提交）
+        let newer = snap_meta(10);
+        let newer_payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &newer,
+            &serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap(),
+        )
+        .unwrap();
+        persist_snapshot_registry(&db, &newer, newer_payload.clone()).unwrap();
+
+        // builder 构建 meta=5 的快照 → 不得覆盖 registry
+        let mut builder = store.get_snapshot_builder().await;
+        let built = builder.build_snapshot().await.unwrap();
+        assert_eq!(built.meta.last_log_id, snap_meta(5).last_log_id);
+
+        let (reg_meta, reg_file) = load_snapshot_registry(&db, dir.join(SNAP_SUBDIR))
+            .unwrap()
+            .expect("registry");
+        assert_eq!(
+            reg_meta.last_log_id, newer.last_log_id,
+            "旧 builder 不得覆盖更新的 registry"
+        );
+        assert_eq!(reg_file, newer_payload, "registry 仍指向新 payload");
+        assert!(
+            fs::exists(&newer_payload).unwrap(),
+            "新 payload 不得被旧 builder 的 delete_old 删掉"
+        );
+        assert!(
+            fs::exists(&built.snapshot).unwrap(),
+            "builder 返回的快照文件仍存在（orphan，下次清扫回收）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 对照：registry 没有更新快照时，builder 正常提交（原有行为不被回归）。
+    #[tokio::test]
+    async fn build_commits_when_registry_not_newer() {
+        let dir = tmpdir("p5-registry-normal");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm.clone(), db.clone(), dir.clone());
+        sm.write()
+            .unwrap()
+            .restore_all(&[(b"k".to_vec(), b"v".to_vec())])
+            .unwrap();
+        put_last_applied(&db, &snap_meta(7).last_log_id.unwrap()).unwrap();
+
+        let mut builder = store.get_snapshot_builder().await;
+        let built = builder.build_snapshot().await.unwrap();
+        let (reg_meta, reg_file) = load_snapshot_registry(&db, dir.join(SNAP_SUBDIR))
+            .unwrap()
+            .expect("registry");
+        assert_eq!(reg_meta.last_log_id, snap_meta(7).last_log_id);
+        assert_eq!(reg_file, built.snapshot);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

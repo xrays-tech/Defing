@@ -762,6 +762,36 @@ class Stats:
         self.leader_kill_target_not_leader = 0
         self.leader_change_missing = 0
         self.per_node = {n.node_id: 0 for n in nodes}
+        # P5：写延迟样本（按阶段）。snapshot build 持读锁写盘期间，client write 的 ack 延迟会抬升；
+        # 用 publish ack 延迟的 p99/max 作为「leader 写停顿」的可观测指标。
+        self.latencies = {"load": [], "bulk": []}
+
+    def record_latency(self, phase, secs):
+        with self.lock:
+            lst = self.latencies.setdefault(phase, [])
+            if len(lst) < 200_000:
+                lst.append(float(secs))
+
+    def latency_summary(self):
+        def pct(vals, p):
+            if not vals:
+                return None
+            i = min(len(vals) - 1, max(0, int(round(p * (len(vals) - 1)))))
+            return round(1000.0 * vals[i], 1)
+
+        out = {}
+        for phase, vals in self.latencies.items():
+            if not vals:
+                continue
+            s = sorted(vals)
+            out[phase] = {
+                "n": len(s),
+                "p50_ms": pct(s, 0.50),
+                "p95_ms": pct(s, 0.95),
+                "p99_ms": pct(s, 0.99),
+                "max_ms": round(1000.0 * s[-1], 1),
+            }
+        return out
 
     def bump(self, attr, node_id=None, n=1):
         with self.lock:
@@ -907,7 +937,9 @@ class Writer:
                     self.stats.bump("attempts", node_id=node.node_id)
                 d = write_draft(node, self.token, self.project, val_bytes, marker)
                 attempts_local += 1
+                _t_pub = time.time()
                 p = write_publish(node, self.token, self.project, "w%d.%d" % (self.wid, seq), rid)
+                self.stats.record_latency("load", time.time() - _t_pub)
                 if attempts_local > 1:
                     self.stats.bump("retries")
                 if p["status"] == 200:
@@ -1240,7 +1272,9 @@ def snapshot_phase(args, stats, token, rng):
             rid = "sn-%d-%d-%s" % (wi, seq, uuid.uuid4().hex[:6])
             stats.bump("attempts", node_id=node.node_id)
             write_draft(node, token, project, vb, marker)
+            _t_pub = time.time()
             p = write_publish(node, token, project, "snp", rid)
+            stats.record_latency("bulk", time.time() - _t_pub)
             if p["status"] == 200:
                 with dlock:
                     done[0] += 1
@@ -1810,6 +1844,14 @@ def validate_final(args, token, writers, snapshot_info, errors):
                     voter_ok = bool(m.get("is_voter"))
                     break
         errors.extend(c4_errors(args, snapshot_info, voter_ok))
+        # P5：写停顿预算（--max-write-p99-ms > 0 才断言；默认只观测）
+        lat = STATS.latency_summary()
+        GLOBAL["write_latency_ms"] = lat
+        if getattr(args, "max_write_p99_ms", 0) > 0:
+            for phase, s in lat.items():
+                if s.get("p99_ms") is not None and s["p99_ms"] > args.max_write_p99_ms:
+                    errors.append("write p99（%s）= %.1fms > 预算 %.1fms"
+                                  % (phase, s["p99_ms"], args.max_write_p99_ms))
 
         # P3 churn 并发 invariant: 正在被 full-snapshot 追赶的 follower（含 leader kill/freeze
         # churn 期间）在 **transfer→install→done 窗口内** 必须一次选举/预投票都不发起。
@@ -1858,6 +1900,9 @@ def parse_args():
     p.add_argument("--catchup-timeout", type=float, default=60.0)
     p.add_argument("--max-install-seconds", type=float, default=30.0,
                    help="C4 预算：full-snapshot 端到端安装时间（transfer→apply 完成）上限，默认 30s")
+    p.add_argument("--max-write-p99-ms", type=float, default=0.0,
+                   help="P5 写停顿预算：publish ack 延迟 p99 上限（load/bulk 两阶段分别检查）。"
+                        "默认 0=只观测（summary.write_latency_ms）；标定后由 gate/CI 传值")
     p.add_argument("--max-rss-delta-mb", type=float, default=320.0,
                    help="C4 内存预算上限：实际预算 = min(该值, 192MiB + payload 大小)。"
                         "install 窗口净增量 RSS = max(窗口采样 0.4s, VmHWM) - 重启基线；"
@@ -2067,6 +2112,7 @@ def main():
             # (t_rel_since_catchup_start, victim lag) sampled; null for quick/no-snapshot
             "lag_trajectory": (snapshot_info or {}).get("lag_trajectory"),
             "per_node_requests": STATS.per_node,
+            "write_latency_ms": STATS.latency_summary(),
         }
         # only meaningful when the snapshot catch-up phase actually ran (not quick)
         if snapshot_info is not None:
