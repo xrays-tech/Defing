@@ -1,0 +1,205 @@
+diff --git a/server/crates/dsh-cli/src/main.rs b/server/crates/dsh-cli/src/main.rs
+index 2221701..5fd7724 100644
+--- a/server/crates/dsh-cli/src/main.rs
++++ b/server/crates/dsh-cli/src/main.rs
+@@ -948,15 +948,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+         raft_addr: cli.raft_addr.clone(),
+     };
+     let network = HttpNetworkFactory::with_token(Some(raft_token.clone()));
++    let raft_cfg = dsh_raft::dev_config();
+     let raft = dsh_raft::new_raft_node(
+         node_id,
+         node_info.clone(),
+         log_store,
+         sm_store,
+         &network,
+-        dsh_raft::dev_config(),
++        raft_cfg.clone(),
+     )
+     .await?;
++    // Restarted node: persisted vote utime may be stale, which makes openraft campaign
++    // immediately before the leader can contact it. Suppress elections for a 4s startup
++    // grace using the same guard that snapshot reception extends; a live leader will
++    // re-establish contact, otherwise the node elects afterwards.
++    let election_guard = dsh_raft::ElectionGuard::new(raft.clone());
++    if has_state {
++        election_guard.arm_for(std::time::Duration::from_secs(30));
++    }
+ 
+     // 首次初始化仅在无持久化状态时执行；已有状态一律 resume（忽略建群参数）。
+     if cli.bootstrap && !has_state {
+@@ -1084,8 +1093,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+     }
+ 
+     // Raft RPC 服务（raft_addr）
+-    let raft_state =
+-        RaftServerState::with_token(raft.clone(), Some(Arc::from(raft_token.as_str())));
++    let raft_state = RaftServerState::with_guard(
++        raft.clone(),
++        Some(Arc::from(raft_token.as_str())),
++        election_guard,
++    );
+     let raft_router = dsh_raft::raft_router(raft_state);
+     let raft_addr = cli.raft_addr.clone();
+     tokio::spawn(async move {
+diff --git a/server/crates/dsh-raft/src/lib.rs b/server/crates/dsh-raft/src/lib.rs
+index 5504de0..c7c9319 100644
+--- a/server/crates/dsh-raft/src/lib.rs
++++ b/server/crates/dsh-raft/src/lib.rs
+@@ -17,6 +17,6 @@ pub use raft::{
+     new_raft_node, try_client_write, wait_for_leader, wait_until, write_command, WriteError,
+     WriteOutcome,
+ };
+-pub use raft_http_server::{raft_router, RaftServerState};
++pub use raft_http_server::{raft_router, ElectionGuard, RaftServerState};
+ pub use store::{LogStore, StateMachineStore};
+ pub use types::{NodeId, NodeInfo, TypeConfig};
+diff --git a/server/crates/dsh-raft/src/raft.rs b/server/crates/dsh-raft/src/raft.rs
+index 7543d8b..cb8aacd 100644
+--- a/server/crates/dsh-raft/src/raft.rs
++++ b/server/crates/dsh-raft/src/raft.rs
+@@ -11,7 +11,7 @@ use crate::types::{NodeId, NodeInfo, TypeConfig};
+ 
+ pub type RaftConfig = Config;
+ 
+-/// 默认测试/联调配置（心跳 100ms、选举 300~600ms）。
++/// 默认测试/联调配置（心跳 200ms、选举 1~2s、批量 16 条）。
+ ///
+ /// 快照传输配套（follower 落后根治，见 raft_http_server.rs `raft_router`）：
+ /// - `install_snapshot_timeout=30s`：openraft 默认 200ms 是「发送+落盘单分块」预算，1MiB
+@@ -23,10 +23,10 @@ pub type RaftConfig = Config;
+ ///   三值（chunk 1MiB ↔ JSON ~3MB ↔ limit 32MiB）配套关系见 dev_docs/deployment-guide.md §6.5。
+ pub fn dev_config() -> RaftConfig {
+     Config {
+-        heartbeat_interval: 100,
+-        election_timeout_min: 300,
+-        election_timeout_max: 600,
+-        max_payload_entries: 64,
++        heartbeat_interval: 200,
++        election_timeout_min: 1_000,
++        election_timeout_max: 2_000,
++        max_payload_entries: 16,
+         enable_tick: true,
+         install_snapshot_timeout: 30_000,
+         snapshot_max_chunk_size: 1024 * 1024,
+diff --git a/server/crates/dsh-raft/src/raft_http_server.rs b/server/crates/dsh-raft/src/raft_http_server.rs
+index 6503da7..fba5e70 100644
+--- a/server/crates/dsh-raft/src/raft_http_server.rs
++++ b/server/crates/dsh-raft/src/raft_http_server.rs
+@@ -1,5 +1,8 @@
+ //! Raft RPC HTTP 服务端（axum，/raft/* 端点）。
+ 
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
+ use axum::extract::{DefaultBodyLimit, State};
+ use axum::http::StatusCode;
+ use axum::routing::post;
+@@ -18,15 +21,95 @@ pub struct RaftServerState {
+     /// 可选 token：Some 时 /raft/* 端点要求 `Authorization: Bearer <token>` 完全相等；
+     /// None 时保持无鉴权（默认行为，兼容现有部署）。
+     pub token: Option<std::sync::Arc<str>>,
++    /// openraft 0.9 的 InstallSnapshot 分块不会续期 follower lease，且 snapshot 在途时
++    /// leader 的普通 heartbeat 被抑制。大快照传输/安装超过 election timeout 时 follower
++    /// 会竞选，抬高 term 后拒绝 leader 的旧 vote，形成永久落后。收到 snapshot 分块时
++    /// 临时关闭本节点选举，30s 无新块自动恢复（leader 死亡时最多延迟 30s 重新选举）。
++    election_guard: Arc<ElectionGuard>,
++}
++
++pub struct ElectionGuard {
++    raft: RaftHandle,
++    idle: Duration,
++    inner: Mutex<GuardState>,
++}
++
++struct GuardState {
++    deadline_ms: u64,
++    started: bool,
++}
++
++impl ElectionGuard {
++    pub fn new(raft: RaftHandle) -> Arc<Self> {
++        Arc::new(Self {
++            raft,
++            idle: Duration::from_secs(30),
++            inner: Mutex::new(GuardState {
++                deadline_ms: 0,
++                started: false,
++            }),
++        })
++    }
++
++    /// Suppress elections for `duration`; called for each snapshot chunk (30s) and by the
++    /// CLI on restart (4s startup grace). Deadlines are shared, so a snapshot chunk always
++    /// extends a startup grace instead of racing with a separate re-enable task.
++    pub fn arm_for(self: &Arc<Self>, duration: Duration) {
++        let mut st = self.inner.lock().expect("election guard lock");
++        self.raft.runtime_config().elect(false);
++        let deadline = now_ms() + duration.as_millis() as u64;
++        if deadline > st.deadline_ms {
++            st.deadline_ms = deadline;
++        }
++        if !st.started {
++            st.started = true;
++            let guard = Arc::clone(self);
++            drop(st);
++            tokio::spawn(async move {
++                loop {
++                    tokio::time::sleep(Duration::from_millis(200)).await;
++                    let mut st = guard.inner.lock().expect("election guard lock");
++                    if st.deadline_ms != 0 && now_ms() >= st.deadline_ms {
++                        guard.raft.runtime_config().elect(true);
++                        st.deadline_ms = 0;
++                    }
++                }
++            });
++        }
++    }
++
++    pub fn arm(self: &Arc<Self>) {
++        self.arm_for(self.idle);
++    }
++}
++
++fn now_ms() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_millis() as u64)
++        .unwrap_or(0)
+ }
+ 
+ impl RaftServerState {
+     pub fn new(raft: RaftHandle) -> Self {
+-        Self { raft, token: None }
++        Self::with_token(raft, None)
+     }
+ 
+     pub fn with_token(raft: RaftHandle, token: Option<std::sync::Arc<str>>) -> Self {
+-        Self { raft, token }
++        let election_guard = ElectionGuard::new(raft.clone());
++        Self::with_guard(raft, token, election_guard)
++    }
++
++    pub fn with_guard(
++        raft: RaftHandle,
++        token: Option<std::sync::Arc<str>>,
++        election_guard: Arc<ElectionGuard>,
++    ) -> Self {
++        Self {
++            raft,
++            token,
++            election_guard,
++        }
+     }
+ }
+ 
+@@ -100,6 +183,9 @@ async fn install_snapshot(
+     Json(rpc): Json<InstallSnapshotRequest<TypeConfig>>,
+ ) -> Result<Json<InstallSnapshotResponse<NodeId>>, (StatusCode, String)> {
+     authed(&s, &headers)?;
++    // Suppress elections while this follower is receiving/installing a snapshot; see
++    // ElectionGuard docs. This is the follower-side complement to the large body limit.
++    s.election_guard.arm();
+     s.raft
+         .install_snapshot(rpc)
+         .await
