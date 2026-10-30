@@ -1031,6 +1031,41 @@ fn log_index_from_key(key: &[u8]) -> u64 {
     u64::from_be_bytes(b)
 }
 
+/// 自愈（P5 runbook 降级步骤）：registry 指向的快照文件缺失（运维按降级步骤删了
+/// `snapshots/*.snap`、或磁盘损坏）→ 清掉 registry 的 `meta`+`file`。否则节点会拿着一个
+/// 不存在的路径对外提供快照（发送时才失败），降级/重建流程会卡死。返回是否清理了。
+fn reset_registry_if_file_missing(db: &DbHandle, dir: &std::path::Path) -> Result<bool, ErrOf> {
+    let missing = {
+        let txn = db.begin_read().map_err(io_read)?;
+        let table = txn.open_table(TBL_SNAPSHOTS).map_err(io_read)?;
+        match table.get(SNAP_FILE_KEY).map_err(io_read)? {
+            Some(v) => {
+                let path: PathBuf = de(v.value())?;
+                if fs::exists(&path).unwrap_or(false) {
+                    return Ok(false);
+                }
+                Some(path)
+            }
+            None => return Ok(false),
+        }
+    };
+    let txn = db.begin_write().map_err(io_write)?;
+    {
+        let mut t = txn.open_table(TBL_SNAPSHOTS).map_err(io_write)?;
+        t.remove(SNAP_FILE_KEY).map_err(io_write)?;
+        t.remove(SNAP_META_KEY).map_err(io_write)?;
+    }
+    txn.commit().map_err(io_write)?;
+    if let Some(path) = missing {
+        tracing::warn!(
+            "snapshot registry pointed to missing payload {}; cleared registry (next snapshot will be rebuilt)",
+            path.display()
+        );
+    }
+    let _ = dir;
+    Ok(true)
+}
+
 /// `true` = `built` 比 `reg` 新（允许覆盖 registry）。P5 复核遗留：builder 的提交在锁外，
 /// 并发 install 可能已提交更新快照；覆盖前用它判断，避免旧快照盖掉新快照并删掉新 payload。
 fn snapshot_meta_newer(
@@ -1529,6 +1564,9 @@ impl StateMachineStore {
             Ok(_) => {}
             Err(e) => tracing::warn!("snapshots dir startup sweep skipped: {e}"),
         };
+        if let Err(e) = reset_registry_if_file_missing(&db, &data_dir) {
+            tracing::warn!("snapshot registry self-heal skipped: {e}");
+        }
         let restore_marker = restore_marker_enabled_from_env();
         let payload_format = payload_format_from_env();
         if payload_format == PAYLOAD_FORMAT_MSGPACK {
@@ -2168,10 +2206,20 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         drop(guard);
         // 重启后内存为空 → 读盘（B5：快照跨重启持久化；P2a: registry meta+file, legacy data 迁移）
         match load_snapshot_registry(&self.db, self.data_dir.join(SNAP_SUBDIR))? {
-            Some((meta, path)) => Ok(Some(Snapshot {
-                meta,
-                snapshot: path,
-            })),
+            Some((meta, path)) => {
+                if !fs::exists(&path).unwrap_or(false) {
+                    // 运行期文件被删（降级步骤）：不要对外提供不存在的路径。
+                    tracing::warn!(
+                        "get_current_snapshot: registry payload {} missing; returning None",
+                        path.display()
+                    );
+                    return Ok(None);
+                }
+                Ok(Some(Snapshot {
+                    meta,
+                    snapshot: path,
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -4985,5 +5033,74 @@ mod p5_concurrency_tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod p5_registry_selfheal_tests {
+    use super::tests::{open_storage, snap_meta, tmpdir};
+    use super::*;
+
+    /// P5 runbook 降级步骤：运维删掉 `snapshots/*.snap` 后重启，节点必须自愈（清掉 registry），
+    /// 而不是拿着不存在的路径对外提供快照。
+    #[tokio::test]
+    async fn registry_cleared_when_payload_file_deleted() {
+        let dir = tmpdir("p5-registry-selfheal");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let storage = open_storage(&dir);
+            let db = storage.raw_db();
+            let meta = snap_meta(9);
+            let payload = write_snapshot_payload(
+                dir.join(SNAP_SUBDIR),
+                &meta,
+                &serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap(),
+            )
+            .unwrap();
+            persist_snapshot_registry(&db, &meta, payload.clone()).unwrap();
+            std::fs::remove_file(&payload).unwrap();
+        }
+        // 重启：构造 store 时自愈
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, db.clone(), dir.clone());
+        assert!(
+            load_snapshot_registry(&db, dir.join(SNAP_SUBDIR))
+                .unwrap()
+                .is_none(),
+            "registry 必须被清掉（否则会提供不存在的快照路径）"
+        );
+        assert!(
+            store.get_current_snapshot().await.unwrap().is_none(),
+            "删文件后 get_current_snapshot 必须返回 None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 运行期删除（不重启）：`get_current_snapshot` 也不能返回不存在的路径。
+    #[tokio::test]
+    async fn get_current_snapshot_none_when_file_deleted_at_runtime() {
+        let dir = tmpdir("p5-registry-selfheal-runtime");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let db = storage.raw_db();
+        let meta = snap_meta(11);
+        let payload = write_snapshot_payload(
+            dir.join(SNAP_SUBDIR),
+            &meta,
+            &serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap(),
+        )
+        .unwrap();
+        persist_snapshot_registry(&db, &meta, payload.clone()).unwrap();
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, db.clone(), dir.clone());
+        assert!(store.get_current_snapshot().await.unwrap().is_some());
+        std::fs::remove_file(&payload).unwrap();
+        assert!(
+            store.get_current_snapshot().await.unwrap().is_none(),
+            "运行期文件被删后必须返回 None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

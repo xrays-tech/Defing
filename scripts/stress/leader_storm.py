@@ -31,6 +31,7 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -2163,9 +2164,25 @@ def rolling_rehearsal(args):
         phases.append({"phase": "v1-rollback", "ok": ok, "detail": detail})
         log("  [v1-rollback] ok=%s %s" % (ok, detail))
 
-        # 混合窗口断言：节点 5 保持 v1 写端，但读端能安装 leader 的 v2 payload
-        # （已在 v2 阶段覆盖：victim 就是 v1 写端节点，安装的是 v2 快照）
-        all_ok = all(p["ok"] for p in phases) and len(phases) == 3
+        # 阶段 4：降级清理（部署手册 §6.6 的「删 snapshots/*.snap」步骤，经 registry 自愈）
+        # 停全部节点 → 删各自 snapshots 目录 → 以 v1 写端重启 → registry 自愈 → 新快照重建并安装。
+        for n in nodes:
+            n.kill()
+        for n in nodes:
+            shutil.rmtree(os.path.join(n.data_dir, "snapshots"), ignore_errors=True)
+        for n in nodes:
+            n.extra_env = {**ROLL_BASE_ENV}
+            n.spawn(seed_map)
+        if not _wait_settled(nodes, 120):
+            phases.append({"phase": "downgrade-clean", "ok": False,
+                           "detail": "删 snapshots 后集群未 settled"})
+            return (1, {"ok": False, "phases": phases, "work": work})
+        ok, detail = _catch_up_victim(nodes, seed_map, token, args.rolling_writes,
+                                      {}, 1, "downgrade-clean")
+        phases.append({"phase": "downgrade-clean", "ok": ok, "detail": detail})
+        log("  [downgrade-clean] ok=%s %s" % (ok, detail))
+
+        all_ok = all(p["ok"] for p in phases) and len(phases) == 4
         return (0 if all_ok else 1,
                 {"ok": bool(all_ok), "phases": phases, "work": work,
                  "note": "v2 阶段 victim 也是 v2 写端；回滚阶段 victim（v1 写端）安装到 v2 payload "
